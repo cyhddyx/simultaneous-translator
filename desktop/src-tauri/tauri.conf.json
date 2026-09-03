@@ -27,6 +27,7 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "cyhddyx",
     "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",

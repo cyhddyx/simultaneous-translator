@@ -2,7 +2,7 @@
 name = "simultaneous-translator"
 version = "0.1.0"
 description = "Desktop simultaneous translation workspace"
-authors = ["Simultaneous Translator"]
+authors = ["cyhddyx"]
 edition = "2021"
 
 [lib]
