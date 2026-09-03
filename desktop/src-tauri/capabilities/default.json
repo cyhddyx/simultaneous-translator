@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Capabilities for the simultaneous translation workspace.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}

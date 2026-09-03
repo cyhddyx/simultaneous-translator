@@ -1,0 +1,52 @@
+# Python environments, caches, and packaging output
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Frontend dependencies and build output
+desktop/node_modules/
+desktop/dist/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Rust, Tauri, and packaged Python sidecar output
+desktop/src-tauri/target/
+desktop/src-tauri/gen/schemas/
+desktop/src-tauri/binaries/*.exe
+.tauri-sidecar-build/
+*.exe
+*.msi
+*.msix
+*.pdb
+
+# Local diagnostics
+_probe_audio.py
+_probe_build/
+
+# Local settings, secrets, and editor metadata
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+.vscode/
+.idea/
+.claude/
+.codex/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
