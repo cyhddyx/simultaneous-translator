@@ -33,11 +33,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir, $BuildRoot | Out-Null
     --distpath (Join-Path $BuildRoot "dist") `
     --workpath (Join-Path $BuildRoot "work") `
     --specpath $BuildRoot `
-    --collect-all dashscope `
-    --collect-all google.genai `
-    --collect-all soundcard `
-    --collect-all scipy `
-    --collect-all numpy `
+    --hidden-import dashscope.audio.asr `
     --hidden-import soundcard.mediafoundation `
     $BridgePath
 if ($LASTEXITCODE -ne 0) {

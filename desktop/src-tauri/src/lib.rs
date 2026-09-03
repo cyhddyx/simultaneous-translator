@@ -20,8 +20,16 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
 use uuid::Uuid;
 
+// Dev and packaged builds share Tauri's application identifier, so they need
+// separate storage names or a release build will inherit local test providers.
+#[cfg(debug_assertions)]
 const KEYRING_SERVICE: &str = "SimultaneousTranslator";
+#[cfg(not(debug_assertions))]
+const KEYRING_SERVICE: &str = "SimultaneousTranslatorProduction";
+#[cfg(debug_assertions)]
 const SETTINGS_FILE: &str = "settings.json";
+#[cfg(not(debug_assertions))]
+const SETTINGS_FILE: &str = "settings.production.json";
 const SETTINGS_SCHEMA_VERSION: u32 = 4;
 const SECRET_ENVELOPE_VERSION: u32 = 2;
 const LEGACY_SECRET_ENVELOPE_VERSION: u32 = 1;
@@ -32,6 +40,7 @@ const GEMINI_ENV_BINDING_ACCOUNT: &str = "environment_binding:gemini";
 const RECOGNITION_ENV_BINDING_ACCOUNT: &str = "environment_binding:dashscope";
 const DEFAULT_RECOGNITION_BASE_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+const DEFAULT_TRANSLATION_MODEL: &str = "gemini-3.7-flash";
 const MAX_TRANSLATION_PROVIDERS: usize = 20;
 const MAX_MODELS_PER_PROVIDER: usize = 100;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
@@ -47,6 +56,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // A bare kill abandons the DashScope recognition task, which the service then
 // holds open until it times out on its own.
 const ENGINE_SHUTDOWN_GRACE: Duration = Duration::from_millis(1_000);
+// A one-file Python sidecar must be unpacked and may be scanned on its first
+// launch. Slow disks and Windows security software can legitimately exceed the
+// old eight-second budget before Python has imported the audio stack.
+const ENGINE_START_TIMEOUT: Duration = Duration::from_secs(60);
 const STDERR_HISTORY_LINES: usize = 20;
 const MAX_STDERR_DETAIL_CHARS: usize = 400;
 static SETTINGS_CREDENTIAL_LOCK: Mutex<()> = Mutex::new(());
@@ -91,8 +104,8 @@ impl Default for TranslationProvider {
             name: "Gemini".into(),
             protocol: "gemini".into(),
             base_url: DEFAULT_GEMINI_BASE_URL.into(),
-            models: vec!["gemini-2.5-flash".into()],
-            selected_model: "gemini-2.5-flash".into(),
+            models: vec![DEFAULT_TRANSLATION_MODEL.into()],
+            selected_model: DEFAULT_TRANSLATION_MODEL.into(),
         }
     }
 }
@@ -1354,7 +1367,7 @@ fn wait_for_start_response(
     request_id: &str,
     expected_session_id: &str,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + ENGINE_START_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2099,6 +2112,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_install_has_only_the_stock_services() {
+        let settings = PublicSettings::default();
+
+        assert_eq!(settings.translation_providers.len(), 1);
+        let provider = &settings.translation_providers[0];
+        assert_eq!(provider.id, DEFAULT_TRANSLATION_PROVIDER_ID);
+        assert_eq!(provider.name, "Gemini");
+        assert_eq!(provider.protocol, "gemini");
+        assert_eq!(provider.base_url, DEFAULT_GEMINI_BASE_URL);
+        assert_eq!(provider.models, vec![DEFAULT_TRANSLATION_MODEL]);
+        assert_eq!(provider.selected_model, DEFAULT_TRANSLATION_MODEL);
+        assert_eq!(settings.recognition.protocol, "dashscope");
+        assert_eq!(settings.recognition.base_url, DEFAULT_RECOGNITION_BASE_URL);
+        assert_eq!(
+            settings.recognition.model,
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+        assert!(ENGINE_START_TIMEOUT >= Duration::from_secs(30));
+    }
 
     #[test]
     fn migrates_legacy_settings_without_losing_provider_values() {

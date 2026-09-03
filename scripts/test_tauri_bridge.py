@@ -572,6 +572,21 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("dashscope-secret", message)
         self.assertEqual(message.count("***"), 2)
 
+    def test_sdk_error_message_does_not_depend_on_a_working_string_conversion(self) -> None:
+        class BrokenResult:
+            message = "authentication failed"
+
+            def __str__(self) -> str:
+                raise AttributeError("SDK response is incomplete")
+
+        self.assertEqual(bridge.sdk_result_message(BrokenResult()), "authentication failed")
+
+        class EmptyBrokenResult:
+            def __str__(self) -> str:
+                raise AttributeError("SDK response is incomplete")
+
+        self.assertEqual(bridge.sdk_result_message(EmptyBrokenResult()), "EmptyBrokenResult")
+
 
 class ProbeCommandTests(unittest.TestCase):
     def setUp(self) -> None:

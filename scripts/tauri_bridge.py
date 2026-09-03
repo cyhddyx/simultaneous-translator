@@ -73,7 +73,7 @@ AUDIO_STARTUP_TIMEOUT_S = 10.0
 DEFAULT_DASHSCOPE_WS_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
-DEFAULT_TRANSLATION_MODEL = "gemini-2.5-flash"
+DEFAULT_TRANSLATION_MODEL = "gemini-3.7-flash"
 DEFAULT_ASR_MODEL = "qwen-audio-3.0-asr-flash-streaming"
 DEFAULT_TARGET_LANGUAGE = "简体中文"
 DEFAULT_SOURCE_LANGUAGE = "自动检测"
@@ -151,6 +151,18 @@ def nested(data: Any, *keys: str, default: Any = None) -> Any:
         if current is None:
             return default
     return current
+
+
+def sdk_result_message(result: Any) -> str:
+    """Read an SDK error without trusting its potentially broken ``__str__``."""
+
+    message = nested(result, "message", default=None)
+    if message not in (None, ""):
+        return str(message)
+    try:
+        return str(result)
+    except Exception:  # noqa: BLE001 - third-party result objects may fail here
+        return type(result).__name__
 
 
 def redact_secret(message: Any, *secrets: str) -> str:
@@ -840,7 +852,7 @@ class AudioWorker(threading.Thread):
                     server.on_asr_ended(session, "closed")
 
                 def on_error(self, result: RecognitionResult) -> None:
-                    message = nested(result, "message", default=str(result))
+                    message = sdk_result_message(result)
                     server.on_asr_error(session, f"语音识别错误：{message}")
 
                 def on_complete(self) -> None:
@@ -1156,7 +1168,7 @@ def probe_recognition_connection(spec: ProviderSpec, timeout_s: float = PROBE_TI
             settled.set()
 
         def on_error(self, result: RecognitionResult) -> None:
-            outcome["error"] = nested(result, "message", default=str(result))
+            outcome["error"] = sdk_result_message(result)
             settled.set()
 
         def on_event(self, result: RecognitionResult) -> None:
