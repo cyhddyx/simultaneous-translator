@@ -561,6 +561,112 @@ class ProviderClientTests(unittest.TestCase):
             client.close()
         self.assertIn("没有结束", str(caught.exception))
 
+    def test_a_closed_keepalive_connection_is_retried_on_a_new_one(self) -> None:
+        """The reported failure: a relay drops an idle connection between sentences."""
+
+        attempts: list[int] = []
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise httpx.ReadError(
+                    "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation "
+                    "of protocol (_ssl.c:1081)"
+                )
+            return httpx.Response(
+                200,
+                content=self._sse('data: {"choices":[{"delta":{"content":"译文"}}]}', "data: [DONE]"),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        client = self._client(
+            bridge.OpenAICompatibleClient,
+            _spec("openai", "https://api.example", "gpt-test", "k"),
+            handler,
+        )
+        try:
+            with patch.object(bridge, "TRANSLATION_RETRY_BACKOFF_S", 0):
+                self.assertEqual(client.translate("hello"), "译文")
+        finally:
+            client.close()
+        self.assertEqual(len(attempts), 2)
+
+    def test_a_permanently_broken_connection_reports_a_readable_failure(self) -> None:
+        attempts: list[int] = []
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+
+        client = self._client(
+            bridge.OpenAICompatibleClient,
+            _spec("openai", "https://api.example", "gpt-test", "k"),
+            handler,
+        )
+        try:
+            with patch.object(bridge, "TRANSLATION_RETRY_BACKOFF_S", 0):
+                with self.assertRaises(RuntimeError) as caught:
+                    client.translate("hello")
+        finally:
+            client.close()
+        self.assertEqual(len(attempts), bridge.TRANSLATION_NETWORK_ATTEMPTS)
+        message = str(caught.exception)
+        self.assertIn("网络连接中断", message)
+        self.assertIn("已重试 2 次", message)
+        # The underlying cause stays visible for troubleshooting.
+        self.assertIn("UNEXPECTED_EOF_WHILE_READING", message)
+
+    def test_service_errors_and_silence_are_never_retried(self) -> None:
+        """Retrying a rejected request or a quiet model only wastes the queue."""
+
+        attempts: list[str] = []
+
+        def rejecting(_request: httpx.Request) -> httpx.Response:
+            attempts.append("http")
+            return httpx.Response(401, json={"error": {"message": "invalid api key"}})
+
+        def silent(_request: httpx.Request) -> httpx.Response:
+            attempts.append("timeout")
+            raise httpx.ReadTimeout("The read operation timed out")
+
+        for handler, expected in ((rejecting, "http"), (silent, "timeout")):
+            attempts.clear()
+            client = self._client(
+                bridge.OpenAICompatibleClient,
+                _spec("openai", "https://api.example", "gpt-test", "k"),
+                handler,
+            )
+            try:
+                with self.assertRaises(Exception):
+                    client.translate("hello")
+            finally:
+                client.close()
+            self.assertEqual(attempts, [expected])
+
+    def test_the_probe_reports_the_first_attempt_instead_of_retrying(self) -> None:
+        """The 检测 button is a diagnostic, and Tauri only waits 20 seconds."""
+
+        attempts: list[int] = []
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+
+        client = bridge.OpenAICompatibleClient(
+            _spec("openai", "https://api.example", "gpt-test", "k"),
+            total_timeout_s=bridge.PROBE_TIMEOUT_S,
+            network_attempts=1,
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                client.translate("hello")
+        finally:
+            client.close()
+        self.assertEqual(len(attempts), 1)
+        self.assertIn("网络连接中断", str(caught.exception))
+        self.assertNotIn("已重试", str(caught.exception))
+
 
 class RedactionTests(unittest.TestCase):
     def test_both_provider_keys_are_removed(self) -> None:

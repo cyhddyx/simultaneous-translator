@@ -61,6 +61,18 @@ TRANSLATION_IDLE_TIMEOUT_S = 12.0
 # A stream that dribbles forever would still hold the session's single ordered
 # worker and starve every later sentence, so the whole response is also capped.
 TRANSLATION_TOTAL_TIMEOUT_S = 45.0
+# A dropped connection is not a translation failure, so a sentence gets more than
+# one chance at one.  Keep-alive is the usual cause: the session reuses one
+# connection pool, and a relay, proxy or gateway that closes an idle connection
+# between sentences makes the next request die instantly with a TLS EOF
+# ([SSL: UNEXPECTED_EOF_WHILE_READING]) or a truncated body.  httpx never retries
+# a POST, so without this a single hiccup loses that subtitle for good.
+TRANSLATION_NETWORK_ATTEMPTS = 3
+TRANSLATION_RETRY_BACKOFF_S = 0.3
+# Retrying only pays off while the failure is fast, which is exactly how a dead
+# connection fails.  Once this much time has gone into one sentence, no further
+# attempt starts, so a slow endpoint cannot multiply the budgets above.
+TRANSLATION_RETRY_WINDOW_S = 8.0
 PROBE_TIMEOUT_S = 15.0
 # The audio thread is a daemon, so the interpreter would exit without running its
 # ``recognition.stop()`` cleanup.  Give it a bounded window to close the ASR
@@ -450,6 +462,7 @@ class ProviderClient:
         connect_timeout_s: float = TRANSLATION_CONNECT_TIMEOUT_S,
         idle_timeout_s: float = TRANSLATION_IDLE_TIMEOUT_S,
         total_timeout_s: float = TRANSLATION_TOTAL_TIMEOUT_S,
+        network_attempts: int = TRANSLATION_NETWORK_ATTEMPTS,
         disable_thinking: bool = True,
         transport: Any = None,
     ) -> None:
@@ -459,6 +472,7 @@ class ProviderClient:
 
         self._spec = spec
         self._total_timeout_s = total_timeout_s
+        self._network_attempts = max(1, int(network_attempts))
         # Live subtitles cannot afford a chain of thought, and several providers
         # now reason by default (DeepSeek V4 does, at "high" effort).  The switch
         # is provider-specific, so a rejection downgrades this for the rest of
@@ -607,6 +621,63 @@ class ProviderClient:
                 return self._complete_text(payload).strip()
         raise RuntimeError(f"翻译服务没有返回可用的流式响应：{body[:300]}")
 
+    @staticmethod
+    def _is_transient_network_error(exc: BaseException) -> bool:
+        """True when a failure is about the connection, not about the request.
+
+        Read and write timeouts are deliberately excluded: they mean the endpoint
+        accepted the request and then went quiet, which the idle budget already
+        governs, and repeating a sentence that is already seconds late only
+        delays the ones queued behind it.
+        """
+
+        import httpx
+
+        return isinstance(
+            exc,
+            (
+                # Socket-level connect/read/write/close failures, which is where
+                # an unexpected TLS EOF surfaces.
+                httpx.NetworkError,
+                # The peer closed the connection part-way through the body.
+                httpx.RemoteProtocolError,
+                httpx.ProxyError,
+                httpx.PoolTimeout,
+                httpx.ConnectTimeout,
+            ),
+        )
+
+    def _stream_with_retries(
+        self,
+        path: str,
+        *,
+        json_body: dict[str, Any],
+        params: dict[str, Any] | None = None,
+    ) -> str:
+        """Stream one translation, replacing a dead connection instead of failing.
+
+        httpx discards the failed connection, so every retry runs on a freshly
+        opened one; that is what makes a closed keep-alive connection recoverable.
+        Nothing is emitted before the whole answer is read, so a retry can never
+        duplicate part of a subtitle.
+        """
+
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._stream_translation(path, json_body=json_body, params=params)
+            except Exception as exc:
+                if not self._is_transient_network_error(exc):
+                    raise
+                out_of_attempts = attempt >= self._network_attempts
+                out_of_time = time.monotonic() - started >= TRANSLATION_RETRY_WINDOW_S
+                if out_of_attempts or out_of_time:
+                    retried = f"（已重试 {attempt - 1} 次）" if attempt > 1 else ""
+                    raise RuntimeError(f"与翻译服务的网络连接中断{retried}：{exc}") from exc
+            time.sleep(TRANSLATION_RETRY_BACKOFF_S * attempt)
+
     def translate(self, prompt: str) -> str:
         """Stream one translation, with thinking switched off when possible.
 
@@ -619,7 +690,7 @@ class ProviderClient:
         """
 
         try:
-            return self._stream_translation(
+            return self._stream_with_retries(
                 self._translate_path(),
                 json_body=self._translate_body(prompt, disable_thinking=self._disable_thinking),
                 params=self._translate_params(),
@@ -628,7 +699,7 @@ class ProviderClient:
             if not self._disable_thinking or not _rejects_request_body(exc):
                 raise
             self._disable_thinking = False
-        return self._stream_translation(
+        return self._stream_with_retries(
             self._translate_path(),
             json_body=self._translate_body(prompt, disable_thinking=False),
             params=self._translate_params(),
@@ -1536,8 +1607,12 @@ class BridgeServer:
             else:
                 # A probe translates three words, so it keeps the session's
                 # request shape but not its generous streaming budget; the
-                # settings dialog must not hang on a dead relay.
-                client = build_translation_client(spec, total_timeout_s=PROBE_TIMEOUT_S)
+                # settings dialog must not hang on a dead relay.  It also reports
+                # the first attempt instead of retrying: the button is a
+                # diagnostic, and Tauri only waits 20 seconds for an answer.
+                client = build_translation_client(
+                    spec, total_timeout_s=PROBE_TIMEOUT_S, network_attempts=1
+                )
                 translation = client.translate(
                     translation_prompt("Connectivity check.", "English", "简体中文")
                 )
