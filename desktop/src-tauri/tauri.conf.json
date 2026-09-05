@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "同传翻译",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "identifier": "com.simultaneous-translator.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -18,7 +18,11 @@
         "minWidth": 860,
         "minHeight": 560,
         "resizable": true,
-        "center": true
+        "center": true,
+        "decorations": false,
+        "shadow": true,
+        "theme": "Dark",
+        "backgroundColor": "#0f1115"
       }
     ],
     "security": {

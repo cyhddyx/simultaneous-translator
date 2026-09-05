@@ -1,7 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Capabilities for the simultaneous translation workspace.",
+  "description": "Capabilities for the simultaneous translation workspace. The window is undecorated, so the in-app title bar needs the drag, resize and caption-button commands that the native frame would otherwise provide.",
   "windows": ["main"],
-  "permissions": ["core:event:default"]
+  "permissions": [
+    "core:event:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-start-resize-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close"
+  ]
 }

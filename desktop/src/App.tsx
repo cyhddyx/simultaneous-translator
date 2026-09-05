@@ -1,12 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   CheckCircle2,
   CircleAlert,
-  CircleDot,
-  Clipboard,
   Copy,
-  Languages,
   LoaderCircle,
+  MessageSquareDashed,
   Play,
   Radio,
   RefreshCw,
@@ -20,6 +18,7 @@ import {
 } from "lucide-react";
 
 import { SettingsDialog } from "./SettingsDialog";
+import { TitleBar } from "./TitleBar";
 import { translatorApi } from "./tauri";
 import {
   IDLE_HEALTH,
@@ -204,25 +203,27 @@ function useElapsed(startedAt: string | null, active: boolean): number {
   return now;
 }
 
-function ServiceStatus({
+function StatusTile({
   icon: Icon,
   label,
   value,
-  health,
+  trailing,
 }: {
   icon: typeof Volume2;
   label: string;
   value: string;
-  health: HealthStatus;
+  trailing?: ReactNode;
 }) {
   return (
-    <div className="rail-item">
-      <Icon size={17} aria-hidden="true" />
-      <div>
-        <span>{label}</span>
-        <strong>{value}</strong>
+    <div className="status-tile">
+      <span className="status-tile__icon" aria-hidden="true">
+        <Icon size={16} />
+      </span>
+      <div className="status-tile__copy">
+        <span className="status-tile__label">{label}</span>
+        <strong className="status-tile__value">{value}</strong>
       </div>
-      <span className={statusClass(health)} aria-label={healthLabel(health)} />
+      {trailing}
     </div>
   );
 }
@@ -476,40 +477,35 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <header className="app-header">
-        <div className="app-brand">
-          <span className="app-brand__mark" aria-hidden="true">
-            <Languages size={20} />
-          </span>
-          <div>
-            <h1>同传翻译</h1>
-            <span className="runtime-label">{translatorApi.isTauri ? "桌面引擎" : "浏览器演示"}</span>
-          </div>
-        </div>
+      <TitleBar runtimeLabel={translatorApi.isTauri ? "桌面引擎" : "浏览器演示"} />
 
-        <div className="header-session-status" aria-live="polite">
+      <header className="app-toolbar">
+        <div className={`session-chip session-chip--${session.phase}`} aria-live="polite">
           {session.phase === "starting" || session.phase === "stopping" ? (
-            <LoaderCircle size={15} className="spin" aria-hidden="true" />
+            <LoaderCircle size={14} className="spin" aria-hidden="true" />
           ) : (
-            <CircleDot size={15} aria-hidden="true" />
+            <span className="session-chip__dot" aria-hidden="true" />
           )}
           <span>{loading ? "正在加载" : phaseLabel(session.phase)}</span>
         </div>
 
-        <div className="language-pair" aria-label={`从${snapshot.settings.sourceLanguage}翻译为${snapshot.settings.targetLanguage}`}>
+        <div
+          className="language-pair"
+          aria-label={`从${snapshot.settings.sourceLanguage}翻译为${snapshot.settings.targetLanguage}`}
+        >
           <span>{snapshot.settings.sourceLanguage}</span>
           <span className="language-pair__arrow" aria-hidden="true">→</span>
           <strong>{snapshot.settings.targetLanguage}</strong>
         </div>
 
-        <div className="header-actions">
+        <div className="toolbar-actions">
           <button
             className={`button ${active && session.phase !== "stopping" ? "button--danger" : "button--primary"}`}
             type="button"
             onClick={() => void handleSessionControl()}
             disabled={loading || actionPending || session.phase === "stopping"}
           >
-            {active ? <Square size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
+            {active ? <Square size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}
             {session.phase === "stopping" ? "正在停止" : active ? "停止同传" : "开始同传"}
           </button>
           <button
@@ -520,156 +516,188 @@ export default function App() {
             aria-label="打开设置"
             title={active ? "请先停止同传后修改设置" : "设置"}
           >
-            <Settings size={18} />
+            <Settings size={17} />
           </button>
         </div>
       </header>
 
-      <section className="status-rail" aria-label="会话状态">
-        <ServiceStatus
-          icon={Volume2}
-          label="音频"
-          value={session.deviceName ?? "等待设备"}
-          health={session.health.audio}
-        />
-        <ServiceStatus icon={Radio} label="语音识别" value={healthLabel(session.health.recognition)} health={session.health.recognition} />
-        <div className="rail-item rail-item--queue">
-          <Waves size={17} aria-hidden="true" />
-          <div>
-            <span>翻译队列</span>
-            <strong>{`${session.queue.pending} / ${session.queue.limit}`}</strong>
-          </div>
-          <span className={`queue-indicator queue-indicator--${queueTone}`} aria-label={`队列 ${session.queue.pending} / ${session.queue.limit}`} />
-        </div>
-        <div className="rail-item rail-item--duration">
-          <Timer size={17} aria-hidden="true" />
-          <div>
-            <span>本轮时长</span>
-            <strong>{formatElapsed(session.startedAt, elapsed)}</strong>
-          </div>
-        </div>
-        {session.queue.skipped > 0 && <span className="skipped-note">为保持实时性已跳过 {session.queue.skipped} 句</span>}
-      </section>
+      <div className="workspace">
+        <section className="status-tiles" aria-label="会话状态">
+          <StatusTile
+            icon={Volume2}
+            label="音频"
+            value={session.deviceName ?? "等待设备"}
+            trailing={
+              <span className={statusClass(session.health.audio)} aria-label={healthLabel(session.health.audio)} />
+            }
+          />
+          <StatusTile
+            icon={Radio}
+            label="语音识别"
+            value={healthLabel(session.health.recognition)}
+            trailing={
+              <span
+                className={statusClass(session.health.recognition)}
+                aria-label={healthLabel(session.health.recognition)}
+              />
+            }
+          />
+          <StatusTile
+            icon={Waves}
+            label="翻译队列"
+            value={`${session.queue.pending} / ${session.queue.limit}`}
+            trailing={
+              <span
+                className={`queue-indicator queue-indicator--${queueTone}`}
+                aria-label={`队列 ${session.queue.pending} / ${session.queue.limit}`}
+              />
+            }
+          />
+          <StatusTile icon={Timer} label="本轮时长" value={formatElapsed(session.startedAt, elapsed)} />
+          {session.queue.skipped > 0 && (
+            <p className="skipped-note">为保持实时性已跳过 {session.queue.skipped} 句</p>
+          )}
+        </section>
 
-      {visibleError && (
-        <section className="error-banner" role="alert">
-          <CircleAlert size={19} aria-hidden="true" />
-          <div className="error-banner__copy">
-            <strong>{visibleError.title}</strong>
-            <span>{visibleError.message}</span>
+        {visibleError && (
+          <section className="error-banner" role="alert">
+            <CircleAlert size={18} aria-hidden="true" />
+            <div className="error-banner__copy">
+              <strong>{visibleError.title}</strong>
+              <span>{visibleError.message}</span>
+            </div>
+            <div className="error-banner__actions">
+              {visibleError.recoverable && !active && (
+                <button className="button button--secondary button--compact" type="button" onClick={retry}>
+                  <RefreshCw size={14} aria-hidden="true" />
+                  重试
+                </button>
+              )}
+              {visibleError.service === "configuration" && (
+                <button
+                  className="button button--secondary button--compact"
+                  type="button"
+                  onClick={() => setSettingsOpen(true)}
+                >
+                  设置
+                </button>
+              )}
+              <button
+                className="icon-button icon-button--quiet"
+                type="button"
+                onClick={() => setDismissedErrorId(visibleError.id)}
+                aria-label="关闭错误提示"
+                title="关闭错误提示"
+              >
+                <X size={16} />
+              </button>
+            </div>
+          </section>
+        )}
+
+        <section
+          className={`panel caption-stage caption-stage--${snapshot.settings.subtitleSize}`}
+          aria-labelledby="caption-stage-title"
+        >
+          <div className="stage-topline">
+            <div className="panel-heading">
+              <p className="eyebrow">实时字幕</p>
+              <h2 id="caption-stage-title">
+                {session.phase === "listening" ? "正在捕捉系统声音" : "等待会话开始"}
+              </h2>
+            </div>
+            <div className="waveform-wrap">
+              <WaveformCanvas
+                active={session.phase === "listening"}
+                strength={session.partialTranscript ? 0.9 : 0.36}
+              />
+            </div>
           </div>
-          <div className="error-banner__actions">
-            {visibleError.recoverable && !active && (
-              <button className="button button--secondary button--compact" type="button" onClick={retry}>
-                <RefreshCw size={14} aria-hidden="true" />
-                重试
-              </button>
-            )}
-            {visibleError.service === "configuration" && (
-              <button className="button button--secondary button--compact" type="button" onClick={() => setSettingsOpen(true)}>
-                设置
-              </button>
-            )}
-            <button
-              className="icon-button icon-button--quiet"
-              type="button"
-              onClick={() => setDismissedErrorId(visibleError.id)}
-              aria-label="关闭错误提示"
-              title="关闭错误提示"
-            >
-              <X size={16} />
-            </button>
+
+          <div className="partial-line" aria-live="off">
+            <span className="caption-label">正在识别</span>
+            <p>{session.partialTranscript || (session.phase === "listening" ? "等待语音…" : "")}</p>
+          </div>
+
+          <div className="current-caption">
+            <div className="current-caption__source">
+              <span className="caption-label">原文</span>
+              <p>{currentCaption?.sourceText ?? ""}</p>
+            </div>
+            <div className="current-caption__translation">
+              <span className="caption-label">译文</span>
+              {stageTranslationState ? (
+                <p className="translation-pending">
+                  <LoaderCircle size={18} className="spin" aria-hidden="true" />
+                  {currentCaption ? captionStatusLabel(currentCaption) : ""}
+                </p>
+              ) : (
+                <p aria-live="polite">{stageTranslation ?? ""}</p>
+              )}
+            </div>
           </div>
         </section>
-      )}
 
-      <section className={`caption-stage caption-stage--${snapshot.settings.subtitleSize}`} aria-labelledby="caption-stage-title">
-        <div className="stage-topline">
-          <div>
-            <p className="eyebrow">实时字幕</p>
-            <h2 id="caption-stage-title">{session.phase === "listening" ? "正在捕捉系统声音" : "等待会话开始"}</h2>
-          </div>
-          <div className="waveform-wrap">
-            <WaveformCanvas active={session.phase === "listening"} strength={session.partialTranscript ? 0.9 : 0.36} />
-          </div>
-        </div>
+        <section className="panel history-section" aria-labelledby="history-title">
+          <header className="history-section__header">
+            <div className="panel-heading">
+              <p className="eyebrow">会话记录</p>
+              <h2 id="history-title">最近字幕</h2>
+            </div>
+            <div className="history-actions">
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => void handleCopy()}
+                disabled={!snapshot.captions.length}
+                aria-label="复制最近字幕"
+                title="复制最近字幕"
+              >
+                <Copy size={16} />
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => void handleClear()}
+                disabled={!snapshot.captions.length || active}
+                aria-label="清空字幕历史"
+                title={active ? "停止同传后清空字幕历史" : "清空字幕历史"}
+              >
+                <Trash2 size={16} />
+              </button>
+            </div>
+          </header>
 
-        <div className="partial-line" aria-live="off">
-          <span className="caption-label">正在识别</span>
-          <p>{session.partialTranscript || (session.phase === "listening" ? "等待语音…" : "")}</p>
-        </div>
-
-        <div className="current-caption">
-          <div className="current-caption__source">
-            <span className="caption-label">原文</span>
-            <p>{currentCaption?.sourceText ?? ""}</p>
-          </div>
-          <div className="current-caption__translation">
-            <span className="caption-label">译文</span>
-            {stageTranslationState ? (
-              <p className="translation-pending">
-                <LoaderCircle size={19} className="spin" aria-hidden="true" />
-                {currentCaption ? captionStatusLabel(currentCaption) : ""}
-              </p>
-            ) : (
-              <p aria-live="polite">{stageTranslation ?? ""}</p>
-            )}
-          </div>
-        </div>
-      </section>
-
-      <section className="history-section" aria-labelledby="history-title">
-        <header className="history-section__header">
-          <div>
-            <p className="eyebrow">会话记录</p>
-            <h2 id="history-title">最近字幕</h2>
-          </div>
-          <div className="history-actions">
-            <button
-              className="icon-button"
-              type="button"
-              onClick={() => void handleCopy()}
-              disabled={!snapshot.captions.length}
-              aria-label="复制最近字幕"
-              title="复制最近字幕"
-            >
-              <Copy size={17} />
-            </button>
-            <button
-              className="icon-button"
-              type="button"
-              onClick={() => void handleClear()}
-              disabled={!snapshot.captions.length || active}
-              aria-label="清空字幕历史"
-              title={active ? "停止同传后清空字幕历史" : "清空字幕历史"}
-            >
-              <Trash2 size={17} />
-            </button>
-          </div>
-        </header>
-
-        {snapshot.captions.length ? (
-          <ol className="caption-history" aria-label="字幕历史">
-            {[...snapshot.captions].reverse().map((caption) => (
-              <li key={caption.id} className="caption-history__item">
-                <time dateTime={caption.createdAt}>{formatCaptionTime(caption.createdAt)}</time>
-                <div className="caption-history__content">
-                  <p className="history-source">{caption.sourceText}</p>
-                  <p className={caption.status === "translated" ? "history-translation" : "history-translation is-pending"}>
-                    {caption.translationText ?? caption.errorMessage ?? captionStatusLabel(caption)}
-                  </p>
-                </div>
-                <CaptionStatus caption={caption} />
-              </li>
-            ))}
-          </ol>
-        ) : (
-          <div className="history-empty">
-            <Clipboard size={20} aria-hidden="true" />
-            <span>尚无字幕记录</span>
-          </div>
-        )}
-      </section>
+          {snapshot.captions.length ? (
+            <ol className="caption-history" aria-label="字幕历史">
+              {[...snapshot.captions].reverse().map((caption) => (
+                <li key={caption.id} className="caption-history__item">
+                  <time dateTime={caption.createdAt}>{formatCaptionTime(caption.createdAt)}</time>
+                  <div className="caption-history__content">
+                    <p className="history-source">{caption.sourceText}</p>
+                    <p
+                      className={
+                        caption.status === "translated" ? "history-translation" : "history-translation is-pending"
+                      }
+                    >
+                      {caption.translationText ?? caption.errorMessage ?? captionStatusLabel(caption)}
+                    </p>
+                  </div>
+                  <CaptionStatus caption={caption} />
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <div className="history-empty">
+              <span className="history-empty__icon" aria-hidden="true">
+                <MessageSquareDashed size={22} />
+              </span>
+              <p className="history-empty__title">尚无字幕记录</p>
+              <p className="history-empty__hint">开始同传后，识别到的原文与译文会按时间顺序出现在这里</p>
+            </div>
+          )}
+        </section>
+      </div>
 
       {toast && (
         <div className="toast" role="status">

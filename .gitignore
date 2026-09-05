@@ -33,6 +33,7 @@ desktop/src-tauri/binaries/*.exe
 # Local diagnostics
 _probe_audio.py
 _probe_build/
+backup/
 
 # Local settings, secrets, and editor metadata
 .env
