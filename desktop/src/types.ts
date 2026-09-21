@@ -6,24 +6,21 @@ export type SessionPhase =
   | "stopping"
   | "error";
 
-export type HealthStatus = "unknown" | "connecting" | "ready" | "degraded" | "failed";
+export type HealthStatus =
+  "unknown" | "connecting" | "ready" | "degraded" | "failed";
 
 export type CaptionStatus =
-  | "queued"
-  | "translating"
-  | "translated"
-  | "timed_out"
-  | "failed"
-  | "dropped";
+  "queued" | "translating" | "translated" | "timed_out" | "failed" | "dropped";
 
-export type SecretStatus = "missing" | "environment" | "secure_store" | "unavailable";
+export type SecretStatus =
+  "missing" | "environment" | "secure_store" | "unavailable";
 
 export type TranslationProtocol = "gemini" | "openai";
 
-/** `realtime` runs one speech-to-speech model; `pipeline` chains ASR + text model. */
-export type EngineMode = "pipeline" | "realtime";
+/** Legacy model fields remain only for settings migration. */
+export type EngineMode = "realtime";
 
-export type AudioInputKind = "loopback" | "microphone";
+export type AudioInputKind = "system" | "loopback" | "microphone";
 
 /** `listen` is other people heard by me; `speak` is me heard by other people. */
 export type ChannelId = "listen" | "speak";
@@ -59,6 +56,7 @@ export interface RealtimeServiceSettings {
 }
 
 export interface AudioChannelSettings {
+  voiceMode: "system" | "clone";
   enabled: boolean;
   input: AudioInputKind;
   inputDevice: string;
@@ -89,7 +87,8 @@ export interface TranslationProviderSettings {
   apiKeyStatus: SecretStatus;
 }
 
-export type ErrorService = "audio" | "recognition" | "translation" | "configuration" | "system";
+export type ErrorService =
+  "audio" | "recognition" | "translation" | "configuration" | "system";
 
 export interface EngineError {
   id: string;
@@ -154,26 +153,34 @@ export interface PublicSettings {
   subtitleSize: "small" | "medium" | "large";
 }
 
-export interface RecognitionServiceDraft extends Omit<RecognitionServiceSettings, "apiKeyStatus"> {
+export interface RecognitionServiceDraft extends Omit<
+  RecognitionServiceSettings,
+  "apiKeyStatus"
+> {
   apiKey?: string;
   clearApiKey?: boolean;
 }
 
-export interface TranslationProviderDraft extends Omit<TranslationProviderSettings, "apiKeyStatus"> {
+export interface TranslationProviderDraft extends Omit<
+  TranslationProviderSettings,
+  "apiKeyStatus"
+> {
   apiKey?: string;
   clearApiKey?: boolean;
 }
 
-export interface RealtimeServiceDraft extends Omit<RealtimeServiceSettings, "apiKeyStatus"> {
+export interface RealtimeServiceDraft extends Omit<
+  RealtimeServiceSettings,
+  "apiKeyStatus"
+> {
   apiKey?: string;
   clearApiKey?: boolean;
 }
 
-export interface SettingsDraft
-  extends Omit<
-    PublicSettings,
-    "recognition" | "translationProviders" | "realtime"
-  > {
+export interface SettingsDraft extends Omit<
+  PublicSettings,
+  "recognition" | "translationProviders" | "realtime"
+> {
   recognition: RecognitionServiceDraft;
   realtime: RealtimeServiceDraft;
   translationProviders: TranslationProviderDraft[];
@@ -239,7 +246,7 @@ export type TranslatorEvent =
 export const DEFAULT_SETTINGS: PublicSettings = {
   sourceLanguage: "自动检测",
   targetLanguage: "简体中文",
-  engine: "pipeline",
+  engine: "realtime",
   recognition: {
     protocol: "dashscope",
     baseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
@@ -248,29 +255,31 @@ export const DEFAULT_SETTINGS: PublicSettings = {
   },
   realtime: {
     protocol: "livetranslate",
-    baseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-    model: "qwen3.5-livetranslate-flash-realtime",
-    voice: "",
-    enableVoiceClone: false,
+    baseUrl: "wss://maas.qianwenaiapi.com/api-ws/v1/realtime",
+    model: "qwen3.8-livetranslate-flash-realtime",
+    voice: "default",
+    enableVoiceClone: true,
     voiceCloneFrequency: "once",
     apiKeyStatus: "missing",
   },
   audio: {
     listen: {
+      voiceMode: "system",
       enabled: true,
-      input: "loopback",
+      input: "system",
       inputDevice: "",
       targetLanguage: "简体中文",
       outputDevice: "",
-      playAudio: true,
+      playAudio: false,
     },
     speak: {
-      enabled: true,
+      voiceMode: "clone",
+      enabled: false,
       input: "microphone",
       inputDevice: "",
       targetLanguage: "English",
       outputDevice: "",
-      playAudio: true,
+      playAudio: false,
     },
   },
   translationProviders: [
@@ -289,7 +298,9 @@ export const DEFAULT_SETTINGS: PublicSettings = {
   subtitleSize: "medium",
 };
 
-export function cloneAudioChannel(channel: AudioChannelSettings): AudioChannelSettings {
+export function cloneAudioChannel(
+  channel: AudioChannelSettings,
+): AudioChannelSettings {
   return { ...channel };
 }
 

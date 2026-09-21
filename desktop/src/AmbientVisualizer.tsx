@@ -142,16 +142,21 @@ export function AmbientVisualizer({
       const cx = w * 0.5;
       const cy = h * 0.44;
 
-      // Vertical floating bobbing & gentle tilt
-      const hoverY = reducedMotion
-        ? 0
-        : Math.sin(time * 1.8) * (active ? 7 : 4.5);
+      // Only the capsule tilts; its supporting frame stays attached to the base.
       const tilt = reducedMotion
         ? 0
         : Math.sin(time * 1.2) * (active ? 0.05 : 0.025);
 
       const micX = cx;
-      const micY = cy + hoverY;
+      const micY = cy;
+      const micWidth = 58 * scale;
+      const micHeight = 88 * scale;
+      const halfW = micWidth / 2;
+      const halfH = micHeight / 2;
+      const cradleR = halfW + 12 * scale;
+      const swivelY = 10 * scale;
+      const baseY = cy + 68 * scale;
+      const stemTop = micY + swivelY + cradleR - 2.5 * scale;
 
       // -------------------------------------------------------------
       // 1. Soft Ambient Halo Glow behind the character
@@ -254,7 +259,7 @@ export function AmbientVisualizer({
       // 4. Desktop Base & Stem (Under the mic)
       // -------------------------------------------------------------
       ctx.save();
-      ctx.translate(micX, cy + 68 * scale);
+      ctx.translate(micX, baseY);
 
       // Base drop shadow
       ctx.beginPath();
@@ -294,17 +299,16 @@ export function AmbientVisualizer({
       stemGrad.addColorStop(1, "#94a3b8");
 
       ctx.beginPath();
-      ctx.rect(-4 * scale, -28 * scale, 8 * scale, 36 * scale);
+      ctx.rect(-4 * scale, stemTop - baseY, 8 * scale, baseY + 8 * scale - stemTop);
       ctx.fillStyle = stemGrad;
       ctx.fill();
       ctx.restore();
 
       // Dynamic Audio Equalizer Bars at base
       ctx.save();
-      const barCount = 7;
+      const barCount = 6;
       const barWidth = 4.5 * scale;
       const barGap = 3.5 * scale;
-      const startX = micX - ((barCount - 1) * (barWidth + barGap)) / 2;
       const barBaseY = cy + 74 * scale;
 
       for (let b = 0; b < barCount; b++) {
@@ -318,7 +322,9 @@ export function AmbientVisualizer({
           : (4 + Math.sin(time * 2 + b * 0.8) * 2.5) * scale;
         const clampedH = Math.max(3 * scale, barHeight);
 
-        const bx = startX + b * (barWidth + barGap);
+        // Leave the center clear so the stem reads as one uninterrupted piece.
+        const column = b < barCount / 2 ? b - barCount / 2 : b - barCount / 2 + 1;
+        const bx = micX + column * (barWidth + barGap);
         const barGrad = ctx.createLinearGradient(
           bx,
           barBaseY - clampedH,
@@ -344,38 +350,20 @@ export function AmbientVisualizer({
       ctx.restore();
 
       // -------------------------------------------------------------
-      // 5. The Main Cartoon Microphone Character (Rotates with tilt)
+      // 5. Fixed cradle with a capsule that tilts about its swivel
       // -------------------------------------------------------------
       ctx.save();
       ctx.translate(micX, micY);
-      ctx.rotate(tilt);
-
-      const micWidth = 58 * scale;
-      const micHeight = 88 * scale;
-      const halfW = micWidth / 2;
-      const halfH = micHeight / 2;
 
       // --- A. U-Shaped Shockmount Frame ---
       ctx.save();
-      const cradleR = halfW + 12 * scale;
       ctx.beginPath();
       // Arc around the bottom of the mic
-      ctx.arc(0, 10 * scale, cradleR, 0.05 * Math.PI, 0.95 * Math.PI, false);
+      ctx.arc(0, swivelY, cradleR, 0, Math.PI, false);
       ctx.lineWidth = 5 * scale;
       ctx.strokeStyle = "#64748b";
       ctx.lineCap = "round";
       ctx.stroke();
-
-      // Cradle bottom pivot connection
-      ctx.beginPath();
-      ctx.rect(
-        -3.5 * scale,
-        10 * scale + cradleR - 2 * scale,
-        7 * scale,
-        12 * scale,
-      );
-      ctx.fillStyle = "#475569";
-      ctx.fill();
 
       // Left & right swivel adjustment knobs
       [-cradleR, cradleR].forEach((kx) => {
@@ -398,6 +386,10 @@ export function AmbientVisualizer({
         ctx.stroke();
       });
       ctx.restore();
+
+      ctx.translate(0, swivelY);
+      ctx.rotate(tilt);
+      ctx.translate(0, -swivelY);
 
       // --- B. Microphone Capsule Outer Contour ---
       // We clip or draw the body in two halves: Upper Grille (Metal Mesh) & Lower Body (Glossy Cyan)

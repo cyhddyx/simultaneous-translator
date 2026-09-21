@@ -21,6 +21,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $DesktopRoot "node_modules"))) {
 }
 
 $env:Path = "$RustBin;$env:Path"
+if ($Mode -eq "dev") {
+    & $CargoPath build --manifest-path (Join-Path $DesktopRoot "src-tauri\Cargo.toml") --bin translator-audio-capture
+    if ($LASTEXITCODE -ne 0) { throw "System audio capture build failed." }
+}
 if ($Mode -eq "build") {
     if (-not (Test-Path -LiteralPath $SidecarBuildScript)) {
         throw "Tauri sidecar build script is missing."

@@ -1622,6 +1622,10 @@ button:disabled {
   gap: 14px;
 }
 
+.field-grid--output-languages {
+  align-items: start;
+}
+
 .field-group {
   display: grid;
   gap: 7px;
@@ -1949,12 +1953,11 @@ select:focus {
 }
 
 .settings-save-state {
-  overflow: hidden;
   min-width: 0;
   color: var(--text-muted);
   font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .settings-actions {
@@ -2136,11 +2139,12 @@ select:focus {
   }
 
   .settings-save-state {
-    display: none;
+    display: block;
   }
 
   .settings-dialog__footer {
     justify-content: flex-end;
+    flex-wrap: wrap;
   }
 }
 
@@ -2737,6 +2741,70 @@ body {
 .provider-workspace {
   border-radius: 8px;
 }
+
+.virtual-microphone {
+  display: grid;
+  gap: 12px;
+  padding: 16px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.virtual-microphone__route {
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.virtual-microphone__route strong {
+  color: var(--text-strong);
+  font-weight: 500;
+}
+.virtual-microphone__actions,
+.virtual-microphone__links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+.virtual-microphone__notice,
+.virtual-microphone__message {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.virtual-microphone__message { color: var(--text-strong); }
+.voice-settings-grid { margin-bottom: 18px; }
+.translation-directions {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+.translation-directions .language-pair {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  min-height: 32px;
+  height: auto;
+  padding: 6px 10px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.translation-directions .is-inactive { opacity: 0.65; }
+.direction-disabled { font-size: 11px; color: var(--text-muted); }
+.virtual-microphone__links button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+.virtual-microphone__links button:hover { text-decoration: underline; }
 
 @media (min-width: 1400px) {
   .ambient-panel {

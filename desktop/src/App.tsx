@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   CircleAlert,
   Copy,
+  Headphones,
   LoaderCircle,
   MessageSquareDashed,
   Mic,
@@ -398,11 +399,6 @@ export default function App() {
     session.lastError && session.lastError.id !== dismissedErrorId
       ? session.lastError
       : null;
-  const queueRatio =
-    session.queue.limit > 0 ? session.queue.pending / session.queue.limit : 0;
-  const queueTone =
-    queueRatio >= 0.75 ? "warning" : queueRatio > 0 ? "active" : "idle";
-
   const writeLocalError = useCallback((title: string, message: string) => {
     setSnapshot((current) => ({
       ...current,
@@ -559,17 +555,22 @@ export default function App() {
   const stageTranslation = currentCaption?.translationText;
   const stageTranslationState =
     currentCaption && currentCaption.status !== "translated";
-  const realtimeEngine = snapshot.settings.engine === "realtime";
   const liveChannel = session.partialChannel;
-  const channelTone: HealthStatus = worstHealth([
-    session.channels.listen,
-    session.channels.speak,
-  ]);
-  const activeChannelNames = realtimeEngine
-    ? (["listen", "speak"] as const).filter(
-        (id) => snapshot.settings.audio[id].enabled,
-      )
-    : [];
+  const activeChannelNames = (["listen", "speak"] as const).filter(
+    (id) => snapshot.settings.audio[id].enabled,
+  );
+  const channelTone: HealthStatus = worstHealth(
+    activeChannelNames.map((id) => session.channels[id]),
+  );
+  const voiceChannels = activeChannelNames.filter(
+    (id) => snapshot.settings.audio[id].playAudio,
+  );
+  const outputMode =
+    voiceChannels.length === 0
+      ? "语音转文字"
+      : voiceChannels.length === activeChannelNames.length
+        ? "语音转语音"
+        : "文字 / 语音";
   // "收听 · 对方" reads better than a bare channel name, and the label follows
   // whichever direction is currently speaking.
   const partialChannelLabel =
@@ -602,7 +603,9 @@ export default function App() {
           <div className="ambient-footer">
             <div className="ambient-session-label">
               <span>会话状态</span>
-              <span>{realtimeEngine ? "双向同传" : "语音翻译"}</span>
+              <span>
+                {activeChannelNames.length === 2 ? "双向同传" : "实时同传"}
+              </span>
             </div>
             <section className="status-tiles" aria-label="会话状态">
               <StatusTile
@@ -611,70 +614,37 @@ export default function App() {
                 value={session.deviceName ?? "等待设备"}
                 trailing={
                   <span
-                    className={statusClass(
-                      realtimeEngine ? channelTone : session.health.audio,
-                    )}
-                    aria-label={healthLabel(
-                      realtimeEngine ? channelTone : session.health.audio,
-                    )}
+                    className={statusClass(channelTone)}
+                    aria-label={healthLabel(channelTone)}
                   />
                 }
               />
-              {realtimeEngine ? (
-                <StatusTile
-                  icon={Radio}
-                  label="同传通道"
-                  value={
-                    activeChannelNames.length
-                      ? activeChannelNames
-                          .map(
-                            (id) =>
-                              `${id === "listen" ? "收听" : "发言"} ${channelLabel(session.channels[id])}`,
-                          )
-                          .join(" · ")
-                      : "未启用通道"
-                  }
-                  trailing={
-                    <span
-                      className={statusClass(channelTone)}
-                      aria-label={healthLabel(channelTone)}
-                    />
-                  }
-                />
-              ) : (
-                <StatusTile
-                  icon={Radio}
-                  label="语音识别"
-                  value={healthLabel(session.health.recognition)}
-                  trailing={
-                    <span
-                      className={statusClass(session.health.recognition)}
-                      aria-label={healthLabel(session.health.recognition)}
-                    />
-                  }
-                />
-              )}
               <StatusTile
-                icon={Waves}
-                label="翻译队列"
-                value={`${session.queue.pending} / ${session.queue.limit}`}
+                icon={Radio}
+                label="同传通道"
+                value={
+                  activeChannelNames.length
+                    ? activeChannelNames
+                        .map(
+                          (id) =>
+                            `${id === "listen" ? "收听" : "发言"} ${channelLabel(session.channels[id])}`,
+                        )
+                        .join(" · ")
+                    : "未启用通道"
+                }
                 trailing={
                   <span
-                    className={`queue-indicator queue-indicator--${queueTone}`}
-                    aria-label={`队列 ${session.queue.pending} / ${session.queue.limit}`}
+                    className={statusClass(channelTone)}
+                    aria-label={healthLabel(channelTone)}
                   />
                 }
               />
+              <StatusTile icon={Waves} label="输出模式" value={outputMode} />
               <StatusTile
                 icon={Timer}
                 label="本轮时长"
                 value={formatElapsed(session.startedAt, elapsed)}
               />
-              {session.queue.skipped > 0 && (
-                <p className="skipped-note">
-                  为保持实时性已跳过 {session.queue.skipped} 句
-                </p>
-              )}
             </section>
           </div>
         </aside>
@@ -697,20 +667,23 @@ export default function App() {
                 )}
                 <span>{loading ? "正在加载" : phaseLabel(session.phase)}</span>
               </div>
-              <button
-                className="language-pair"
-                type="button"
-                onClick={() => setSettingsOpen(true)}
-                disabled={active}
-                aria-label="设置翻译语言"
-                title={active ? "请先停止同传后修改语言" : "设置翻译语言"}
-              >
-                <span>{snapshot.settings.sourceLanguage}</span>
-                <span className="language-pair__arrow" aria-hidden="true">
-                  →
-                </span>
-                <strong>{snapshot.settings.targetLanguage}</strong>
-              </button>
+              <div className="translation-directions" aria-label="双向翻译语言">
+                {(["listen", "speak"] as const).map((id) => {
+                  const channel = snapshot.settings.audio[id];
+                  const Icon = id === "listen" ? Headphones : Mic;
+                  const label = id === "listen" ? "我听到" : "对方听到";
+                  return <button key={id}
+                    className={`language-pair ${channel.enabled ? "" : "is-inactive"}`}
+                    type="button" onClick={() => setSettingsOpen(true)} disabled={active}
+                    aria-label={`设置${label}的语言`}
+                    title={active ? "请先停止同传后修改语言" : `设置${label}的语言`}>
+                    <Icon size={14} aria-hidden="true" />
+                    <span>{label}</span><span className="language-pair__arrow" aria-hidden="true">→</span>
+                    <strong>{channel.targetLanguage}</strong>
+                    {!channel.enabled && <span className="direction-disabled">已停用</span>}
+                  </button>;
+                })}
+              </div>
             </div>
             {visibleError && (
               <section className="error-banner" role="alert">

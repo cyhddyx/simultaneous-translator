@@ -1,9 +1,10 @@
 [package]
 name = "simultaneous-translator"
-version = "0.2.0"
+version = "0.3.0"
 description = "Desktop simultaneous translation workspace"
 authors = ["cyhddyx"]
 edition = "2021"
+default-run = "simultaneous-translator"
 
 [lib]
 name = "simultaneous_translator_lib"
@@ -23,3 +24,4 @@ tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = "2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+wasapi = "=0.24.0"

@@ -20,6 +20,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
 use uuid::Uuid;
 
+mod virtual_microphone;
+mod translation_languages;
+
 // Dev and packaged builds share Tauri's application identifier, so they need
 // separate storage names or a release build will inherit local test providers.
 #[cfg(debug_assertions)]
@@ -30,7 +33,7 @@ const KEYRING_SERVICE: &str = "SimultaneousTranslatorProduction";
 const SETTINGS_FILE: &str = "settings.json";
 #[cfg(not(debug_assertions))]
 const SETTINGS_FILE: &str = "settings.production.json";
-const SETTINGS_SCHEMA_VERSION: u32 = 5;
+const SETTINGS_SCHEMA_VERSION: u32 = 8;
 const SECRET_ENVELOPE_VERSION: u32 = 2;
 const LEGACY_SECRET_ENVELOPE_VERSION: u32 = 1;
 const DEFAULT_TRANSLATION_PROVIDER_ID: &str = "gemini-default";
@@ -45,17 +48,16 @@ const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com
 const DEFAULT_TRANSLATION_MODEL: &str = "gemini-3.7-flash";
 // The realtime model streams audio in, and translated audio plus text out, over
 // one WebSocket: `?model=` selects it, so the base URL stays query-free.
-const DEFAULT_LIVETRANSLATE_BASE_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime";
-const DEFAULT_LIVETRANSLATE_MODEL: &str = "qwen3.5-livetranslate-flash-realtime";
+const DEFAULT_LIVETRANSLATE_BASE_URL: &str = "wss://maas.qianwenaiapi.com/api-ws/v1/realtime";
+const DEFAULT_LIVETRANSLATE_MODEL: &str = "qwen3.8-livetranslate-flash-realtime";
 const LIVETRANSLATE_PROTOCOL: &str = "livetranslate";
 const ENGINE_PIPELINE: &str = "pipeline";
 const ENGINE_REALTIME: &str = "realtime";
 const DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY: &str = "once";
 const VOICE_CLONE_FREQUENCIES: [&str; 3] = ["never", "once", "always"];
-const AUDIO_INPUT_KINDS: [&str; 2] = ["loopback", "microphone"];
+const AUDIO_INPUT_KINDS: [&str; 3] = ["system", "loopback", "microphone"];
 const MAX_AUDIO_DEVICE_BYTES: usize = 512;
 const MAX_REALTIME_VOICE_BYTES: usize = 80;
-const MAX_TRANSLATION_PROVIDERS: usize = 20;
 const MAX_MODELS_PER_PROVIDER: usize = 100;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_MODEL_ID_BYTES: usize = 256;
@@ -143,8 +145,8 @@ impl Default for RealtimeSettings {
             protocol: LIVETRANSLATE_PROTOCOL.into(),
             base_url: DEFAULT_LIVETRANSLATE_BASE_URL.into(),
             model: DEFAULT_LIVETRANSLATE_MODEL.into(),
-            voice: String::new(),
-            enable_voice_clone: false,
+            voice: "default".into(),
+            enable_voice_clone: true,
             voice_clone_frequency: DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY.into(),
         }
     }
@@ -153,6 +155,8 @@ impl Default for RealtimeSettings {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioChannelSettings {
+    #[serde(default)]
+    voice_mode: String,
     enabled: bool,
     input: String,
     input_device: String,
@@ -167,22 +171,24 @@ impl AudioChannelSettings {
             enabled: true,
             // The shipped behaviour listens to system playback, which is what a
             // meeting or a video call actually emits.
-            input: "loopback".into(),
+            input: "system".into(),
+            voice_mode: "system".into(),
             input_device: String::new(),
             target_language: "简体中文".into(),
             output_device: String::new(),
-            play_audio: true,
+            play_audio: false,
         }
     }
 
     fn speak() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             input: "microphone".into(),
+            voice_mode: "clone".into(),
             input_device: String::new(),
             target_language: "English".into(),
             output_device: String::new(),
-            play_audio: true,
+            play_audio: false,
         }
     }
 }
@@ -215,8 +221,7 @@ struct PublicSettings {
     active_translation_provider_id: String,
     keep_on_top: bool,
     caption_scale: String,
-    // Schema 5 adds the realtime engine. Older files load with the pipeline
-    // defaults, so an upgrade never silently switches how audio is translated.
+    // Legacy provider fields are retained for migration; schema 6 runs realtime only.
     #[serde(default = "default_engine")]
     engine: String,
     #[serde(default)]
@@ -226,7 +231,7 @@ struct PublicSettings {
 }
 
 fn default_engine() -> String {
-    ENGINE_PIPELINE.into()
+    ENGINE_REALTIME.into()
 }
 
 impl Default for PublicSettings {
@@ -328,6 +333,8 @@ struct RealtimeInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioChannelInput {
+    #[serde(default)]
+    voice_mode: String,
     enabled: bool,
     input: String,
     #[serde(default)]
@@ -524,6 +531,7 @@ struct EngineManager {
 #[derive(Clone, Default)]
 struct ProbeManager {
     gate: Arc<Mutex<()>>,
+    audio_gate: Arc<Mutex<()>>,
 }
 
 impl Default for EngineManager {
@@ -619,18 +627,45 @@ fn decode_public_settings_versioned(
             ))
         }
     };
-    let settings = match version {
+    let mut settings = match version {
         1 => {
             let legacy = serde_json::from_value::<LegacyPublicSettings>(value)
                 .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?;
             PublicSettings::from(legacy)
         }
-        2 | 3 | 4 | 5 => {
+        2 | 3 | 4 | 5 | 6 | 7 | 8 => {
             serde_json::from_value::<PublicSettings>(value)
                 .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?
         }
         version => return Err(SettingsDecodeError::UnsupportedVersion(version)),
     };
+    if version < 6 {
+        let was_pipeline = version < 5 || settings.engine != ENGINE_REALTIME;
+        settings.engine = ENGINE_REALTIME.into();
+        settings.source_language = "自动检测".into();
+        settings.realtime.model = DEFAULT_LIVETRANSLATE_MODEL.into();
+        if settings.realtime.base_url == "wss://dashscope.aliyuncs.com/api-ws/v1/realtime" {
+            settings.realtime.base_url = DEFAULT_LIVETRANSLATE_BASE_URL.into();
+        }
+        settings.realtime.voice.clear();
+        settings.realtime.enable_voice_clone = false;
+        if was_pipeline {
+            settings.audio = AudioSettings::default();
+            settings.audio.listen.target_language = settings.target_language.clone();
+        }
+    }
+    if version < 7 {
+        settings.realtime.voice = "default".into();
+        settings.realtime.enable_voice_clone = true;
+        settings.realtime.voice_clone_frequency = "once".into();
+    }
+    if version < 8 {
+        settings.audio.listen.voice_mode = "system".into();
+        settings.audio.speak.voice_mode = if settings.realtime.enable_voice_clone { "clone" } else { "system" }.into();
+        if settings.audio.listen.input == "loopback" && settings.audio.listen.input_device.is_empty() {
+            settings.audio.listen.input = "system".into();
+        }
+    }
     normalize_public_settings(settings)
         .map(|settings| (settings, version))
         .map_err(SettingsDecodeError::Invalid)
@@ -749,7 +784,7 @@ fn normalize_translation_provider(
 fn normalize_engine(value: &str) -> Result<String, String> {
     let engine = value.trim().to_lowercase();
     match engine.as_str() {
-        ENGINE_PIPELINE | ENGINE_REALTIME => Ok(engine),
+        ENGINE_PIPELINE | ENGINE_REALTIME => Ok(ENGINE_REALTIME.into()),
         _ => Err("翻译引擎无效，只能是管线翻译或实时同传".into()),
     }
 }
@@ -760,8 +795,8 @@ fn normalize_realtime(settings: RealtimeSettings) -> Result<RealtimeSettings, St
         return Err("实时同传仅支持 LiveTranslate 协议".into());
     }
     let model = settings.model.trim().to_string();
-    if model.is_empty() || model.len() > MAX_MODEL_ID_BYTES {
-        return Err("同传模型不能为空且不能过长".into());
+    if model != DEFAULT_LIVETRANSLATE_MODEL {
+        return Err("当前仅支持 qwen3.8-livetranslate-flash-realtime 同传模型".into());
     }
     let voice = settings.voice.trim().to_string();
     if voice.len() > MAX_REALTIME_VOICE_BYTES {
@@ -792,8 +827,8 @@ fn normalize_audio_channel(
     if !AUDIO_INPUT_KINDS.contains(&input.as_str()) {
         return Err(format!("{label}通道的音频来源无效"));
     }
-    // An empty target language means "follow the app-wide target" rather than an
-    // error, so a channel stays usable after the global language changes.
+    // Each direction supplies its own fallback; outgoing speech must never
+    // inherit the incoming translation target.
     let target_language = match settings.target_language.trim() {
         "" => default_target_language.to_string(),
         value if value.len() <= MAX_LANGUAGE_BYTES => value.to_string(),
@@ -805,6 +840,11 @@ fn normalize_audio_channel(
         return Err(format!("{label}通道的音频设备标识过长"));
     }
     Ok(AudioChannelSettings {
+        voice_mode: match settings.voice_mode.as_str() {
+            "system" | "clone" => settings.voice_mode,
+            "" => if label == "发言" { "clone" } else { "system" }.into(),
+            _ => return Err(format!("{label}通道的音色设置无效")),
+        },
         enabled: settings.enabled,
         input,
         input_device: input_device.into(),
@@ -820,7 +860,7 @@ fn normalize_audio_settings(
 ) -> Result<AudioSettings, String> {
     Ok(AudioSettings {
         listen: normalize_audio_channel(settings.listen, "收听", target_language)?,
-        speak: normalize_audio_channel(settings.speak, "发言", target_language)?,
+        speak: normalize_audio_channel(settings.speak, "发言", "English")?,
     })
 }
 
@@ -838,47 +878,9 @@ fn normalize_public_settings(settings: PublicSettings) -> Result<PublicSettings,
         return Err("字幕大小无效".into());
     }
 
-    let recognition_protocol = settings.recognition.protocol.trim().to_lowercase();
-    if recognition_protocol != "dashscope" {
-        return Err("当前版本的实时语音识别仅支持 DashScope 协议".into());
-    }
-    let recognition_model = settings.recognition.model.trim().to_string();
-    if recognition_model.is_empty() || recognition_model.len() > MAX_MODEL_ID_BYTES {
-        return Err("语音识别模型不能为空且不能过长".into());
-    }
-    let recognition = RecognitionSettings {
-        protocol: recognition_protocol,
-        base_url: normalize_endpoint(
-            &settings.recognition.base_url,
-            "wss",
-            "DashScope WebSocket",
-            None,
-        )?,
-        model: recognition_model,
-    };
-
-    if settings.translation_providers.is_empty() {
-        return Err("请至少添加一个翻译服务商".into());
-    }
-    if settings.translation_providers.len() > MAX_TRANSLATION_PROVIDERS {
-        return Err(format!(
-            "最多可保存 {MAX_TRANSLATION_PROVIDERS} 个翻译服务商"
-        ));
-    }
-    let mut provider_ids = HashSet::new();
-    let mut translation_providers = Vec::with_capacity(settings.translation_providers.len());
-    for provider in settings.translation_providers {
-        let provider = normalize_translation_provider(provider)?;
-        if !provider_ids.insert(provider.id.clone()) {
-            return Err("服务商标识重复，请删除后重新添加".into());
-        }
-        translation_providers.push(provider);
-    }
-    let active_translation_provider_id =
-        validate_provider_id(&settings.active_translation_provider_id)?;
-    if !provider_ids.contains(&active_translation_provider_id) {
-        return Err("当前翻译服务商不存在".into());
-    }
+    let recognition = settings.recognition;
+    let translation_providers = settings.translation_providers;
+    let active_translation_provider_id = settings.active_translation_provider_id;
 
     let engine = normalize_engine(&settings.engine)?;
     let realtime = normalize_realtime(settings.realtime)?;
@@ -930,7 +932,7 @@ fn normalize_settings(input: &SettingsInput) -> Result<PublicSettings, String> {
         engine: input
             .engine
             .clone()
-            .unwrap_or_else(|| ENGINE_PIPELINE.to_string()),
+            .unwrap_or_else(default_engine),
         realtime: input
             .realtime
             .as_ref()
@@ -960,6 +962,7 @@ fn normalize_settings(input: &SettingsInput) -> Result<PublicSettings, String> {
 
 fn channel_from_input(input: AudioChannelInput) -> AudioChannelSettings {
     AudioChannelSettings {
+        voice_mode: input.voice_mode,
         enabled: input.enabled,
         input: input.input,
         input_device: input.input_device,
@@ -1276,23 +1279,6 @@ fn provider_secret_source(provider: &TranslationProvider) -> Result<SecretSource
     match read_scoped_secret(&account, &scope)? {
         ScopedSecret::Available(_) => Ok(SecretSource::SecureStore),
         secret => Ok(scoped_secret_source(secret)),
-    }
-}
-
-fn resolve_recognition_secret(recognition: &RecognitionSettings) -> Result<String, String> {
-    if let Some(value) = environment_secret(recognition_environment(recognition)?) {
-        return Ok(value);
-    }
-    let scope = secret_scope(&recognition.protocol, &recognition.base_url)?;
-    match read_scoped_secret(
-        RECOGNITION_ACCOUNT,
-        &scope,
-    )? {
-        ScopedSecret::Available(value) => Ok(value),
-        ScopedSecret::ScopeMismatch => {
-            Err("语音识别服务地址已更改，请重新输入并保存 API Key".into())
-        }
-        ScopedSecret::Missing => Err("缺少语音识别 API Key，请在设置中配置".into()),
     }
 }
 
@@ -2158,10 +2144,13 @@ async fn test_provider_connection(
 async fn list_audio_devices(
     manager: State<'_, ProbeManager>,
 ) -> Result<Value, String> {
-    let gate = manager.gate.clone();
+    let gate = manager.audio_gate.clone();
     // Device enumeration reuses the probe path: one throwaway sidecar, one
     // request, then the sidecar dies, so it never disturbs a live session.
-    run_probe_blocking(gate, || run_probe_request("devices", json!({}))).await
+    spawn_command(move || {
+        let _guard = gate.lock().map_err(|_| "音频设备查询状态异常，请重启应用".to_string())?;
+        run_probe_request("devices", json!({}))
+    }).await
 }
 
 #[tauri::command]
@@ -2173,6 +2162,7 @@ fn save_settings_blocking(app: &AppHandle, input: SettingsInput) -> Result<Setti
     let _guard = lock_settings_credentials()?;
     let previous = load_public_settings_internal(app, false)?;
     let normalized = normalize_settings(&input)?;
+    translation_languages::validate_audio_languages(&normalized.audio)?;
     let recognition_change = requested_secret_change(
         input.recognition.api_key.as_deref(),
         input.recognition.clear_api_key.unwrap_or(false),
@@ -2382,25 +2372,17 @@ fn save_settings_blocking(app: &AppHandle, input: SettingsInput) -> Result<Setti
     Ok(snapshot_from_settings(normalized))
 }
 
-fn active_translation_provider(settings: &PublicSettings) -> Result<&TranslationProvider, String> {
-    settings
-        .translation_providers
-        .iter()
-        .find(|provider| provider.id == settings.active_translation_provider_id)
-        .ok_or_else(|| "当前翻译服务商不存在，请重新保存设置".into())
-}
-
 fn build_start_request(
     request_id: &str,
     session_id: &str,
     settings: &PublicSettings,
-    recognition_key: &str,
-    translation_key: &str,
+    _recognition_key: &str,
+    _translation_key: &str,
     realtime_key: &str,
 ) -> Result<Value, String> {
-    let provider = active_translation_provider(settings)?;
     let realtime = &settings.realtime;
     let audio = &settings.audio;
+    translation_languages::validate_audio_languages(audio)?;
     Ok(json!({
         "type": "request",
         "id": request_id,
@@ -2411,16 +2393,6 @@ fn build_start_request(
                 "engine": settings.engine,
                 "sourceLanguage": settings.source_language,
                 "targetLanguage": settings.target_language,
-                "recognition": {
-                    "protocol": settings.recognition.protocol,
-                    "baseUrl": settings.recognition.base_url,
-                    "model": settings.recognition.model
-                },
-                "translation": {
-                    "protocol": provider.protocol,
-                    "baseUrl": provider.base_url,
-                    "model": provider.selected_model
-                },
                 "realtime": {
                     "protocol": realtime.protocol,
                     "baseUrl": realtime.base_url,
@@ -2436,7 +2408,8 @@ fn build_start_request(
                         "inputDevice": audio.listen.input_device,
                         "targetLanguage": audio.listen.target_language,
                         "outputDevice": audio.listen.output_device,
-                        "playAudio": audio.listen.play_audio
+                        "playAudio": audio.listen.play_audio,
+                        "voiceMode": audio.listen.voice_mode
                     },
                     "speak": {
                         "enabled": audio.speak.enabled,
@@ -2444,13 +2417,12 @@ fn build_start_request(
                         "inputDevice": audio.speak.input_device,
                         "targetLanguage": audio.speak.target_language,
                         "outputDevice": audio.speak.output_device,
-                        "playAudio": audio.speak.play_audio
+                        "playAudio": audio.speak.play_audio,
+                        "voiceMode": audio.speak.voice_mode
                     }
                 }
             },
             "secrets": {
-                "recognition_api_key": recognition_key,
-                "translation_api_key": translation_key,
                 "realtime_api_key": realtime_key
             }
         }
@@ -2469,26 +2441,20 @@ async fn start_translation(
 fn start_translation_blocking(app: AppHandle, manager: &EngineManager) -> Result<StartResult, String> {
     let settings_guard = lock_settings_credentials()?;
     let settings = load_public_settings_internal(&app, false)?;
-    // The realtime model recognises and translates audio itself, so demanding
-    // the pipeline credentials would block a perfectly valid session.
-    let realtime_mode = settings.engine == ENGINE_REALTIME;
-    let recognition_key = if realtime_mode {
-        String::new()
-    } else {
-        resolve_recognition_secret(&settings.recognition)?
-    };
-    let translation_key = if realtime_mode {
-        String::new()
-    } else {
-        resolve_provider_secret(active_translation_provider(&settings)?)?
-    };
-    let realtime_key = if realtime_mode {
-        resolve_realtime_secret(&settings.realtime)?
-    } else {
-        String::new()
-    };
+    let recognition_key = String::new();
+    let translation_key = String::new();
+    let realtime_key = resolve_realtime_secret(&settings.realtime)?;
     drop(settings_guard);
     let session_id = Uuid::new_v4().to_string();
+    let request_id = Uuid::new_v4().to_string();
+    let request = build_start_request(
+        &request_id,
+        &session_id,
+        &settings,
+        &recognition_key,
+        &translation_key,
+        &realtime_key,
+    )?;
 
     let mut process = manager.process.lock().map_err(|_| "翻译引擎状态不可用".to_string())?;
     stop_locked(&mut process);
@@ -2500,15 +2466,6 @@ fn start_translation_blocking(app: AppHandle, manager: &EngineManager) -> Result
     let stdout_receiver = start_stdout_reader(stdout);
     let stderr_log = start_stderr_forwarder(stderr);
 
-    let request_id = Uuid::new_v4().to_string();
-    let request = build_start_request(
-        &request_id,
-        &session_id,
-        &settings,
-        &recognition_key,
-        &translation_key,
-        &realtime_key,
-    )?;
     if let Err(error) = write_json_line(&mut stdin, request) {
         let _ = child.kill();
         let _ = child.wait();
@@ -2566,6 +2523,7 @@ pub fn run() {
         }))
         .manage(EngineManager::default())
         .manage(ProbeManager::default())
+        .manage(virtual_microphone::InstallerState::default())
         .setup(|app| {
             if let Ok(settings) = load_public_settings(&app.handle()) {
                 if let Some(window) = app.get_webview_window("main") {
@@ -2580,6 +2538,8 @@ pub fn run() {
             fetch_provider_models,
             test_provider_connection,
             list_audio_devices,
+            virtual_microphone::install_virtual_microphone,
+            virtual_microphone::open_virtual_microphone_link,
             save_settings,
             start_translation,
             stop_translation
@@ -2596,6 +2556,37 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_legacy_speech_target_is_readable_but_cannot_start() {
+        for target in ["粤语", "Cantonese", "YUE", "Ελληνικά", "el"] {
+            let mut saved = PublicSettings::default();
+            saved.audio.listen.target_language = target.into();
+            saved.audio.listen.play_audio = true;
+            let loaded = decode_public_settings(&serde_json::to_string(&saved).unwrap()).unwrap();
+            assert_eq!(loaded.audio.listen.target_language, target);
+            assert!(loaded.audio.listen.play_audio);
+            let error = build_start_request("request", "session", &loaded, "", "", "test").unwrap_err();
+            assert!(error.contains("仅支持文字"));
+        }
+    }
+
+    #[test]
+    fn language_modes_validate_each_direction_without_changing_targets() {
+        let mut settings = PublicSettings::default();
+        settings.audio.listen.target_language = "粤语".into();
+        settings.audio.speak.enabled = true;
+        settings.audio.speak.play_audio = true;
+        let request = build_start_request("request", "session", &settings, "", "", "test").unwrap();
+        assert_eq!(request["params"]["config"]["audio"]["listen"]["targetLanguage"], "粤语");
+        assert_eq!(request["params"]["config"]["audio"]["speak"]["targetLanguage"], "English");
+        settings.audio.speak.target_language = "希腊语".into();
+        assert!(build_start_request("request", "session", &settings, "", "", "test").unwrap_err().contains("发言"));
+        settings.audio.speak.enabled = false;
+        assert!(build_start_request("request", "session", &settings, "", "", "test").is_ok());
+        settings.audio.listen.target_language = "unknown-language".into();
+        assert!(build_start_request("request", "session", &settings, "", "", "test").is_err());
+    }
 
     #[test]
     fn clean_install_has_only_the_stock_services() {
@@ -2638,7 +2629,7 @@ mod tests {
         assert_eq!(migrated.translation_providers.len(), 1);
         let provider = &migrated.translation_providers[0];
         assert_eq!(provider.id, DEFAULT_TRANSLATION_PROVIDER_ID);
-        assert_eq!(provider.base_url, "https://relay.example/gemini");
+        assert_eq!(provider.base_url, "https://relay.example/gemini/v1beta");
         assert_eq!(provider.selected_model, "custom-gemini-model");
         assert_eq!(provider.models, vec!["custom-gemini-model"]);
         assert!(migrated.keep_on_top);
@@ -2646,32 +2637,20 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_models_and_rejects_duplicate_provider_ids() {
+    fn unused_legacy_models_do_not_block_realtime() {
         let mut settings = PublicSettings::default();
-        settings.translation_providers[0].models = vec![
-            " gemini-2.5-flash ".into(),
-            "gemini-2.5-flash".into(),
-        ];
-        settings.translation_providers[0].selected_model = "custom-model".into();
-        let normalized = normalize_public_settings(settings.clone()).expect("settings are valid");
-        assert_eq!(
-            normalized.translation_providers[0].models,
-            vec!["gemini-2.5-flash", "custom-model"]
-        );
-
-        settings.translation_providers.push(settings.translation_providers[0].clone());
-        assert!(normalize_public_settings(settings)
-            .expect_err("duplicate IDs must fail")
-            .contains("重复"));
+        settings.translation_providers.clear();
+        settings.recognition.model.clear();
+        let normalized = normalize_public_settings(settings).expect("only realtime is required");
+        assert_eq!(normalized.engine, ENGINE_REALTIME);
     }
 
     #[test]
     fn rejects_unsupported_future_settings_version() {
-        let error = decode_public_settings(
-            r#"{"schemaVersion":6,"translationProviders":[]}"#,
-        )
+        let future = u64::from(SETTINGS_SCHEMA_VERSION) + 1;
+        let error = decode_public_settings(&json!({"schemaVersion": future, "translationProviders": []}).to_string())
         .expect_err("future settings must not be interpreted as v2");
-        assert_eq!(error, SettingsDecodeError::UnsupportedVersion(6));
+        assert_eq!(error, SettingsDecodeError::UnsupportedVersion(future));
     }
 
     #[test]
@@ -2860,52 +2839,18 @@ mod tests {
     }
 
     #[test]
-    fn start_request_uses_only_the_selected_provider_contract() {
-        let mut settings = PublicSettings::default();
-        settings.translation_providers.push(TranslationProvider {
-            id: "openai-custom".into(),
-            name: "Custom OpenAI".into(),
-            protocol: "openai".into(),
-            base_url: "https://relay.example".into(),
-            models: vec!["chat-model".into()],
-            selected_model: "chat-model".into(),
-        });
-        settings.active_translation_provider_id = "openai-custom".into();
+    fn start_request_contains_only_realtime_configuration_and_key() {
+        let settings = PublicSettings::default();
         let request = build_start_request(
-            "request-id",
-            "session-id",
-            &settings,
-            "recognition-secret",
-            "translation-secret",
-            "realtime-secret",
-        )
-        .expect("request should serialize");
-
-        assert_eq!(
-            request.pointer("/params/config/engine"),
-            Some(&json!(ENGINE_PIPELINE))
-        );
-        assert_eq!(
-            request.pointer("/params/config/translation/protocol"),
-            Some(&json!("openai"))
-        );
-        assert_eq!(
-            request.pointer("/params/config/translation/baseUrl"),
-            Some(&json!("https://relay.example"))
-        );
-        assert_eq!(
-            request.pointer("/params/config/translation/model"),
-            Some(&json!("chat-model"))
-        );
-        assert_eq!(
-            request.pointer("/params/secrets/translation_api_key"),
-            Some(&json!("translation-secret"))
-        );
-        assert_eq!(
-            request.pointer("/params/secrets/recognition_api_key"),
-            Some(&json!("recognition-secret"))
-        );
-        assert!(request.pointer("/params/config/geminiModel").is_none());
+            "request-id", "session-id", &settings,
+            "recognition-secret", "translation-secret", "realtime-secret",
+        ).expect("request should serialize");
+        assert_eq!(request.pointer("/params/config/engine"), Some(&json!(ENGINE_REALTIME)));
+        assert!(request.pointer("/params/config/translation").is_none());
+        assert!(request.pointer("/params/config/recognition").is_none());
+        assert!(request.pointer("/params/secrets/translation_api_key").is_none());
+        assert!(request.pointer("/params/secrets/recognition_api_key").is_none());
+        assert_eq!(request.pointer("/params/secrets/realtime_api_key"), Some(&json!("realtime-secret")));
     }
 
     #[cfg(windows)]
@@ -2991,6 +2936,7 @@ mod tests {
 
     fn channel_input(channel: AudioChannelSettings) -> AudioChannelInput {
         AudioChannelInput {
+            voice_mode: channel.voice_mode,
             enabled: channel.enabled,
             input: channel.input,
             input_device: channel.input_device,
@@ -3001,22 +2947,25 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_install_still_translates_with_the_pipeline() {
+    fn a_clean_install_uses_realtime_text_mode() {
         let settings = PublicSettings::default();
 
-        assert_eq!(settings.engine, ENGINE_PIPELINE);
+        assert_eq!(settings.engine, ENGINE_REALTIME);
         assert_eq!(settings.realtime.protocol, LIVETRANSLATE_PROTOCOL);
         assert_eq!(settings.realtime.base_url, DEFAULT_LIVETRANSLATE_BASE_URL);
         assert_eq!(settings.realtime.model, DEFAULT_LIVETRANSLATE_MODEL);
-        assert!(settings.realtime.voice.is_empty());
+        assert_eq!(settings.realtime.voice, "default");
+        assert!(settings.realtime.enable_voice_clone);
         assert!(settings.audio.listen.enabled);
-        assert_eq!(settings.audio.listen.input, "loopback");
+        assert_eq!(settings.audio.listen.input, "system");
         assert_eq!(settings.audio.speak.input, "microphone");
         assert_eq!(settings.audio.speak.target_language, "English");
+        assert!(!settings.audio.speak.enabled);
+        assert!(!settings.audio.listen.play_audio);
     }
 
     #[test]
-    fn schema_four_files_upgrade_to_the_pipeline_without_switching_engines() {
+    fn schema_four_files_upgrade_to_realtime() {
         let stored = json!({
             "schemaVersion": 4,
             "sourceLanguage": "自动检测",
@@ -3042,8 +2991,8 @@ mod tests {
 
         let settings = decode_public_settings(&stored).expect("schema 4 must stay readable");
 
-        assert_eq!(settings.engine, ENGINE_PIPELINE);
-        assert_eq!(settings.audio.listen.input, "loopback");
+        assert_eq!(settings.engine, ENGINE_REALTIME);
+        assert_eq!(settings.audio.listen.input, "system");
         assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
     }
 
@@ -3068,6 +3017,24 @@ mod tests {
             settings.realtime.voice_clone_frequency,
             DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY
         );
+    }
+
+    #[test]
+    fn schema_six_enables_original_voice_and_preserves_audio_routes() {
+        let mut original = PublicSettings::default();
+        original.schema_version = 6;
+        original.realtime.enable_voice_clone = false;
+        original.realtime.voice.clear();
+        original.audio.speak.output_device = "headset".into();
+        let migrated = decode_public_settings(&serde_json::to_string(&original).unwrap()).unwrap();
+        assert!(migrated.realtime.enable_voice_clone);
+        assert_eq!(migrated.realtime.voice, "default");
+        assert_eq!(migrated.realtime.voice_clone_frequency, "once");
+        assert_eq!(migrated.audio.speak.output_device, "headset");
+        let mut saved = migrated;
+        saved.realtime.enable_voice_clone = false;
+        let reloaded = decode_public_settings(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(!reloaded.realtime.enable_voice_clone);
     }
 
     #[test]
@@ -3098,12 +3065,44 @@ mod tests {
         let error = normalize_settings(&input).expect_err("no channel means no audio to translate");
         assert!(error.contains("至少需要启用一个翻译通道"), "{error}");
 
-        // The pipeline engine keeps listening to system audio, so it stays valid.
+        // Legacy engine names migrate to realtime and require an enabled channel.
         let mut audio = AudioSettings::default();
         audio.listen.enabled = false;
         audio.speak.enabled = false;
         let input = realtime_settings_input(ENGINE_PIPELINE, RealtimeSettings::default(), audio);
-        assert!(normalize_settings(&input).is_ok());
+        assert!(normalize_settings(&input).is_err());
+    }
+
+    #[test]
+    fn schema_seven_separates_voices_and_migrates_default_loopback() {
+        let mut previous = PublicSettings::default();
+        previous.schema_version = 7;
+        previous.audio.listen.input = "loopback".into();
+        previous.audio.speak.output_device = "cable".into();
+        previous.realtime.enable_voice_clone = false;
+        let migrated = decode_public_settings(&serde_json::to_string(&previous).unwrap()).unwrap();
+        assert_eq!(migrated.audio.listen.voice_mode, "system");
+        assert_eq!(migrated.audio.speak.voice_mode, "system");
+        assert_eq!(migrated.audio.listen.input, "system");
+        assert_eq!(migrated.audio.speak.output_device, "cable");
+        let mut current = migrated;
+        current.audio.listen.voice_mode = "clone".into();
+        let reloaded = decode_public_settings(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(reloaded.audio.listen.voice_mode, "clone");
+        assert_eq!(reloaded.audio.speak.voice_mode, "system");
+        previous.audio.listen.input_device = "selected-speaker".into();
+        let explicit = decode_public_settings(&serde_json::to_string(&previous).unwrap()).unwrap();
+        assert_eq!(explicit.audio.listen.input, "loopback");
+    }
+
+    #[test]
+    fn missing_outgoing_language_does_not_inherit_listening_language() {
+        let mut audio = AudioSettings::default();
+        audio.listen.target_language.clear();
+        audio.speak.target_language.clear();
+        let normalized = normalize_audio_settings(audio, "简体中文").unwrap();
+        assert_eq!(normalized.listen.target_language, "简体中文");
+        assert_eq!(normalized.speak.target_language, "English");
     }
 
     #[test]
@@ -3138,7 +3137,7 @@ mod tests {
         );
         assert_eq!(
             request.pointer("/params/config/audio/listen/input"),
-            Some(&json!("loopback"))
+            Some(&json!("system"))
         );
         assert_eq!(
             request.pointer("/params/config/audio/speak/inputDevice"),
@@ -3148,6 +3147,10 @@ mod tests {
             request.pointer("/params/config/audio/speak/outputDevice"),
             Some(&json!("cable-input"))
         );
+        assert_eq!(request.pointer("/params/config/audio/listen/voiceMode"), Some(&json!("system")));
+        assert_eq!(request.pointer("/params/config/audio/speak/voiceMode"), Some(&json!("clone")));
+        assert_eq!(request.pointer("/params/config/audio/listen/targetLanguage"), Some(&json!("简体中文")));
+        assert_eq!(request.pointer("/params/config/audio/speak/targetLanguage"), Some(&json!("English")));
         assert_eq!(
             request.pointer("/params/secrets/realtime_api_key"),
             Some(&json!("realtime-secret"))

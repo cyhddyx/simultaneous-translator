@@ -20,9 +20,9 @@ Wire protocol (``wss://<host>/api-ws/v1/realtime?model=<model>``):
 * ``session.finish`` must be sent before closing, otherwise the last utterance
   is lost; the server acknowledges with ``session.finished``.
 
-Translated text arrives through ``response.text.text`` (text-only modality) or
-``response.audio_transcript.text`` (text + audio).  Note that these are *not*
-the ``response.text.delta`` events of the full-duplex Omni models.
+Qwen3.8 text arrives through ``response.text.delta`` (text only) or
+``response.audio_transcript.delta`` (text + audio). Fragments are accumulated
+until the corresponding completion event. No external ASR or TTS is used.
 """
 
 from __future__ import annotations
@@ -36,14 +36,18 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
-DEFAULT_LIVETRANSLATE_WS_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
-DEFAULT_LIVETRANSLATE_MODEL = "qwen3.5-livetranslate-flash-realtime"
+# Load the resampler's native dependencies before capture workers start.
+from system_capture import SystemCapture
+
+DEFAULT_LIVETRANSLATE_WS_URL = "wss://maas.qianwenaiapi.com/api-ws/v1/realtime"
+DEFAULT_LIVETRANSLATE_MODEL = "qwen3.8-livetranslate-flash-realtime"
 LIVETRANSLATE_PROTOCOLS = ("livetranslate",)
 
 CHANNEL_IDS = ("listen", "speak")
-INPUT_KINDS = ("loopback", "microphone")
+INPUT_KINDS = ("system", "loopback", "microphone")
 VOICE_CLONE_FREQUENCIES = ("never", "once", "always")
 
 # Encodings are fixed by the service: PCM16 mono, 16 kHz up / 24 kHz down.
@@ -58,86 +62,41 @@ PLAYER_QUEUE_CHUNKS = 240
 CONNECT_TIMEOUT_S = 20.0
 FINISH_TIMEOUT_S = 15.0
 CLOSE_TIMEOUT_S = 5.0
-ASR_MODEL = "qwen3-asr-flash-realtime"
 
+# Shared with the desktop UI and native save/start validation.
+_LANGUAGES = json.loads(Path(__file__).with_name("translation_languages.json").read_text(encoding="utf-8"))["languages"]
+_LANGUAGES_BY_CODE = {language["code"]: language for language in _LANGUAGES}
 _LANGUAGE_CODES = {
-    "自动检测": "auto",
-    "自动": "auto",
-    "简体中文": "zh",
-    "中文": "zh",
-    "繁體中文": "zh",
-    "粤语": "yue",
-    "英语": "en",
-    "日语": "ja",
-    "韓語": "ko",
-    "韩语": "ko",
-    "俄语": "ru",
-    "法语": "fr",
-    "德语": "de",
-    "葡萄牙语": "pt",
-    "西班牙语": "es",
-    "意大利语": "it",
-    "印尼语": "id",
-    "越南语": "vi",
-    "泰语": "th",
-    "阿拉伯语": "ar",
-    "印地语": "hi",
-    "希腊语": "el",
-    "土耳其语": "tr",
+    alias.lower(): language["code"]
+    for language in _LANGUAGES
+    for alias in [language["code"], language["label"], *language["aliases"]]
 }
-
-_ENGLISH_LANGUAGE_CODES = {
-    "auto": "auto",
-    "automatic": "auto",
-    "chinese": "zh",
-    "mandarin": "zh",
-    "cantonese": "yue",
-    "english": "en",
-    "japanese": "ja",
-    "korean": "ko",
-    "russian": "ru",
-    "french": "fr",
-    "german": "de",
-    "portuguese": "pt",
-    "spanish": "es",
-    "italian": "it",
-    "indonesian": "id",
-    "vietnamese": "vi",
-    "thai": "th",
-    "arabic": "ar",
-    "hindi": "hi",
-    "greek": "el",
-    "turkish": "tr",
-}
-
-_KNOWN_LANGUAGE_CODES = frozenset(
-    value for value in list(_LANGUAGE_CODES.values()) + list(_ENGLISH_LANGUAGE_CODES.values())
-)
+_LANGUAGE_CODES.update({alias: "auto" for alias in ("自动检测", "自动", "auto", "automatic")})
 
 
 def language_code(value: Any, default: str = "en") -> str:
     """Map a UI language label (or an ISO code) to the model's language code."""
 
     text = value.strip() if isinstance(value, str) else ""
-    if not text:
-        return default
-    lowered = text.lower()
-    if lowered in _KNOWN_LANGUAGE_CODES:
-        return lowered
-    for table in (_LANGUAGE_CODES, _ENGLISH_LANGUAGE_CODES):
-        if text in table:
-            return table[text]
-        if lowered in table:
-            return table[lowered]
-    return default
+    return _LANGUAGE_CODES.get(text.lower(), default)
+
+
+def validate_output_language(value: str, play_audio: bool, label: str) -> str:
+    code = language_code(value, "")
+    language = _LANGUAGES_BY_CODE.get(code)
+    if language is None:
+        raise ValueError(f"{label}通道的目标语言不受当前模型支持，请重新选择。")
+    if play_audio and not language["audio"]:
+        raise ValueError(f"{label}通道：{language['label']}仅支持文字输出，不能语音播报。请改为文字输出，或选择其他译文语言。")
+    return code
 
 
 @dataclass(frozen=True)
 class RealtimeOptions:
     """Session-wide realtime model options shared by every channel."""
 
-    voice: str = ""
-    enable_voice_clone: bool = False
+    voice: str = "default"
+    enable_voice_clone: bool = True
     voice_clone_frequency: str = "once"
 
 
@@ -152,6 +111,7 @@ class ChannelSpec:
     target_language: str
     output_device: str
     play_audio: bool
+    voice_mode: str = ""
 
     @property
     def label(self) -> str:
@@ -181,14 +141,13 @@ def parse_channel_specs(
     raw: Any,
     *,
     default_target_language: str,
-    listen_default_input: str = "loopback",
+    listen_default_input: str = "system",
     speak_default_input: str = "microphone",
 ) -> tuple[ChannelSpec, ...]:
     """Build both channel specifications from the ``audio`` config object.
 
-    Unknown or malformed fields fall back to a working default instead of
-    failing the session, because a bad device id is already recoverable at
-    runtime and should not cost the user the other channel.
+    Missing fields retain their defaults. Explicit unsupported output languages
+    fail validation before any channel starts capturing or connecting.
     """
 
     table = raw if isinstance(raw, dict) else {}
@@ -199,7 +158,8 @@ def parse_channel_specs(
         default_input = listen_default_input if channel == "listen" else speak_default_input
         target = _field(entry, "target_language")
         if not isinstance(target, str) or not target.strip():
-            target = default_target_language
+            target = default_target_language if channel == "listen" else "English"
+        target = target.strip()
         input_device = _field(entry, "input_device")
         output_device = _field(entry, "output_device")
         specs.append(
@@ -210,9 +170,13 @@ def parse_channel_specs(
                 input_device=input_device.strip() if isinstance(input_device, str) else "",
                 target_language=target,
                 output_device=output_device.strip() if isinstance(output_device, str) else "",
-                play_audio=_flag(_field(entry, "play_audio"), True),
+                play_audio=_flag(_field(entry, "play_audio"), False),
+                voice_mode=_choice(_field(entry, "voice_mode"), ("system", "clone"), ""),
             )
         )
+    for spec in specs:
+        if spec.enabled:
+            validate_output_language(spec.target_language, spec.play_audio, spec.label)
     return tuple(specs)
 
 
@@ -294,17 +258,18 @@ def _ensure_com_initialized() -> None:
 class _PcmPlayer(threading.Thread):
     """Render 24 kHz mono PCM on a dedicated thread."""
 
-    def __init__(self, device_id: str, channel: str) -> None:
+    def __init__(self, device_id: str, channel: str, on_error: Callable[[BaseException], None] | None = None) -> None:
         super().__init__(name=f"livetranslate-player-{channel}", daemon=True)
         self._device_id = device_id
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=PLAYER_QUEUE_CHUNKS)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.error: BaseException | None = None
+        self._on_error = on_error
 
     def push(self, samples: Any) -> None:
         """Queue one decoded delta, dropping the oldest audio when behind."""
 
-        if self._stop.is_set():
+        if self._stop_event.is_set():
             return
         try:
             self._queue.put_nowait(samples)
@@ -317,13 +282,13 @@ class _PcmPlayer(threading.Thread):
             self._queue.put_nowait(samples)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         with contextlib.suppress(queue.Full):
             self._queue.put_nowait(None)
 
     def run(self) -> None:
-        _ensure_com_initialized()
         try:
+            _ensure_com_initialized()
             import soundcard as sc
 
             speaker = (
@@ -332,7 +297,7 @@ class _PcmPlayer(threading.Thread):
             if speaker is None:
                 raise RuntimeError("未找到可用的播放设备")
             with speaker.player(samplerate=OUTPUT_SAMPLE_RATE, channels=1) as player:
-                while not self._stop.is_set():
+                while not self._stop_event.is_set():
                     try:
                         item = self._queue.get(timeout=0.2)
                     except queue.Empty:
@@ -342,6 +307,8 @@ class _PcmPlayer(threading.Thread):
                     player.play(item)
         except BaseException as exc:  # noqa: BLE001 - reported to the session
             self.error = exc
+            if self._on_error is not None and not self._stop_event.is_set():
+                self._on_error(exc)
 
 
 class LiveTranslateChannel(threading.Thread):
@@ -369,15 +336,20 @@ class LiveTranslateChannel(threading.Thread):
         self._finished = asyncio.Event()
         self._failed = False
         self._player: _PcmPlayer | None = None
+        self._system_capture: SystemCapture | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._updated = False
+        self._configuration_ready = asyncio.Event()
         self._variant = 0
+        self._source_deltas: dict[str, str] = {}
+        self._translation_deltas: dict[str, str] = {}
+        self._completed_responses: dict[str, None] = {}
 
     # ------------------------------------------------------------------ thread
 
     def run(self) -> None:
-        _ensure_com_initialized()
         try:
+            _ensure_com_initialized()
             asyncio.run(self._main())
         except Exception as exc:  # noqa: BLE001 - surfaced as a channel error
             self._report_failure("realtime_channel_failed", f"{self._spec.label}通道失败：{exc}")
@@ -395,9 +367,11 @@ class LiveTranslateChannel(threading.Thread):
         if self._loop is not None:
             # Wake the receive loop out of a long ``recv`` wait.
             with contextlib.suppress(RuntimeError):
-                self._loop.call_soon_threadsafe(lambda: None)
+                self._loop.call_soon_threadsafe(self._configuration_ready.set)
         if self._player is not None:
             self._player.stop()
+        if self._system_capture is not None:
+            self._system_capture.close()
 
     # -------------------------------------------------------------- async main
 
@@ -406,40 +380,85 @@ class LiveTranslateChannel(threading.Thread):
         pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"livetranslate-capture-{self._spec.channel}"
         )
-        device = await self._loop.run_in_executor(pool, self._open_input)
-        if device is None:
-            pool.shutdown(wait=False)
-            self._report_failure("audio_device_missing", f"{self._spec.label}通道未找到可用的输入设备")
-            return
-
-        recorder, device_info = device
-        ws_url = f"{self._base_url}?model={self._model}"
-        connector = _build_connector(ws_url, self._api_key)
-
-        async with connector as websocket:
-            await self._send_session_update(websocket)
-            if self._spec.play_audio:
-                self._player = _PcmPlayer(self._spec.output_device, self._spec.channel)
-                self._player.start()
-
-            self._server.on_realtime_channel(
-                self._session, self._spec.channel, "capturing", device=device_info
+        recorder = None
+        stage = "audio"
+        try:
+            device = await asyncio.wait_for(
+                self._loop.run_in_executor(pool, self._prepare_input),
+                self._session.startup_timeout_s,
             )
+            if device is None:
+                if self._session.stop_event.is_set():
+                    return
+                self._report_failure("audio_device_missing", f"{self._spec.label}通道未找到可用的输入设备")
+                return
+            recorder, device_info = device
             self._session.mark_channel_ready(self._spec.channel)
-
-            reader = asyncio.create_task(self._receive_loop(websocket))
-            try:
-                with recorder:
+            self._server.on_realtime_channel(self._session, self._spec.channel, "connecting", device=device_info)
+            stage = "connect"
+            ws_url = f"{self._base_url}?model={self._model}"
+            async with _build_connector(ws_url, self._api_key) as websocket:
+                reader = asyncio.create_task(self._receive_loop(websocket))
+                try:
+                    stage = "configure"
+                    await self._send_session_update(websocket)
+                    await asyncio.wait_for(self._configuration_ready.wait(), CONNECT_TIMEOUT_S)
+                    if self._failed or self._session.stop_event.is_set():
+                        return
+                    if self._spec.play_audio:
+                        self._player = _PcmPlayer(self._spec.output_device, self._spec.channel, self._on_playback_error)
+                        self._player.start()
+                    stage = "capture"
                     self._server.on_realtime_channel(self._session, self._spec.channel, "streaming")
                     await self._capture_loop(websocket, pool, recorder)
-            finally:
-                await self._finish(websocket)
-                reader.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await reader
-                pool.shutdown(wait=False)
+                finally:
+                    if self._updated and not self._failed:
+                        await self._finish(websocket)
+                    reader.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await reader
+        except asyncio.TimeoutError:
+            if not self._session.stop_event.is_set():
+                failures = {
+                    "audio": ("audio_startup_timeout", "打开音频输入设备超时，请检查所选设备"),
+                    "connect": ("realtime_connect_timeout", "连接同传接口超时，请检查网络和接口地址"),
+                    "configure": ("realtime_configuration_timeout", "同传接口未及时确认会话配置，请检查接口是否支持当前模型"),
+                }
+                code, detail = failures.get(stage, ("realtime_stream_timeout", "同传连接等待超时"))
+                self._report_failure(code, f"{self._spec.label}通道：{detail}")
+        except Exception as exc:
+            if stage == "audio":
+                self._report_failure("audio_device_failed", f"{self._spec.label}通道音频设备打开失败：{exc}")
+            else:
+                raise
+        finally:
+            if recorder is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        self._loop.run_in_executor(pool, recorder.__exit__, None, None, None),
+                        self._session.startup_timeout_s,
+                    )
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _prepare_input(self) -> tuple[Any, dict[str, Any]] | None:
+        device = self._open_input()
+        if device is None:
+            return None
+        recorder, _ = device
+        # WASAPI creation, opening, reads and closing belong to the same worker.
+        recorder.__enter__()
+        if self._failed or self._session.stop_event.is_set():
+            recorder.__exit__(None, None, None)
+            return None
+        return device
 
     def _open_input(self) -> tuple[Any, dict[str, Any]] | None:
+        if self._spec.input_kind == "system":
+            self._system_capture = SystemCapture(startup_timeout=self._session.startup_timeout_s)
+            return self._system_capture, {
+                "id": "system-excluding-translator", "name": "系统声音（排除本软件）",
+                "channels": 1, "kind": "system",
+            }
         # Runs on the capture worker thread, which must claim its own COM
         # apartment before any WASAPI call.
         _ensure_com_initialized()
@@ -456,6 +475,14 @@ class LiveTranslateChannel(threading.Thread):
             else:
                 name = device_id
             microphone = sc.get_microphone(id=device_id, include_loopback=True)
+            # Explicit device loopback remains available, but cannot share a
+            # render endpoint with either translated voice.
+            for spec in self._session.specs:
+                if not spec.enabled or not spec.play_audio:
+                    continue
+                output = sc.get_speaker(spec.output_device) if spec.output_device else sc.default_speaker()
+                if output is not None and output.id == device_id:
+                    raise RuntimeError("所选设备会再次采集译文，请将音频来源改为系统声音（排除本软件）")
         else:
             if self._spec.input_device:
                 microphone = sc.get_microphone(id=self._spec.input_device)
@@ -482,7 +509,7 @@ class LiveTranslateChannel(threading.Thread):
 
         loop = asyncio.get_running_loop()
         counter = 0
-        while not self._session.stop_event.is_set():
+        while not self._session.stop_event.is_set() and not self._failed:
             audio = await loop.run_in_executor(pool, recorder.record, FRAME_SAMPLES)
             if self._session.stop_event.is_set():
                 break
@@ -508,44 +535,33 @@ class LiveTranslateChannel(threading.Thread):
 
     # ------------------------------------------------------------ protocol I/O
 
-    def _session_variants(self) -> list[dict[str, Any]]:
-        target = language_code(self._spec.target_language, "en")
-        modalities = ["text", "audio"] if self._spec.play_audio else ["text"]
-        modern = "3.8" in self._model
-        legacy: dict[str, Any] = {
-            "modalities": modalities,
-            "input_audio_format": "pcm",
-            "output_audio_format": "pcm",
-            "sample_rate": INPUT_SAMPLE_RATE,
-            "input_audio_transcription": {"model": ASR_MODEL},
-            "translation": {"language": target},
-        }
-        modern_body: dict[str, Any] = {
-            "output_modalities": modalities,
-            "translation": {"language": target},
-        }
-        source = language_code(self._session.config.source_language, "auto")
-        if source != "auto":
-            legacy["input_audio_transcription"]["language"] = source
-            modern_body["input_audio_transcription"] = {"language": source}
-        if self._options.enable_voice_clone:
-            options = {
-                "enable_voice_clone": True,
-                "voice_clone_options": {"frequency": self._options.voice_clone_frequency},
-            }
-            legacy.update(options)
-            modern_body.update(options)
-        voice = self._options.voice.strip()
-        if self._options.enable_voice_clone and not voice:
-            voice = "default"
-        if voice:
-            legacy["voice"] = voice
-            modern_body["voice"] = voice
+    @property
+    def _clone_enabled(self) -> bool:
+        if self._spec.voice_mode:
+            return self._spec.voice_mode == "clone"
+        return self._spec.channel == "speak" and self._options.enable_voice_clone
 
-        primary, secondary = (modern_body, legacy) if modern else (legacy, modern_body)
-        minimal: dict[str, Any] = {"translation": {"language": target}}
-        minimal["output_modalities" if modern else "modalities"] = modalities
-        return [primary, secondary, minimal]
+    @property
+    def _clone_frequency(self) -> str:
+        return "always" if self._spec.channel == "listen" else "once"
+
+    def _session_variants(self) -> list[dict[str, Any]]:
+        # 3.8 performs ASR inside the same model; no separate ASR model or TTS call.
+        configuration = {
+            "output_modalities": ["text", "audio"] if self._spec.play_audio else ["text"],
+            "translation": {"language": validate_output_language(
+                self._spec.target_language, self._spec.play_audio, self._spec.label,
+            )},
+        }
+        if self._spec.play_audio:
+            configuration["enable_voice_clone"] = self._clone_enabled
+        if self._spec.play_audio and self._clone_enabled:
+            configuration.update({
+                "voice": "default",
+                "enable_voice_clone": True,
+                "voice_clone_options": {"frequency": self._clone_frequency},
+            })
+        return [configuration]
 
     async def _send_session_update(self, websocket: Any) -> None:
         variants = self._session_variants()
@@ -567,6 +583,8 @@ class LiveTranslateChannel(threading.Thread):
                 if not isinstance(event, dict):
                     continue
                 self._handle_event(event, websocket)
+            if not self._session.stop_event.is_set() and not self._finished.is_set():
+                self._report_failure("realtime_connection_closed", f"{self._spec.label}通道连接已关闭")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - connection-level failure
@@ -579,7 +597,24 @@ class LiveTranslateChannel(threading.Thread):
             return
 
         if event_type == "session.updated":
+            session = event.get("session", {})
+            actual = session.get("output_modalities") if isinstance(session, dict) else None
+            expected = ["text", "audio"] if self._spec.play_audio else ["text"]
+            if actual is not None and (not isinstance(actual, list) or set(actual) != set(expected)):
+                self._report_failure("realtime_output_mismatch", "模型未接受所选输出模式")
+                return
+            if self._spec.play_audio and not self._clone_enabled and isinstance(session, dict) and session.get("enable_voice_clone") is True:
+                self._report_failure("realtime_voice_clone_unsupported", "同传接口未关闭该通道的音色复刻，已停止连接")
+                return
+            if self._spec.play_audio and self._clone_enabled:
+                clone = session.get("voice_clone_options", {}) if isinstance(session, dict) else {}
+                if (not isinstance(session, dict) or session.get("enable_voice_clone") is not True
+                        or not isinstance(clone, dict)
+                        or clone.get("frequency") != self._clone_frequency):
+                    self._report_failure("realtime_voice_clone_unsupported", "同传接口未确认本人音色复刻，已停止连接；可在设置中切换系统音色后重试")
+                    return
             self._updated = True
+            self._configuration_ready.set()
             return
         if event_type == "error":
             self._handle_protocol_error(event, websocket)
@@ -588,21 +623,51 @@ class LiveTranslateChannel(threading.Thread):
             self._finished.set()
             return
 
+        if event_type == "conversation.item.input_audio_transcription.delta":
+            key = str(event.get("item_id", "current"))
+            text = self._source_deltas.get(key, "") + _event_text(event, "delta")
+            self._source_deltas[key] = text
+            self._trim_buffer(self._source_deltas)
+            self._on_source_partial({"text": text})
+            return
         if event_type == "conversation.item.input_audio_transcription.text":
             self._on_source_partial(event)
             return
         if event_type == "conversation.item.input_audio_transcription.completed":
-            self._session.on_channel_transcript(self._spec.channel, _event_text(event, "transcript"))
+            key = str(event.get("item_id", "current"))
+            text = _event_text(event, "transcript") or self._source_deltas.get(key, "")
+            self._source_deltas.pop(key, None)
+            self._session.on_channel_transcript(self._spec.channel, text)
+            return
+        if event_type in ("response.audio_transcript.delta", "response.text.delta"):
+            key = _response_key(event)
+            text = self._translation_deltas.get(key, "") + _event_text(event, "delta")
+            self._translation_deltas[key] = text
+            self._trim_buffer(self._translation_deltas)
+            self._session.on_channel_translation_partial(self._spec.channel, key, text)
             return
         if event_type in ("response.audio_transcript.text", "response.text.text"):
-            self._session.on_channel_translation_partial(
-                self._spec.channel, _response_key(event), _event_text(event, "text")
-            )
+            text = _event_text(event, "text") + str(event.get("stash") or "")
+            self._translation_deltas[_response_key(event)] = text
+            self._session.on_channel_translation_partial(self._spec.channel, _response_key(event), text)
             return
         if event_type in ("response.audio_transcript.done", "response.text.done"):
-            self._session.on_channel_translation_done(
-                self._spec.channel, _response_key(event), _event_text(event, "text")
-            )
+            self._finish_translation(_response_key(event), _event_text(event, "text"))
+            return
+        if event_type == "response.done":
+            response = event.get("response", {})
+            if not isinstance(response, dict):
+                return
+            if response.get("status") in ("failed", "cancelled", "incomplete"):
+                self._report_failure("realtime_response_failed", "同传响应未完成，请重新开始会话")
+                return
+            output = response.get("output", [])
+            parts = [
+                _event_text(content, "text")
+                for item in output if isinstance(item, dict)
+                for content in item.get("content", []) if isinstance(content, dict)
+            ] if isinstance(output, list) else []
+            self._finish_translation(str(response.get("id", "")), "".join(parts))
             return
         if event_type == "response.audio.delta":
             self._on_audio_delta(event)
@@ -610,16 +675,27 @@ class LiveTranslateChannel(threading.Thread):
 
     def _handle_protocol_error(self, event: dict[str, Any], websocket: Any) -> None:
         detail = _event_error_message(event)
-        if not self._updated and self._variant + 1 < len(self._session_variants()):
-            # The 3.5 and 3.8 generations disagree on ``modalities`` versus
-            # ``output_modalities``; fall forward instead of failing the session.
-            self._variant += 1
-            asyncio.get_running_loop().create_task(self._send_session_update(websocket))
-            return
         self._report_failure("realtime_protocol_error", f"{self._spec.label}通道被模型拒绝：{detail}")
 
+    @staticmethod
+    def _trim_buffer(buffer: dict[str, Any]) -> None:
+        while len(buffer) > 128:
+            del buffer[next(iter(buffer))]
+
+    def _finish_translation(self, key: str, text: str) -> None:
+        if key and key in self._completed_responses:
+            return
+        text = text or self._translation_deltas.get(key, "")
+        self._translation_deltas.pop(key, None)
+        if not text:
+            return
+        if key:
+            self._completed_responses[key] = None
+            self._trim_buffer(self._completed_responses)
+        self._session.on_channel_translation_done(self._spec.channel, key, text)
+
     def _on_source_partial(self, event: dict[str, Any]) -> None:
-        text = _event_text(event, "text") + _event_text(event, "stash")
+        text = _event_text(event, "text") + str(event.get("stash") or "")
         if not text:
             return
         self._server.emit_session_event(
@@ -628,8 +704,17 @@ class LiveTranslateChannel(threading.Thread):
             {"text": text, "channel": self._spec.channel},
         )
 
+    def _on_playback_error(self, error: BaseException) -> None:
+        if self._loop is not None:
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(
+                    self._report_failure,
+                    "audio_playback_failed",
+                    f"{self._spec.label}通道译文播放失败，请检查译文播放设备：{error}",
+                )
+
     def _on_audio_delta(self, event: dict[str, Any]) -> None:
-        if self._player is None:
+        if not self._spec.play_audio or self._player is None:
             return
         encoded = event.get("delta")
         if not isinstance(encoded, str) or not encoded:
@@ -638,7 +723,7 @@ class LiveTranslateChannel(threading.Thread):
             raw = base64.b64decode(encoded, validate=False)
         except Exception:  # noqa: BLE001 - a malformed delta is not fatal
             return
-        if not raw:
+        if not raw or len(raw) % 2:
             return
         import numpy as np
 
@@ -670,10 +755,11 @@ class LiveTranslateChannel(threading.Thread):
         if self._failed:
             return
         self._failed = True
+        self._configuration_ready.set()
         self._server.on_realtime_channel(self._session, self._spec.channel, "failed", detail=message)
         self._server.emit_session_error(
             self._session,
-            scope="translation",
+            scope="audio" if code.startswith("audio_") else "translation",
             code=code,
             message=message,
             recoverable=True,
@@ -716,7 +802,7 @@ def _event_text(event: dict[str, Any], key: str) -> str:
 
 
 def _response_key(event: dict[str, Any]) -> str:
-    for key in ("response_id", "item_id", "event_id"):
+    for key in ("response_id", "item_id"):
         value = event.get(key)
         if isinstance(value, str) and value:
             return value
@@ -754,6 +840,9 @@ class RealtimeSession:
         specs: tuple[ChannelSpec, ...],
         startup_timeout_s: float,
     ) -> None:
+        # Native NumPy/audio DLL loading can hang when first imported on a worker
+        # while the sidecar's main thread is blocked reading its command pipe.
+        _ensure_com_initialized()
         self.server = server
         self.session_id = session_id
         self.config = config
@@ -788,17 +877,6 @@ class RealtimeSession:
     def start(self) -> None:
         for channel in self.channels:
             channel.start()
-        threading.Thread(
-            target=self._watch_audio_startup,
-            name=f"livetranslate-startup-{self.session_id[:8]}",
-            daemon=True,
-        ).start()
-
-    def _watch_audio_startup(self) -> None:
-        # Unlike the pipeline, one failing channel must not hide the other, so
-        # the watchdog only settles once every channel has reported in.
-        if not self._audio_startup_settled.wait(self.startup_timeout_s):
-            self.server.on_audio_startup_timeout(self)
 
     def mark_channel_ready(self, channel: str) -> None:
         with self._lock:
@@ -873,6 +951,7 @@ class RealtimeSession:
             text = orphans.pop(0)
             sequence = self._emit_source_final(channel, transcript)
             if sequence is not None:
+                self._pending_asr[channel] = [(seq, source) for seq, source in self._pending_asr[channel] if seq != sequence]
                 self._emit_translation(channel, sequence, transcript, text)
             return
         self._emit_source_final(channel, transcript)

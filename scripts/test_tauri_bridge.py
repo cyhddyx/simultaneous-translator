@@ -6,6 +6,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -15,7 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import numpy as np
@@ -83,6 +84,7 @@ class RuntimeConfigTests(unittest.TestCase):
         config = bridge.RuntimeConfig.from_start_params(
             {
                 "config": {
+                    "engine": "pipeline",
                     "sourceLanguage": "Japanese",
                     "targetLanguage": "English",
                     "translation": {
@@ -117,6 +119,7 @@ class RuntimeConfigTests(unittest.TestCase):
     def test_snake_case_payload_is_equally_accepted(self) -> None:
         config = bridge.RuntimeConfig.from_start_params(
             {
+                "engine": "pipeline",
                 "translation": {
                     "protocol": "gemini",
                     "base_url": "https://relay.example/v1beta",
@@ -136,78 +139,17 @@ class RuntimeConfigTests(unittest.TestCase):
         with self.assertRaises(bridge.ProtocolError):
             bridge.RuntimeConfig.from_start_params(
                 {
+                    "engine": "pipeline",
                     "translation": {"protocol": "anthropic", "base_url": "https://api.example"},
                     "translation_api_key": "k",
                     "recognition_api_key": "k",
                 }
             )
 
-    def test_start_uses_the_selected_openai_provider_contract(self) -> None:
-        captured: dict[str, object] = {}
-
-        class CapturingSession:
-            def __init__(
-                self,
-                _server: "bridge.BridgeServer",
-                session_id: str,
-                config: "bridge.RuntimeConfig",
-            ) -> None:
-                self.session_id = session_id
-                self.config = config
-                self.state = "starting"
-                self.stop_event = threading.Event()
-                captured["config"] = config
-
-            def start(self) -> None:
-                captured["started"] = True
-
-            def cancel_pending_translations(self) -> None:
-                pass
-
-        stdout = io.StringIO()
-        server = bridge.BridgeServer(io.StringIO(), stdout)
-        session_id = "6f4db13f-626c-4e4e-9147-c8f065b7ba8a"
-
-        with patch.object(bridge, "TranslationSession", CapturingSession):
-            server.handle_request(
-                {
-                    "id": "start-openai",
-                    "command": "start",
-                    "params": {
-                        "session_id": session_id,
-                        "config": {
-                            "sourceLanguage": "English",
-                            "targetLanguage": "简体中文",
-                            "translation": {
-                                "protocol": "openai",
-                                "baseUrl": "https://openai-relay.example/v1",
-                                "model": "custom-chat-model",
-                            },
-                            "recognition": {
-                                "protocol": "dashscope",
-                                "baseUrl": "wss://asr.example/ws",
-                                "model": "asr-model",
-                            },
-                        },
-                        "secrets": {
-                            "translationApiKey": "openai-key",
-                            "recognitionApiKey": "recognition-key",
-                        },
-                    },
-                }
-            )
-
-        messages = [json.loads(line) for line in stdout.getvalue().splitlines()]
-        response = messages[0]
-        config = captured["config"]
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["result"]["session_id"], session_id)
-        self.assertTrue(captured["started"])
-        self.assertIsInstance(config, bridge.RuntimeConfig)
-        self.assertEqual(config.translation.protocol, "openai")
-        self.assertEqual(config.translation.base_url, "https://openai-relay.example")
-        self.assertEqual(config.translation.model, "custom-chat-model")
-        self.assertEqual(config.translation.api_key, "openai-key")
+    def test_pipeline_cannot_start(self) -> None:
+        server = bridge.BridgeServer(io.StringIO(), io.StringIO())
+        with self.assertRaises(bridge.ProtocolError):
+            bridge.create_session(server, "legacy", _runtime_config())
 
 
 class AudioLifecycleTests(unittest.TestCase):
@@ -932,6 +874,33 @@ class ProtocolTests(unittest.TestCase):
 class RealtimeEngineTests(unittest.TestCase):
     """The realtime engine replaces ASR + translation with one model session."""
 
+    def test_realtime_preloads_audio_on_the_constructing_thread(self) -> None:
+        calls = []
+        config = bridge.RuntimeConfig.from_start_params(self._start_params())
+        server = bridge.BridgeServer(io.StringIO(), io.StringIO())
+        with patch.object(livetranslate, "_ensure_com_initialized", side_effect=lambda: calls.append(threading.get_ident())):
+            session = bridge.create_session(server, "preload-realtime", config)
+        self.assertEqual(calls, [threading.get_ident()])
+        self.assertFalse(any(channel.is_alive() for channel in session.channels))
+
+    def test_audio_player_can_be_joined_after_stop(self) -> None:
+        player = livetranslate._PcmPlayer("", "listen")
+        with patch.object(player, "run"):
+            player.start()
+            player.stop()
+            player.join(timeout=1)
+        self.assertFalse(player.is_alive())
+
+    def test_audio_player_reports_initialization_failure(self) -> None:
+        errors = []
+        player = livetranslate._PcmPlayer("", "listen", errors.append)
+        with patch.object(livetranslate, "_ensure_com_initialized", side_effect=RuntimeError("device unavailable")):
+            player.start()
+            player.join(timeout=1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(str(errors[0]), "device unavailable")
+        self.assertIs(player.error, errors[0])
+
     def _start_params(self, **overrides: object) -> dict[str, object]:
         config: dict[str, object] = {
             "engine": "realtime",
@@ -939,8 +908,8 @@ class RealtimeEngineTests(unittest.TestCase):
             "targetLanguage": "简体中文",
             "realtime": {
                 "protocol": "livetranslate",
-                "baseUrl": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-                "model": "qwen3.5-livetranslate-flash-realtime",
+                "baseUrl": "wss://maas.qianwenaiapi.com/api-ws/v1/realtime",
+                "model": "qwen3.8-livetranslate-flash-realtime",
                 "voice": "Tina",
             },
             "audio": {
@@ -970,14 +939,47 @@ class RealtimeEngineTests(unittest.TestCase):
 
         self.assertEqual(config.engine, "realtime")
         self.assertIsNotNone(config.realtime)
-        self.assertEqual(config.realtime.base_url, "wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
-        self.assertEqual(config.realtime.model, "qwen3.5-livetranslate-flash-realtime")
+        self.assertEqual(config.realtime.base_url, "wss://maas.qianwenaiapi.com/api-ws/v1/realtime")
+        self.assertEqual(config.realtime.model, "qwen3.8-livetranslate-flash-realtime")
         self.assertEqual(config.realtime.api_key, "dashscope-key")
         self.assertEqual(config.realtime_options.voice, "Tina")
         # The pipeline credentials are irrelevant here and must not leak.
         self.assertEqual(config.translation.api_key, "")
         self.assertEqual(config.recognition.api_key, "")
         self.assertIn("dashscope-key", config.secrets)
+
+    def test_text_only_languages_rejected_for_speech_in_either_direction(self) -> None:
+        for channel in ("listen", "speak"):
+            for language in ("粤语", "YUE", "Cantonese", "el", "Ελληνικά", "Greek"):
+                with self.subTest(channel=channel, language=language):
+                    params = self._start_params()
+                    params["config"]["audio"][channel].update(
+                        targetLanguage=language, playAudio=True,
+                    )
+                    with self.assertRaisesRegex(bridge.ProtocolError, "仅支持文字"):
+                        bridge.RuntimeConfig.from_start_params(params)
+
+    def test_cantonese_input_and_text_target_keep_independent_speech_output(self) -> None:
+        params = self._start_params(sourceLanguage="粤语")
+        params["config"]["audio"]["listen"].update(targetLanguage="粤语", playAudio=False)
+        params["config"]["audio"]["speak"].update(targetLanguage="English", playAudio=True)
+        config = bridge.RuntimeConfig.from_start_params(params)
+        self.assertEqual(config.source_language, "粤语")
+        self.assertEqual([(s.target_language, s.play_audio) for s in config.channels], [("粤语", False), ("English", True)])
+
+    def test_disabled_legacy_language_does_not_block_the_other_channel(self) -> None:
+        params = self._start_params()
+        params["config"]["audio"]["speak"].update(enabled=False, targetLanguage="粤语", playAudio=True)
+        config = bridge.RuntimeConfig.from_start_params(params)
+        self.assertEqual(config.channels[1].target_language, "粤语")
+        self.assertEqual(len(livetranslate.enabled_channels(config.channels)), 1)
+
+    def test_unknown_target_does_not_silently_translate_into_english(self) -> None:
+        for target in ("自动检测", "auto", "unlisted-language"):
+            params = self._start_params()
+            params["config"]["audio"]["listen"]["targetLanguage"] = target
+            with self.assertRaisesRegex(bridge.ProtocolError, "目标语言不受"):
+                bridge.RuntimeConfig.from_start_params(params)
 
     def test_realtime_channels_follow_the_audio_settings(self) -> None:
         config = bridge.RuntimeConfig.from_start_params(self._start_params())
@@ -1010,20 +1012,20 @@ class RealtimeEngineTests(unittest.TestCase):
             with self.assertRaises(bridge.ProtocolError):
                 bridge.RuntimeConfig.from_start_params(params)
 
-    def test_pipeline_engine_is_still_the_default(self) -> None:
-        config = bridge.RuntimeConfig.from_start_params(
-            {
-                "translation": {"protocol": "gemini", "base_url": "https://relay.example"},
-                "recognition": {"base_url": "wss://asr.example/ws", "model": "asr"},
-                "translation_api_key": "translation-key",
-                "recognition_api_key": "recognition-key",
-            }
-        )
+    def test_realtime_is_the_default_without_legacy_keys(self) -> None:
+        config = bridge.RuntimeConfig.from_start_params({
+            "secrets": {"realtimeApiKey": "realtime-key"}
+        })
+        self.assertEqual(config.engine, "realtime")
+        self.assertEqual(config.realtime.model, livetranslate.DEFAULT_LIVETRANSLATE_MODEL)
+        self.assertEqual(config.translation.api_key, "")
+        self.assertEqual(config.recognition.api_key, "")
 
-        self.assertEqual(config.engine, "pipeline")
-        self.assertIsNone(config.realtime)
-        self.assertEqual(config.channels, ())
-        self.assertEqual(config.secrets, ("translation-key", "recognition-key"))
+    def test_other_models_are_rejected(self) -> None:
+        with self.assertRaises(bridge.ProtocolError):
+            bridge.RuntimeConfig.from_start_params(self._start_params(
+                realtime={"model": "qwen3.5-livetranslate-flash-realtime"}
+            ))
 
     def test_start_selects_the_realtime_session_implementation(self) -> None:
         captured: dict[str, object] = {}
@@ -1055,7 +1057,7 @@ class RealtimeEngineTests(unittest.TestCase):
         self.assertTrue(messages[0]["ok"], messages[0])
         self.assertTrue(captured["started"])
         kwargs = captured["kwargs"]
-        self.assertEqual(kwargs["base_url"], "wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
+        self.assertEqual(kwargs["base_url"], "wss://maas.qianwenaiapi.com/api-ws/v1/realtime")
         self.assertEqual(kwargs["api_key"], "dashscope-key")
         self.assertEqual([spec.channel for spec in kwargs["specs"]], ["listen", "speak"])
 
@@ -1088,7 +1090,7 @@ class RealtimeCaptionPairingTests(unittest.TestCase):
             {
                 "engine": "realtime",
                 "targetLanguage": "简体中文",
-                "realtime": {"model": "qwen3.5-livetranslate-flash-realtime"},
+                "realtime": {"model": "qwen3.8-livetranslate-flash-realtime"},
                 "secrets": {"realtimeApiKey": "k"},
             }
         )
@@ -1165,7 +1167,7 @@ class RealtimeChannelRetirementTests(unittest.TestCase):
         config = bridge.RuntimeConfig.from_start_params(
             {
                 "engine": "realtime",
-                "realtime": {"model": "qwen3.5-livetranslate-flash-realtime"},
+                "realtime": {"model": "qwen3.8-livetranslate-flash-realtime"},
                 "audio": channels,
                 "secrets": {"realtimeApiKey": "k"},
             }
@@ -1266,13 +1268,13 @@ class RealtimeChannelEventTests(unittest.TestCase):
         def push(self, samples: object) -> None:
             self.pushes.append(list(samples))
 
-    def _channel(self) -> tuple["RealtimeChannelEventTests._Server", object, object]:
+    def _channel(self, play_audio: bool = True, voice_mode: str = "system") -> tuple["RealtimeChannelEventTests._Server", object, object]:
         config = bridge.RuntimeConfig.from_start_params(
             {
                 "engine": "realtime",
                 "targetLanguage": "简体中文",
-                "realtime": {"model": "qwen3.5-livetranslate-flash-realtime"},
-                "audio": {"listen": {"enabled": True, "playAudio": True}},
+                "realtime": {"model": "qwen3.8-livetranslate-flash-realtime"},
+                "audio": {"listen": {"enabled": True, "playAudio": play_audio, "voiceMode": voice_mode}},
                 "secrets": {"realtimeApiKey": "k"},
             }
         )
@@ -1295,10 +1297,155 @@ class RealtimeChannelEventTests(unittest.TestCase):
     def _dispatch(self, channel: object, event: dict[str, object]) -> None:
         channel._handle_event(event, None)
 
+    def test_output_modes_use_the_38_session_contract(self) -> None:
+        for play_audio, modalities in [(False, ["text"]), (True, ["text", "audio"])]:
+            _, _, channel = self._channel(play_audio)
+            expected = {
+                "output_modalities": modalities,
+                "translation": {"language": "zh"},
+            }
+            if play_audio:
+                expected.update({"enable_voice_clone": False})
+            self.assertEqual(channel._session_variants(), [expected])
+
+    def test_default_voice_can_be_selected_without_cloning(self) -> None:
+        _, _, channel = self._channel()
+        channel._options = livetranslate.RealtimeOptions(enable_voice_clone=False)
+        self.assertFalse(channel._session_variants()[0]["enable_voice_clone"])
+        self._dispatch(channel, {"type": "session.updated", "session": {"output_modalities": ["text", "audio"]}})
+        self.assertTrue(channel._updated)
+
+    def test_missing_clone_confirmation_is_reported(self) -> None:
+        server, _, channel = self._channel(voice_mode="clone")
+        self._dispatch(channel, {"type": "session.updated", "session": {"output_modalities": ["text", "audio"]}})
+        self.assertEqual(server.errors, ["realtime_voice_clone_unsupported"])
+        self.assertFalse(channel._updated)
+
+    def test_clone_configuration_is_confirmed(self) -> None:
+        server, _, channel = self._channel(voice_mode="clone")
+        self._dispatch(channel, {"type": "session.updated", "session": {
+            "output_modalities": ["text", "audio"], "enable_voice_clone": True,
+            "voice_clone_options": {"frequency": "always"},
+            "audio": {"output": {"voice": "Tina"}},
+        }})
+        self.assertEqual(server.errors, [])
+        self.assertTrue(channel._updated)
+
+    def test_playback_failure_is_forwarded_to_the_channel(self) -> None:
+        server, _, channel = self._channel()
+        async def fail():
+            channel._loop = asyncio.get_running_loop()
+            channel._on_playback_error(RuntimeError("speaker unplugged"))
+            await asyncio.sleep(0)
+        asyncio.run(fail())
+        self.assertEqual(server.errors, ["audio_playback_failed"])
+        self.assertTrue(channel._failed)
+
+    def test_model_wait_does_not_use_the_device_timeout(self) -> None:
+        server, session, channel = self._channel(False)
+        session.startup_timeout_s = 0.02
+        recorder = MagicMock()
+        websocket = MagicMock()
+        websocket.send = AsyncMock()
+        connector = MagicMock()
+        connector.__aenter__ = AsyncMock(return_value=websocket)
+        connector.__aexit__ = AsyncMock(return_value=False)
+
+        async def delayed_confirmation(_socket: object) -> None:
+            await asyncio.sleep(0.06)
+            channel._handle_event({"type": "session.updated"}, websocket)
+            await asyncio.Event().wait()
+
+        with patch.object(channel, "_prepare_input", return_value=(recorder, {})), \
+             patch.object(session, "mark_channel_ready"), \
+             patch.object(channel, "_receive_loop", side_effect=delayed_confirmation), \
+             patch.object(channel, "_capture_loop", new_callable=AsyncMock) as capture, \
+             patch.object(channel, "_finish", new_callable=AsyncMock), \
+             patch.object(livetranslate, "_build_connector", return_value=connector):
+            asyncio.run(channel._main())
+        capture.assert_awaited_once()
+        recorder.__exit__.assert_called_once()
+        self.assertEqual(server.errors, [])
+
+    def test_model_configuration_timeout_is_not_an_audio_error(self) -> None:
+        server, session, channel = self._channel(False)
+        recorder = MagicMock()
+        websocket = MagicMock()
+        websocket.send = AsyncMock()
+        connector = MagicMock()
+        connector.__aenter__ = AsyncMock(return_value=websocket)
+        connector.__aexit__ = AsyncMock(return_value=False)
+
+        async def no_confirmation(_socket: object) -> None:
+            await asyncio.Event().wait()
+
+        with patch.object(channel, "_prepare_input", return_value=(recorder, {})), \
+             patch.object(session, "mark_channel_ready"), \
+             patch.object(channel, "_receive_loop", side_effect=no_confirmation), \
+             patch.object(livetranslate, "CONNECT_TIMEOUT_S", 0.01), \
+             patch.object(livetranslate, "_build_connector", return_value=connector):
+            asyncio.run(channel._main())
+        self.assertEqual(server.errors, ["realtime_configuration_timeout"])
+        recorder.__exit__.assert_called_once()
+
+    def test_device_open_timeout_remains_an_audio_error(self) -> None:
+        server, _, channel = self._channel(False)
+        with patch.object(channel, "_prepare_input", side_effect=TimeoutError), \
+             patch.object(livetranslate, "_build_connector") as connector:
+            asyncio.run(channel._main())
+        self.assertEqual(server.errors, ["audio_startup_timeout"])
+        connector.assert_not_called()
+
+    def test_text_mode_does_not_play_unexpected_audio(self) -> None:
+        _, _, channel = self._channel(False)
+        self._dispatch(channel, {"type": "response.audio.delta", "delta": "AAAAAA=="})
+        self.assertEqual(channel._player.pushes, [])
+
+    def test_incremental_events_accumulate_and_complete_once(self) -> None:
+        for kind in ["text", "audio_transcript"]:
+            server, _, channel = self._channel()
+            for delta in ["Hel", "lo"]:
+                self._dispatch(channel, {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "source-1", "delta": delta,
+                })
+            self._dispatch(channel, {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "source-1", "transcript": "Hello",
+            })
+            for delta in ["你", "好"]:
+                self._dispatch(channel, {
+                    "type": f"response.{kind}.delta",
+                    "response_id": "r1", "delta": delta,
+                })
+            self._dispatch(channel, {"type": f"response.{kind}.done", "response_id": "r1"})
+            self._dispatch(channel, {
+                "type": "response.done",
+                "response": {"id": "r1", "status": "completed",
+                             "output": [{"content": [{"text": "你好"}]}]},
+            })
+            partials = [data["text"] for event, data in server.events if event == "translation.partial"]
+            finals = [data for event, data in server.events if event == "translation"]
+            self.assertEqual(partials, ["你", "你好"])
+            self.assertEqual(len(finals), 1)
+            self.assertEqual(finals[0]["source_text"], "Hello")
+            self.assertEqual(finals[0]["text"], "你好")
+
+    def test_incompatible_session_modalities_fail_before_capture(self) -> None:
+        server, _, channel = self._channel(False)
+        self._dispatch(channel, {
+            "type": "session.updated", "session": {"output_modalities": ["text", "audio"]},
+        })
+        self.assertTrue(channel._failed)
+        self.assertTrue(channel._configuration_ready.is_set())
+        self.assertTrue(server.errors)
+
     def test_a_full_turn_produces_one_paired_caption(self) -> None:
         server, _session, channel = self._channel()
 
-        self._dispatch(channel, {"type": "session.updated"})
+        self._dispatch(channel, {"type": "session.updated", "session": {
+            "enable_voice_clone": False,
+        }})
         self._dispatch(
             channel,
             {

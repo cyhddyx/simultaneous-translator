@@ -361,7 +361,7 @@ class RuntimeConfig:
         values = dict(raw_config)
         values.update(raw_secrets)
 
-        engine = _string(_config_value(values, "engine"), "engine", default="pipeline").lower()
+        engine = _string(_config_value(values, "engine"), "engine", default="realtime").lower()
         if engine not in ENGINE_MODES:
             raise ProtocolError(f"engine must be one of {', '.join(ENGINE_MODES)}")
         realtime_mode = engine == "realtime"
@@ -416,6 +416,8 @@ class RuntimeConfig:
                 default_base_url=DEFAULT_LIVETRANSLATE_WS_URL,
                 default_model=DEFAULT_LIVETRANSLATE_MODEL,
             )
+            if realtime_spec.model != DEFAULT_LIVETRANSLATE_MODEL:
+                raise ProtocolError("Only qwen3.8-livetranslate-flash-realtime is supported")
             raw_realtime = _config_value(values, "realtime", {})
             if raw_realtime is None:
                 raw_realtime = {}
@@ -429,9 +431,9 @@ class RuntimeConfig:
             if frequency not in livetranslate.VOICE_CLONE_FREQUENCIES:
                 frequency = DEFAULT_VOICE_CLONE_FREQUENCY
             realtime_options = livetranslate.RealtimeOptions(
-                voice=_string(_config_value(raw_realtime, "voice"), "realtime.voice"),
+                voice=_string(_config_value(raw_realtime, "voice"), "realtime.voice", default="default"),
                 enable_voice_clone=bool(
-                    _config_value(raw_realtime, "enable_voice_clone", False)
+                    _config_value(raw_realtime, "enable_voice_clone", True)
                 ),
                 voice_clone_frequency=frequency,
             )
@@ -477,7 +479,7 @@ def create_session(server: "BridgeServer", session_id: str, config: RuntimeConfi
     """Build the session implementation the requested engine needs."""
 
     if config.engine != "realtime":
-        return TranslationSession(server, session_id, config)
+        raise ProtocolError("Only the realtime translation engine is available")
     if config.realtime is None:
         raise ProtocolError("realtime engine requires a realtime service configuration")
     return livetranslate.RealtimeSession(

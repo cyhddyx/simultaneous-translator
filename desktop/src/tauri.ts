@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { audioLanguageErrors } from "./translationLanguages";
 
 import {
   DEFAULT_SETTINGS,
@@ -28,29 +29,34 @@ type EventListener = (event: TranslatorEvent) => void;
 const isTauriRuntime = () =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-const deepCopy = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+const deepCopy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 const now = () => new Date().toISOString();
 
 const mockSentences = [
   {
-    source: "Welcome, everyone. We will begin with the product roadmap for the next quarter.",
+    source:
+      "Welcome, everyone. We will begin with the product roadmap for the next quarter.",
     translation: "各位好。我们将先介绍下个季度的产品路线图。",
   },
   {
-    source: "The team has finished the reliability work and is preparing the staged rollout.",
+    source:
+      "The team has finished the reliability work and is preparing the staged rollout.",
     translation: "团队已经完成可靠性工作，正在准备分阶段发布。",
   },
   {
-    source: "Please hold questions until the end so we can keep the discussion moving.",
+    source:
+      "Please hold questions until the end so we can keep the discussion moving.",
     translation: "请把问题留到最后，这样我们可以保持讨论进度。",
   },
   {
-    source: "The first build is expected on Friday, subject to the final verification results.",
+    source:
+      "The first build is expected on Friday, subject to the final verification results.",
     translation: "首个构建版本预计将在周五推出，具体取决于最终验证结果。",
   },
   {
-    source: "We will share the rollback plan with the support team before the release window.",
+    source:
+      "We will share the rollback plan with the support team before the release window.",
     translation: "我们会在发布窗口之前与支持团队共享回滚计划。",
   },
 ];
@@ -78,6 +84,8 @@ class MockTranslator {
   }
 
   async start(): Promise<{ sessionId: string }> {
+    const languageErrors = audioLanguageErrors(this.snapshot.settings.audio);
+    if (Object.keys(languageErrors).length) throw new Error(Object.values(languageErrors).join("\n"));
     this.clearTimers();
     const sessionId = `mock-${Date.now()}`;
     this.snapshot.session = {
@@ -86,7 +94,11 @@ class MockTranslator {
       sessionId,
       startedAt: now(),
       partialTranscript: "",
-      health: { audio: "connecting", recognition: "connecting", translation: "connecting" },
+      health: {
+        audio: "connecting",
+        recognition: "connecting",
+        translation: "connecting",
+      },
       queue: createEmptyQueue(),
       lastError: null,
     };
@@ -100,6 +112,14 @@ class MockTranslator {
         phase: "listening",
         deviceName: "默认扬声器 (Mock Audio)",
         health: { audio: "ready", recognition: "ready", translation: "ready" },
+        channels: {
+          listen: this.snapshot.settings.audio.listen.enabled
+            ? "ready"
+            : "unknown",
+          speak: this.snapshot.settings.audio.speak.enabled
+            ? "ready"
+            : "unknown",
+        },
       };
       this.bump();
       this.emit("session", this.snapshot.session, sessionId);
@@ -111,7 +131,11 @@ class MockTranslator {
 
   async stop(sessionId: string | null): Promise<void> {
     if (!sessionId || this.snapshot.session.sessionId !== sessionId) return;
-    this.snapshot.session = { ...this.snapshot.session, phase: "stopping", partialTranscript: "" };
+    this.snapshot.session = {
+      ...this.snapshot.session,
+      phase: "stopping",
+      partialTranscript: "",
+    };
     this.bump();
     this.emit("session", this.snapshot.session, sessionId);
     this.clearTimers();
@@ -136,7 +160,11 @@ class MockTranslator {
   async clearHistory(): Promise<void> {
     this.snapshot.captions = [];
     this.bump();
-    this.emit("session", { partialTranscript: this.snapshot.session.partialTranscript }, this.snapshot.session.sessionId);
+    this.emit(
+      "session",
+      { partialTranscript: this.snapshot.session.partialTranscript },
+      this.snapshot.session.sessionId,
+    );
   }
 
   async saveSettings(draft: SettingsDraft): Promise<PublicSettings> {
@@ -144,28 +172,39 @@ class MockTranslator {
       ? "missing"
       : draft.recognition.apiKey?.trim()
         ? "secure_store"
-        : draft.recognition.protocol === this.snapshot.settings.recognition.protocol
-            && draft.recognition.baseUrl.trim() === this.snapshot.settings.recognition.baseUrl
+        : draft.recognition.protocol ===
+              this.snapshot.settings.recognition.protocol &&
+            draft.recognition.baseUrl.trim() ===
+              this.snapshot.settings.recognition.baseUrl
           ? this.snapshot.settings.recognition.apiKeyStatus
           : "missing";
     const realtimeStatus = draft.realtime.clearApiKey
       ? "missing"
       : draft.realtime.apiKey?.trim()
         ? "secure_store"
-        : draft.realtime.protocol === this.snapshot.settings.realtime.protocol
-            && draft.realtime.baseUrl.trim() === this.snapshot.settings.realtime.baseUrl
+        : draft.realtime.protocol ===
+              this.snapshot.settings.realtime.protocol &&
+            draft.realtime.baseUrl.trim() ===
+              this.snapshot.settings.realtime.baseUrl
           ? this.snapshot.settings.realtime.apiKeyStatus
           : "missing";
     const translationProviders = draft.translationProviders.map((provider) => {
-      const current = this.snapshot.settings.translationProviders.find((item) => item.id === provider.id);
+      const current = this.snapshot.settings.translationProviders.find(
+        (item) => item.id === provider.id,
+      );
       const apiKeyStatus = provider.clearApiKey
         ? "missing"
         : provider.apiKey?.trim()
           ? "secure_store"
-          : current?.protocol === provider.protocol && current.baseUrl === provider.baseUrl.trim()
+          : current?.protocol === provider.protocol &&
+              current.baseUrl === provider.baseUrl.trim()
             ? current.apiKeyStatus
             : "missing";
-      const { apiKey: _apiKey, clearApiKey: _clearApiKey, ...publicProvider } = provider;
+      const {
+        apiKey: _apiKey,
+        clearApiKey: _clearApiKey,
+        ...publicProvider
+      } = provider;
       return { ...publicProvider, apiKeyStatus };
     });
     this.snapshot.settings = {
@@ -197,26 +236,43 @@ class MockTranslator {
       subtitleSize: draft.subtitleSize,
     };
     this.bump();
-    this.emit("settings", this.snapshot.settings, this.snapshot.session.sessionId);
+    this.emit(
+      "settings",
+      this.snapshot.settings,
+      this.snapshot.session.sessionId,
+    );
     return deepCopy(this.snapshot.settings);
   }
 
   private runSentence(sessionId: string): void {
-    if (this.snapshot.session.sessionId !== sessionId || this.snapshot.session.phase !== "listening") return;
+    if (
+      this.snapshot.session.sessionId !== sessionId ||
+      this.snapshot.session.phase !== "listening"
+    )
+      return;
     const sentence = mockSentences[this.sentenceIndex % mockSentences.length];
     this.sentenceIndex += 1;
     const words = sentence.source.split(" ");
     let wordIndex = 0;
 
     const partialTimer = window.setInterval(() => {
-      if (this.snapshot.session.sessionId !== sessionId || this.snapshot.session.phase !== "listening") {
+      if (
+        this.snapshot.session.sessionId !== sessionId ||
+        this.snapshot.session.phase !== "listening"
+      ) {
         window.clearInterval(partialTimer);
         return;
       }
       wordIndex += 2;
-      this.snapshot.session.partialTranscript = words.slice(0, wordIndex).join(" ");
+      this.snapshot.session.partialTranscript = words
+        .slice(0, wordIndex)
+        .join(" ");
       this.bump();
-      this.emit("session", { partialTranscript: this.snapshot.session.partialTranscript }, sessionId);
+      this.emit(
+        "session",
+        { partialTranscript: this.snapshot.session.partialTranscript },
+        sessionId,
+      );
       if (wordIndex >= words.length) {
         window.clearInterval(partialTimer);
         this.finishSentence(sessionId, sentence.source, sentence.translation);
@@ -225,7 +281,11 @@ class MockTranslator {
     this.timers.add(partialTimer);
   }
 
-  private finishSentence(sessionId: string, sourceText: string, translationText: string): void {
+  private finishSentence(
+    sessionId: string,
+    sourceText: string,
+    translationText: string,
+  ): void {
     if (this.snapshot.session.sessionId !== sessionId) return;
     const segment: CaptionSegment = {
       id: `mock-caption-${++this.sequence}`,
@@ -237,19 +297,29 @@ class MockTranslator {
     };
     this.snapshot.session.partialTranscript = "";
     this.snapshot.captions.push(segment);
-    this.snapshot.session.queue = { ...this.snapshot.session.queue, pending: 1, lagMs: 620 };
+    this.snapshot.session.queue = {
+      ...this.snapshot.session.queue,
+      pending: 1,
+      lagMs: 620,
+    };
     this.bump();
     this.emit("caption", segment, sessionId);
     this.emit("queue", this.snapshot.session.queue, sessionId);
 
     this.schedule(() => {
       if (this.snapshot.session.sessionId !== sessionId) return;
-      const item = this.snapshot.captions.find((caption) => caption.id === segment.id);
+      const item = this.snapshot.captions.find(
+        (caption) => caption.id === segment.id,
+      );
       if (!item) return;
       item.translationText = translationText;
       item.status = "translated";
       item.completedAt = now();
-      this.snapshot.session.queue = { ...this.snapshot.session.queue, pending: 0, lagMs: 0 };
+      this.snapshot.session.queue = {
+        ...this.snapshot.session.queue,
+        pending: 0,
+        lagMs: 0,
+      };
       this.bump();
       this.emit("caption", item, sessionId);
       this.emit("queue", this.snapshot.session.queue, sessionId);
@@ -296,13 +366,22 @@ class MockTranslator {
 const mockTranslator = new MockTranslator();
 
 function validateDraft(draft: SettingsDraft): SettingsValidation {
-  const fieldErrors: SettingsValidation["fieldErrors"] = {};
-  const validateUrl = (value: string, protocol: "wss:" | "https:", field: string) => {
+  const fieldErrors: SettingsValidation["fieldErrors"] = audioLanguageErrors(draft.audio);
+  const validateUrl = (
+    value: string,
+    protocol: "wss:" | "https:",
+    field: string,
+  ) => {
     try {
       const parsed = new URL(value.trim());
       if (parsed.protocol !== protocol) {
         fieldErrors[field] = `地址必须使用 ${protocol}// 加密连接。`;
-      } else if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      } else if (
+        parsed.username ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash
+      ) {
         fieldErrors[field] = "地址不能包含凭据、查询参数或片段。";
       }
     } catch {
@@ -310,33 +389,22 @@ function validateDraft(draft: SettingsDraft): SettingsValidation {
     }
   };
 
-  validateUrl(draft.recognition.baseUrl, "wss:", "recognition.baseUrl");
-  if (!draft.recognition.model.trim()) fieldErrors["recognition.model"] = "请输入语音识别模型名称。";
   validateUrl(draft.realtime.baseUrl, "wss:", "realtime.baseUrl");
-  if (!draft.realtime.model.trim()) fieldErrors["realtime.model"] = "请输入同传模型名称。";
-  if (draft.engine === "realtime" && !draft.audio.listen.enabled && !draft.audio.speak.enabled) {
-    fieldErrors.audio = "实时同传至少需要启用一个翻译通道。";
-  }
-  if (!draft.translationProviders.length) fieldErrors.translationProviders = "请至少添加一个翻译服务商。";
-  const ids = new Set<string>();
-  draft.translationProviders.forEach((provider) => {
-    const prefix = `provider.${provider.id}`;
-    if (!provider.name.trim()) fieldErrors[`${prefix}.name`] = "请输入服务商名称。";
-    validateUrl(provider.baseUrl, "https:", `${prefix}.baseUrl`);
-    if (!provider.selectedModel.trim()) fieldErrors[`${prefix}.selectedModel`] = "请添加并选择一个模型。";
-    if (provider.models.length > 100) fieldErrors[`${prefix}.selectedModel`] = "每个服务商最多保留 100 个模型。";
-    if (ids.has(provider.id)) fieldErrors.translationProviders = "服务商标识重复，请删除后重新添加。";
-    ids.add(provider.id);
-  });
-  if (!ids.has(draft.activeTranslationProviderId)) {
-    fieldErrors.activeTranslationProviderId = "请选择当前使用的翻译服务商。";
-  }
-  if (!draft.targetLanguage.trim()) fieldErrors.targetLanguage = "请选择目标语言。";
+  if (draft.realtime.model !== DEFAULT_SETTINGS.realtime.model)
+    fieldErrors["realtime.model"] = "当前仅支持 Qwen3.8 实时同传模型。";
+  if (!draft.audio.listen.enabled && !draft.audio.speak.enabled)
+    fieldErrors.audio = "请至少启用一个音频通道。";
+  if (!draft.targetLanguage.trim())
+    fieldErrors.targetLanguage = "请选择目标语言。";
 
   return { valid: Object.keys(fieldErrors).length === 0, fieldErrors };
 }
 
-function emitTauri<T>(type: TranslatorEvent["type"], data: EventEnvelope<T>, listener: EventListener): void {
+function emitTauri<T>(
+  type: TranslatorEvent["type"],
+  data: EventEnvelope<T>,
+  listener: EventListener,
+): void {
   listener({ type, data } as TranslatorEvent);
 }
 
@@ -421,34 +489,50 @@ function asNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function toSecretStatus(value: string): PublicSettings["recognition"]["apiKeyStatus"] {
-  if (value === "environment" || value === "secure_store" || value === "unavailable") return value;
+function toSecretStatus(
+  value: string,
+): PublicSettings["recognition"]["apiKeyStatus"] {
+  if (
+    value === "environment" ||
+    value === "secure_store" ||
+    value === "unavailable"
+  )
+    return value;
   return "missing";
 }
 
-function toEngineMode(value: unknown): PublicSettings["engine"] {
-  return value === "realtime" ? "realtime" : "pipeline";
+function toEngineMode(_value: unknown): PublicSettings["engine"] {
+  return "realtime";
 }
 
 function toChannelId(value: unknown): ChannelId {
   return value === "speak" ? "speak" : "listen";
 }
 
-function toAudioChannel(raw: unknown, fallback: AudioChannelSettings): AudioChannelSettings {
+function toAudioChannel(
+  raw: unknown,
+  fallback: AudioChannelSettings,
+): AudioChannelSettings {
   const channel = asRecord(raw);
-  const input = channel.input === "microphone" ? "microphone" : "loopback";
+  const input = channel.input === "microphone" || channel.input === "loopback" || channel.input === "system" ? channel.input : fallback.input;
   return {
-    enabled: typeof channel.enabled === "boolean" ? channel.enabled : fallback.enabled,
+    voiceMode: channel.voiceMode === "system" || channel.voiceMode === "clone" ? channel.voiceMode : fallback.voiceMode,
+    enabled:
+      typeof channel.enabled === "boolean" ? channel.enabled : fallback.enabled,
     input,
     inputDevice: asString(channel.inputDevice, ""),
-    targetLanguage: asString(channel.targetLanguage, fallback.targetLanguage),
+    targetLanguage: asString(channel.targetLanguage, "").trim() || fallback.targetLanguage,
     outputDevice: asString(channel.outputDevice, ""),
-    playAudio: typeof channel.playAudio === "boolean" ? channel.playAudio : true,
+    playAudio:
+      typeof channel.playAudio === "boolean" ? channel.playAudio : true,
   };
 }
 
 function toPublicSettings(raw: BackendSettingsSnapshot): PublicSettings {
-  const subtitleSize = raw.captionScale === "small" || raw.captionScale === "large" ? raw.captionScale : "medium";
+  const subtitleSize =
+    raw.captionScale === "small" || raw.captionScale === "large"
+      ? raw.captionScale
+      : "medium";
   const realtime = asRecord(raw.realtime);
   const audio = asRecord(raw.audio);
   return {
@@ -465,8 +549,8 @@ function toPublicSettings(raw: BackendSettingsSnapshot): PublicSettings {
       protocol: "livetranslate",
       baseUrl: asString(realtime.baseUrl, DEFAULT_SETTINGS.realtime.baseUrl),
       model: asString(realtime.model, DEFAULT_SETTINGS.realtime.model),
-      voice: asString(realtime.voice, ""),
-      enableVoiceClone: realtime.enableVoiceClone === true,
+      voice: asString(realtime.voice, DEFAULT_SETTINGS.realtime.voice),
+      enableVoiceClone: realtime.enableVoiceClone !== false,
       voiceCloneFrequency: toVoiceCloneFrequency(realtime.voiceCloneFrequency),
       apiKeyStatus: toSecretStatus(asString(realtime.apiKeyStatus)),
     },
@@ -485,12 +569,15 @@ function toPublicSettings(raw: BackendSettingsSnapshot): PublicSettings {
   };
 }
 
-function toVoiceCloneFrequency(value: unknown): RealtimeServiceSettings["voiceCloneFrequency"] {
+function toVoiceCloneFrequency(
+  value: unknown,
+): RealtimeServiceSettings["voiceCloneFrequency"] {
   return value === "never" || value === "always" ? value : "once";
 }
 
 function toBackendAudioChannel(channel: AudioChannelSettings) {
   return {
+    voiceMode: channel.voiceMode,
     enabled: channel.enabled,
     input: channel.input,
     inputDevice: channel.inputDevice.trim(),
@@ -569,7 +656,11 @@ function nextBridgeRevision(sequence: unknown): number {
   return bridgeRevision;
 }
 
-function eventEnvelope<T>(revision: number, sessionId: string | null, payload: T): EventEnvelope<T> {
+function eventEnvelope<T>(
+  revision: number,
+  sessionId: string | null,
+  payload: T,
+): EventEnvelope<T> {
   return {
     revision,
     sessionId,
@@ -591,15 +682,10 @@ function queueFor(sessionId: string): TranslationQueue {
 export function isConfigurationComplete(settings: PublicSettings): boolean {
   const usable = (status: PublicSettings["recognition"]["apiKeyStatus"]) =>
     status === "environment" || status === "secure_store";
-  if (settings.engine === "realtime") {
-    const channels =
-      (settings.audio.listen.enabled ? 1 : 0) + (settings.audio.speak.enabled ? 1 : 0);
-    return usable(settings.realtime.apiKeyStatus) && channels > 0;
-  }
-  const activeProvider = settings.translationProviders.find(
-    (provider) => provider.id === settings.activeTranslationProviderId,
-  );
-  return usable(settings.recognition.apiKeyStatus) && Boolean(activeProvider && usable(activeProvider.apiKeyStatus));
+  const channels =
+    Number(settings.audio.listen.enabled) +
+    Number(settings.audio.speak.enabled);
+  return usable(settings.realtime.apiKeyStatus) && channels > 0;
 }
 
 async function copyInBrowser(text: string): Promise<void> {
@@ -619,6 +705,9 @@ async function copyInBrowser(text: string): Promise<void> {
   if (!copied) throw new Error("浏览器不允许访问剪贴板。");
 }
 
+// Settings can mount twice in StrictMode or reopen while enumeration is pending.
+let audioDevicesRequest: Promise<unknown> | null = null;
+
 export const translatorApi = {
   isTauri: isTauriRuntime(),
 
@@ -633,7 +722,9 @@ export const translatorApi = {
     const snapshot = createInitialSnapshot();
     snapshot.revision = bridgeRevision;
     snapshot.settings = settings;
-    snapshot.session.phase = isConfigurationComplete(settings) ? "idle" : "needs_configuration";
+    snapshot.session.phase = isConfigurationComplete(settings)
+      ? "idle"
+      : "needs_configuration";
     if (activeSession.sessionId) {
       // The sidecar continues independently of a WebView reload. Reattach to
       // its known session ID so subsequent events are not discarded as stale.
@@ -642,7 +733,11 @@ export const translatorApi = {
         phase: "listening",
         sessionId: activeSession.sessionId,
         startedAt: now(),
-        health: { audio: "connecting", recognition: "connecting", translation: "connecting" },
+        health: {
+          audio: "connecting",
+          recognition: "connecting",
+          translation: "connecting",
+        },
         queue: createEmptyQueue(),
         lastError: null,
       };
@@ -682,15 +777,23 @@ export const translatorApi = {
   },
 
   async saveSettings(draft: SettingsDraft): Promise<PublicSettings> {
+    const validation = validateDraft(draft);
+    if (!validation.valid) throw new Error(Object.values(validation.fieldErrors).join("\n"));
     if (!isTauriRuntime()) return mockTranslator.saveSettings(draft);
-    const raw = await invoke<BackendSettingsSnapshot>("save_settings", { input: toBackendSettings(draft) });
+    const raw = await invoke<BackendSettingsSnapshot>("save_settings", {
+      input: toBackendSettings(draft),
+    });
     return toPublicSettings(raw);
   },
 
-  async fetchProviderModels(provider: TranslationProviderDraft): Promise<ProviderModelsResult> {
+  async fetchProviderModels(
+    provider: TranslationProviderDraft,
+  ): Promise<ProviderModelsResult> {
     if (!isTauriRuntime()) {
       return {
-        models: provider.models.length ? [...provider.models] : [provider.selectedModel].filter(Boolean),
+        models: provider.models.length
+          ? [...provider.models]
+          : [provider.selectedModel].filter(Boolean),
         supported: true,
       };
     }
@@ -699,7 +802,9 @@ export const translatorApi = {
     });
   },
 
-  async testProviderConnection(provider: TranslationProviderDraft): Promise<ProviderConnectionResult> {
+  async testProviderConnection(
+    provider: TranslationProviderDraft,
+  ): Promise<ProviderConnectionResult> {
     if (!isTauriRuntime()) {
       await new Promise((resolve) => window.setTimeout(resolve, 350));
       return { ok: true, latencyMs: 350, detail: "浏览器演示连接正常" };
@@ -709,11 +814,32 @@ export const translatorApi = {
     });
   },
 
+  async installVirtualMicrophone(): Promise<void> {
+    if (!isTauriRuntime()) throw new Error("请在 Windows 桌面版中安装虚拟麦克风。");
+    await invoke("install_virtual_microphone");
+  },
+
+  async openVirtualMicrophoneLink(kind: "product" | "license" | "donate"): Promise<void> {
+    if (isTauriRuntime()) {
+      await invoke("open_virtual_microphone_link", { kind });
+    } else {
+      const urls = { product: "https://vb-audio.com/Cable/", license: "https://vb-audio.com/Services/licensing.htm", donate: "https://shop.vb-audio.com/en/" };
+      window.open(urls[kind], "_blank", "noopener,noreferrer");
+    }
+  },
+
   async listAudioDevices(): Promise<AudioDeviceList> {
     if (!isTauriRuntime()) {
       return { speakers: [], microphones: [] };
     }
-    const raw = asRecord(await invoke<unknown>("list_audio_devices"));
+    if (!audioDevicesRequest) {
+      audioDevicesRequest = invoke<unknown>("list_audio_devices").finally(
+        () => {
+          audioDevicesRequest = null;
+        },
+      );
+    }
+    const raw = asRecord(await audioDevicesRequest);
     const toDevices = (value: unknown): AudioDevice[] =>
       Array.isArray(value)
         ? value.map((item) => {
@@ -727,7 +853,10 @@ export const translatorApi = {
             };
           })
         : [];
-    return { speakers: toDevices(raw.speakers), microphones: toDevices(raw.microphones) };
+    return {
+      speakers: toDevices(raw.speakers),
+      microphones: toDevices(raw.microphones),
+    };
   },
 
   async copyText(text: string): Promise<void> {
@@ -740,10 +869,11 @@ export const translatorApi = {
     return listen<BridgeEvent>("translator-event", (event) => {
       const bridge = event.payload;
       if (bridge.type !== "event" || typeof bridge.event !== "string") return;
-      const sessionId = typeof bridge.session_id === "string" ? bridge.session_id : null;
+      const sessionId =
+        typeof bridge.session_id === "string" ? bridge.session_id : null;
       const revision = nextBridgeRevision(bridge.sequence);
       const data = asRecord(bridge.data);
-      const emit = <T,>(type: TranslatorEvent["type"], payload: T) =>
+      const emit = <T>(type: TranslatorEvent["type"], payload: T) =>
         emitTauri(type, eventEnvelope(revision, sessionId, payload), listener);
 
       if (bridge.event === "state") {
@@ -759,7 +889,11 @@ export const translatorApi = {
             partialTranslation: "",
             deviceNames: {},
             channels: { listen: "connecting", speak: "connecting" },
-            health: { audio: "connecting", recognition: "connecting", translation: "connecting" },
+            health: {
+              audio: "connecting",
+              recognition: "connecting",
+              translation: "connecting",
+            },
             queue: queueFor(sessionId),
             lastError: null,
           });
@@ -770,7 +904,11 @@ export const translatorApi = {
         // "connecting" until real traffic proves otherwise.
         if (state === "listening") emit("session", { phase: "listening" });
         if (state === "stopping") {
-          emit("session", { phase: "stopping", partialTranscript: "", partialTranslation: "" });
+          emit("session", {
+            phase: "stopping",
+            partialTranscript: "",
+            partialTranslation: "",
+          });
         }
         if (state === "stopped") {
           emit("session", {
@@ -808,7 +946,10 @@ export const translatorApi = {
         const channel = toChannelId(data.channel);
         const status = asString(data.status);
         if (status === "failed") {
-          emit("session", { channels: { [channel]: "failed" }, health: { audio: "failed" } });
+          emit("session", {
+            channels: { [channel]: "failed" },
+            health: { audio: "failed" },
+          });
         } else if (status === "ready" || status === "streaming") {
           emit("session", {
             channels: { [channel]: "ready" },
@@ -882,9 +1023,16 @@ export const translatorApi = {
       if (bridge.event === "translation") {
         const sourceSequence = asNumber(data.source_seq);
         const queue = queueFor(sessionId);
-        const nextQueue = { ...queue, pending: Math.max(0, queue.pending - 1), lagMs: 0 };
+        const nextQueue = {
+          ...queue,
+          pending: Math.max(0, queue.pending - 1),
+          lagMs: 0,
+        };
         bridgeQueues.set(sessionId, nextQueue);
-        emit("session", { health: { translation: "ready" }, partialTranslation: "" });
+        emit("session", {
+          health: { translation: "ready" },
+          partialTranslation: "",
+        });
         emit("caption", {
           id: `${sessionId}:${sourceSequence}`,
           sessionId,
@@ -925,7 +1073,11 @@ export const translatorApi = {
       if (bridge.event === "translation.failed") {
         const sourceSequence = asNumber(data.source_seq);
         const queue = queueFor(sessionId);
-        const nextQueue = { ...queue, pending: Math.max(0, queue.pending - 1), lagMs: 0 };
+        const nextQueue = {
+          ...queue,
+          pending: Math.max(0, queue.pending - 1),
+          lagMs: 0,
+        };
         bridgeQueues.set(sessionId, nextQueue);
         emit("caption", {
           id: `${sessionId}:${sourceSequence}`,
@@ -943,10 +1095,18 @@ export const translatorApi = {
       if (bridge.event === "error") {
         const scope = asString(data.scope);
         const service: EngineError["service"] =
-          scope === "audio" ? "audio" : scope === "asr" ? "recognition" : scope === "translation" ? "translation" : "system";
+          scope === "audio"
+            ? "audio"
+            : scope === "asr"
+              ? "recognition"
+              : scope === "translation"
+                ? "translation"
+                : "system";
         const title =
           service === "audio"
-            ? "音频采集失败"
+            ? asString(data.code) === "audio_playback_failed"
+              ? "译文播放失败"
+              : "音频采集失败"
             : service === "recognition"
               ? "语音识别失败"
               : service === "translation"

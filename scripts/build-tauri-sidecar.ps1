@@ -24,6 +24,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 New-Item -ItemType Directory -Force -Path $OutputDir, $BuildRoot | Out-Null
 
+& cargo build --release --manifest-path (Join-Path $ProjectRoot "desktop/src-tauri/Cargo.toml") --bin translator-audio-capture
+if ($LASTEXITCODE -ne 0) { throw "System audio capture build failed." }
+$AudioCapturePath = Join-Path $ProjectRoot "desktop/src-tauri/target/release/translator-audio-capture.exe"
+
 & $PythonPath -m PyInstaller `
     --noconfirm `
     --clean `
@@ -37,6 +41,8 @@ New-Item -ItemType Directory -Force -Path $OutputDir, $BuildRoot | Out-Null
     --hidden-import soundcard.mediafoundation `
     --hidden-import websockets.asyncio.client `
     --hidden-import websockets.asyncio.server `
+    --add-data "$(Join-Path $PSScriptRoot 'translation_languages.json');." `
+    --add-binary "$AudioCapturePath;." `
     $BridgePath
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller sidecar build failed."
