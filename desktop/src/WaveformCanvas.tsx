@@ -5,7 +5,10 @@ interface WaveformCanvasProps {
   strength?: number;
 }
 
-export function WaveformCanvas({ active, strength = 0.45 }: WaveformCanvasProps) {
+export function WaveformCanvas({
+  active,
+  strength = 0.45,
+}: WaveformCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -18,7 +21,9 @@ export function WaveformCanvas({ active, strength = 0.45 }: WaveformCanvasProps)
     let frame = 0;
     let animationFrame = 0;
     let disposed = false;
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const reducedMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
     const animated = active && !reducedMotion;
 
     const paint = () => {
@@ -39,15 +44,20 @@ export function WaveformCanvas({ active, strength = 0.45 }: WaveformCanvasProps)
       const phase = reducedMotion ? 0 : frame / 17;
 
       for (let index = 0; index < bars; index += 1) {
-        const wave = Math.sin(index * 0.43 + phase) * 0.42 + Math.sin(index * 0.14 - phase * 0.65) * 0.28;
+        const wave =
+          Math.sin(index * 0.43 + phase) * 0.42 +
+          Math.sin(index * 0.14 - phase * 0.65) * 0.28;
         const idle = 1.5 + (index % 5) * 0.2;
         const amplitude = active
-          ? Math.max(3, 5 + Math.abs(wave) * bounds.height * (0.24 + strength * 0.46))
+          ? Math.max(
+              3,
+              5 + Math.abs(wave) * bounds.height * (0.24 + strength * 0.46),
+            )
           : idle;
         const x = index * step + step * 0.22;
         const barWidth = Math.max(1.5, step * 0.46);
         const alpha = active ? 0.48 + Math.abs(wave) * 0.42 : 0.24;
-        context.fillStyle = `rgba(98, 213, 166, ${alpha})`;
+        context.fillStyle = `rgba(0, 155, 185, ${alpha})`;
         context.fillRect(x, center - amplitude / 2, barWidth, amplitude);
       }
     };
@@ -86,5 +96,7 @@ export function WaveformCanvas({ active, strength = 0.45 }: WaveformCanvasProps)
     };
   }, [active, strength]);
 
-  return <canvas ref={canvasRef} className="waveform-canvas" aria-hidden="true" />;
+  return (
+    <canvas ref={canvasRef} className="waveform-canvas" aria-hidden="true" />
+  );
 }

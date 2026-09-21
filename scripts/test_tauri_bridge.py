@@ -6,8 +6,10 @@ Run with:
 
 from __future__ import annotations
 
+import base64
 import io
 import json
+import os
 import sys
 import threading
 import time
@@ -16,9 +18,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import numpy as np
 
 
 sys.path.insert(0, str(Path(__file__).parent))
+import livetranslate  # noqa: E402
 import tauri_bridge as bridge  # noqa: E402
 
 
@@ -923,6 +927,445 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(responses[0]["id"], "p")
         self.assertTrue(responses[0]["ok"])
         self.assertEqual(responses[1]["error"]["code"], "unknown_command")
+
+
+class RealtimeEngineTests(unittest.TestCase):
+    """The realtime engine replaces ASR + translation with one model session."""
+
+    def _start_params(self, **overrides: object) -> dict[str, object]:
+        config: dict[str, object] = {
+            "engine": "realtime",
+            "sourceLanguage": "自动检测",
+            "targetLanguage": "简体中文",
+            "realtime": {
+                "protocol": "livetranslate",
+                "baseUrl": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+                "model": "qwen3.5-livetranslate-flash-realtime",
+                "voice": "Tina",
+            },
+            "audio": {
+                "listen": {
+                    "enabled": True,
+                    "input": "loopback",
+                    "inputDevice": "",
+                    "targetLanguage": "简体中文",
+                    "outputDevice": "",
+                    "playAudio": True,
+                },
+                "speak": {
+                    "enabled": True,
+                    "input": "microphone",
+                    "inputDevice": "mic-1",
+                    "targetLanguage": "English",
+                    "outputDevice": "speaker-2",
+                    "playAudio": False,
+                },
+            },
+        }
+        config.update(overrides)
+        return {"config": config, "secrets": {"realtimeApiKey": "dashscope-key"}}
+
+    def test_realtime_engine_needs_only_the_dashscope_key(self) -> None:
+        config = bridge.RuntimeConfig.from_start_params(self._start_params())
+
+        self.assertEqual(config.engine, "realtime")
+        self.assertIsNotNone(config.realtime)
+        self.assertEqual(config.realtime.base_url, "wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
+        self.assertEqual(config.realtime.model, "qwen3.5-livetranslate-flash-realtime")
+        self.assertEqual(config.realtime.api_key, "dashscope-key")
+        self.assertEqual(config.realtime_options.voice, "Tina")
+        # The pipeline credentials are irrelevant here and must not leak.
+        self.assertEqual(config.translation.api_key, "")
+        self.assertEqual(config.recognition.api_key, "")
+        self.assertIn("dashscope-key", config.secrets)
+
+    def test_realtime_channels_follow_the_audio_settings(self) -> None:
+        config = bridge.RuntimeConfig.from_start_params(self._start_params())
+        channels = {spec.channel: spec for spec in config.channels}
+
+        self.assertEqual(channels["listen"].input_kind, "loopback")
+        self.assertEqual(channels["listen"].target_language, "简体中文")
+        self.assertTrue(channels["listen"].play_audio)
+        self.assertEqual(channels["speak"].input_kind, "microphone")
+        self.assertEqual(channels["speak"].input_device, "mic-1")
+        self.assertEqual(channels["speak"].output_device, "speaker-2")
+        self.assertEqual(channels["speak"].target_language, "English")
+        self.assertFalse(channels["speak"].play_audio)
+
+    def test_realtime_engine_rejects_a_session_without_channels(self) -> None:
+        with self.assertRaises(bridge.ProtocolError):
+            bridge.RuntimeConfig.from_start_params(
+                self._start_params(
+                    audio={
+                        "listen": {"enabled": False},
+                        "speak": {"enabled": False},
+                    }
+                )
+            )
+
+    def test_realtime_engine_requires_its_own_api_key(self) -> None:
+        params = self._start_params()
+        params["secrets"] = {}
+        with patch.dict("os.environ", {"DASHSCOPE_API_KEY": ""}, clear=False):
+            with self.assertRaises(bridge.ProtocolError):
+                bridge.RuntimeConfig.from_start_params(params)
+
+    def test_pipeline_engine_is_still_the_default(self) -> None:
+        config = bridge.RuntimeConfig.from_start_params(
+            {
+                "translation": {"protocol": "gemini", "base_url": "https://relay.example"},
+                "recognition": {"base_url": "wss://asr.example/ws", "model": "asr"},
+                "translation_api_key": "translation-key",
+                "recognition_api_key": "recognition-key",
+            }
+        )
+
+        self.assertEqual(config.engine, "pipeline")
+        self.assertIsNone(config.realtime)
+        self.assertEqual(config.channels, ())
+        self.assertEqual(config.secrets, ("translation-key", "recognition-key"))
+
+    def test_start_selects_the_realtime_session_implementation(self) -> None:
+        captured: dict[str, object] = {}
+
+        class CapturingRealtimeSession:
+            def __init__(self, _server: object, session_id: str, config: object, **kwargs: object) -> None:
+                self.session_id = session_id
+                self.config = config
+                self.state = "starting"
+                self.stop_event = threading.Event()
+                captured["kwargs"] = kwargs
+
+            def start(self) -> None:
+                captured["started"] = True
+
+            def cancel_pending_translations(self) -> None:
+                pass
+
+        stdout = io.StringIO()
+        server = bridge.BridgeServer(io.StringIO(), stdout)
+        session_id = "0f1d2c3b-4a59-4e6f-8a9b-0c1d2e3f4a5b"
+        params = self._start_params()
+        params["session_id"] = session_id
+
+        with patch.object(bridge.livetranslate, "RealtimeSession", CapturingRealtimeSession):
+            server.handle_request({"id": "start-realtime", "command": "start", "params": params})
+
+        messages = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertTrue(messages[0]["ok"], messages[0])
+        self.assertTrue(captured["started"])
+        kwargs = captured["kwargs"]
+        self.assertEqual(kwargs["base_url"], "wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
+        self.assertEqual(kwargs["api_key"], "dashscope-key")
+        self.assertEqual([spec.channel for spec in kwargs["specs"]], ["listen", "speak"])
+
+    def test_devices_command_lists_endpoints(self) -> None:
+        stdout = io.StringIO()
+        server = bridge.BridgeServer(io.StringIO(), stdout)
+        payload = {"speakers": [{"id": "spk", "name": "扬声器", "channels": 2}], "microphones": []}
+
+        with patch.object(bridge.livetranslate, "list_audio_devices", return_value=payload):
+            server.handle_request({"id": "d", "command": "devices", "params": {}})
+
+        response = json.loads(stdout.getvalue().splitlines()[0])
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"]["speakers"][0]["id"], "spk")
+
+
+class RealtimeCaptionPairingTests(unittest.TestCase):
+    """Transcript and translation arrive as two independent server event series."""
+
+    class _Server:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def emit_session_event(self, _session: object, event: str, data: dict[str, object]) -> bool:
+            self.events.append((event, data))
+            return True
+
+    def _session(self) -> "livetranslate.RealtimeSession":
+        config = bridge.RuntimeConfig.from_start_params(
+            {
+                "engine": "realtime",
+                "targetLanguage": "简体中文",
+                "realtime": {"model": "qwen3.5-livetranslate-flash-realtime"},
+                "secrets": {"realtimeApiKey": "k"},
+            }
+        )
+        self.server = self._Server()
+        return livetranslate.RealtimeSession(
+            self.server,
+            "session-1",
+            config,
+            base_url=config.realtime.base_url,
+            model=config.realtime.model,
+            api_key="k",
+            options=livetranslate.RealtimeOptions(),
+            specs=livetranslate.enabled_channels(config.channels),
+            startup_timeout_s=1.0,
+        )
+
+    def test_transcript_then_translation_completes_one_caption(self) -> None:
+        session = self._session()
+        session.on_channel_transcript("listen", "Hello there")
+        session.on_channel_translation_done("listen", "resp-1", "你好")
+
+        kinds = [event for event, _ in self.server.events]
+        self.assertEqual(kinds, ["source.final", "translation"])
+        self.assertEqual(self.server.events[0][1]["source_seq"], self.server.events[1][1]["source_seq"])
+        self.assertEqual(self.server.events[1][1]["source_text"], "Hello there")
+        self.assertEqual(self.server.events[1][1]["text"], "你好")
+
+    def test_translation_arriving_first_still_merges_into_one_caption(self) -> None:
+        session = self._session()
+        session.on_channel_translation_done("listen", "resp-1", "你好")
+        self.assertEqual(self.server.events, [])
+
+        session.on_channel_transcript("listen", "Hello there")
+        kinds = [event for event, _ in self.server.events]
+        self.assertEqual(kinds, ["source.final", "translation"])
+        self.assertEqual(self.server.events[1][1]["source_text"], "Hello there")
+        self.assertEqual(self.server.events[1][1]["text"], "你好")
+
+    def test_channels_keep_independent_sequences(self) -> None:
+        session = self._session()
+        session.on_channel_transcript("listen", "Hello")
+        session.on_channel_transcript("speak", "你好")
+        session.on_channel_translation_done("speak", "resp-b", "Hello")
+        session.on_channel_translation_done("listen", "resp-a", "你好")
+
+        translations = [data for event, data in self.server.events if event == "translation"]
+        self.assertEqual(translations[0]["channel"], "speak")
+        self.assertEqual(translations[0]["source_text"], "你好")
+        self.assertEqual(translations[1]["channel"], "listen")
+        self.assertEqual(translations[1]["source_text"], "Hello")
+
+    def test_language_labels_map_to_model_codes(self) -> None:
+        self.assertEqual(livetranslate.language_code("简体中文"), "zh")
+        self.assertEqual(livetranslate.language_code("English"), "en")
+        self.assertEqual(livetranslate.language_code("en"), "en")
+        self.assertEqual(livetranslate.language_code("自动检测"), "auto")
+        self.assertEqual(livetranslate.language_code("未配置的语言"), "en")
+
+
+class RealtimeChannelRetirementTests(unittest.TestCase):
+    """A session must be retired exactly when its last channel stops."""
+
+    class _Server:
+        def __init__(self) -> None:
+            self.retired = 0
+
+        def emit_session_event(self, *_args: object, **_kwargs: object) -> bool:
+            return True
+
+        def on_realtime_all_channels_closed(self, _session: object) -> None:
+            self.retired += 1
+
+    def _session(self, channels: dict[str, bool]) -> tuple["RealtimeChannelRetirementTests._Server", object]:
+        config = bridge.RuntimeConfig.from_start_params(
+            {
+                "engine": "realtime",
+                "realtime": {"model": "qwen3.5-livetranslate-flash-realtime"},
+                "audio": channels,
+                "secrets": {"realtimeApiKey": "k"},
+            }
+        )
+        server = self._Server()
+        session = livetranslate.RealtimeSession(
+            server,
+            "session-1",
+            config,
+            base_url=config.realtime.base_url,
+            model=config.realtime.model,
+            api_key="k",
+            options=livetranslate.RealtimeOptions(),
+            specs=livetranslate.enabled_channels(config.channels),
+            startup_timeout_s=1.0,
+        )
+        return server, session
+
+    def test_the_calling_channel_does_not_keep_the_session_alive(self) -> None:
+        server, session = self._session({"listen": {"enabled": True}, "speak": {"enabled": False}})
+        exited = threading.Event()
+
+        class Runner(threading.Thread):
+            def run(self) -> None:
+                # Mirrors the production call: the session is told a channel is
+                # gone from inside that channel's own thread.
+                session.on_channel_exit("listen")
+                exited.set()
+
+        runner = Runner(daemon=True)
+        session.channels[0] = runner  # type: ignore[assignment]
+        runner.start()
+        self.assertTrue(exited.wait(5))
+        runner.join(5)
+
+        self.assertEqual(server.retired, 1)
+
+    def test_a_live_sibling_defers_retirement(self) -> None:
+        server, session = self._session(
+            {"listen": {"enabled": True}, "speak": {"enabled": True}}
+        )
+        self.assertEqual(len(session.channels), 2)
+        holder = threading.Thread(target=lambda: threading.Event().wait(5), daemon=True)
+        holder.start()
+        # The second channel is still running, so the session must survive.
+        session.channels[1] = holder  # type: ignore[assignment]
+
+        session.on_channel_exit("listen")
+        self.assertEqual(server.retired, 0)
+
+        session.channels[1] = session.channels[0]  # type: ignore[assignment]
+
+        class Runner(threading.Thread):
+            def run(self) -> None:
+                session.on_channel_exit("speak")
+
+        second = Runner(daemon=True)
+        session.channels[0] = second  # type: ignore[assignment]
+        second.start()
+        second.join(5)
+
+        self.assertEqual(server.retired, 1)
+
+
+class RealtimeChannelEventTests(unittest.TestCase):
+    """DashScope server events become bridge events without a live socket."""
+
+    class _Server:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+            self.errors: list[str] = []
+            self.channels: list[tuple[str, str]] = []
+
+        def emit_session_event(self, _session: object, event: str, data: dict[str, object]) -> bool:
+            self.events.append((event, data))
+            return True
+
+        def emit_session_error(
+            self, _session: object, *, scope: str, code: str, message: str, recoverable: bool
+        ) -> None:
+            self.errors.append(code)
+
+        def on_realtime_channel(
+            self,
+            _session: object,
+            channel: str,
+            status: str,
+            *,
+            device: object = None,
+            detail: str = "",
+        ) -> None:
+            self.channels.append((channel, status))
+
+    class _Player:
+        def __init__(self) -> None:
+            self.pushes: list[list[float]] = []
+
+        def push(self, samples: object) -> None:
+            self.pushes.append(list(samples))
+
+    def _channel(self) -> tuple["RealtimeChannelEventTests._Server", object, object]:
+        config = bridge.RuntimeConfig.from_start_params(
+            {
+                "engine": "realtime",
+                "targetLanguage": "简体中文",
+                "realtime": {"model": "qwen3.5-livetranslate-flash-realtime"},
+                "audio": {"listen": {"enabled": True, "playAudio": True}},
+                "secrets": {"realtimeApiKey": "k"},
+            }
+        )
+        server = self._Server()
+        session = livetranslate.RealtimeSession(
+            server,
+            "session-1",
+            config,
+            base_url=config.realtime.base_url,
+            model=config.realtime.model,
+            api_key="k",
+            options=livetranslate.RealtimeOptions(),
+            specs=livetranslate.enabled_channels(config.channels),
+            startup_timeout_s=1.0,
+        )
+        channel = session.channels[0]
+        channel._player = self._Player()
+        return server, session, channel
+
+    def _dispatch(self, channel: object, event: dict[str, object]) -> None:
+        channel._handle_event(event, None)
+
+    def test_a_full_turn_produces_one_paired_caption(self) -> None:
+        server, _session, channel = self._channel()
+
+        self._dispatch(channel, {"type": "session.updated"})
+        self._dispatch(
+            channel,
+            {
+                "type": "conversation.item.input_audio_transcription.text",
+                "text": "Hello",
+                "stash": " the",
+            },
+        )
+        self._dispatch(
+            channel,
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "Hello there",
+            },
+        )
+        self._dispatch(
+            channel,
+            {"type": "response.text.text", "response_id": "resp-1", "text": "你好", "stash": "世界"},
+        )
+        self._dispatch(
+            channel,
+            {"type": "response.text.done", "response_id": "resp-1", "text": "你好，世界"},
+        )
+
+        kinds = [event for event, _ in server.events]
+        self.assertEqual(
+            kinds, ["source.partial", "source.final", "translation.partial", "translation"]
+        )
+        # `stash` holds the not-yet-finalised tail, so the live line shows both.
+        self.assertEqual(server.events[0][1]["text"], "Hello the")
+        self.assertEqual(server.events[0][1]["channel"], "listen")
+        self.assertEqual(server.events[1][1]["text"], "Hello there")
+        final = server.events[3][1]
+        self.assertEqual(final["source_seq"], server.events[1][1]["source_seq"])
+        self.assertEqual(final["source_text"], "Hello there")
+        self.assertEqual(final["text"], "你好，世界")
+
+    def test_audio_delta_is_decoded_for_playback(self) -> None:
+        _server, _session, channel = self._channel()
+        samples = np.array([0, 16384, -16384, 32767], dtype="<i2")
+        encoded = base64.b64encode(samples.tobytes()).decode("ascii")
+
+        self._dispatch(channel, {"type": "response.audio.delta", "delta": encoded})
+
+        self.assertEqual(len(channel._player.pushes), 1)
+        decoded = channel._player.pushes[0]
+        self.assertEqual(len(decoded), 4)
+        self.assertAlmostEqual(decoded[1], 0.5, places=3)
+
+    def test_session_finish_is_acknowledged(self) -> None:
+        _server, _session, channel = self._channel()
+        self.assertFalse(channel._finished.is_set())
+
+        self._dispatch(channel, {"type": "session.finished"})
+
+        self.assertTrue(channel._finished.is_set())
+
+    def test_audio_transcript_spelling_is_accepted_too(self) -> None:
+        server, _session, channel = self._channel()
+        self._dispatch(channel, {"type": "conversation.item.input_audio_transcription.completed", "transcript": "Hi"})
+        self._dispatch(
+            channel,
+            {"type": "response.audio_transcript.done", "response_id": "resp-2", "transcript": "你好"},
+        )
+
+        self.assertEqual([event for event, _ in server.events], ["source.final", "translation"])
+        self.assertEqual(server.events[1][1]["text"], "你好")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,58 @@ export type SecretStatus = "missing" | "environment" | "secure_store" | "unavail
 
 export type TranslationProtocol = "gemini" | "openai";
 
+/** `realtime` runs one speech-to-speech model; `pipeline` chains ASR + text model. */
+export type EngineMode = "pipeline" | "realtime";
+
+export type AudioInputKind = "loopback" | "microphone";
+
+/** `listen` is other people heard by me; `speak` is me heard by other people. */
+export type ChannelId = "listen" | "speak";
+
+export const CHANNEL_IDS: ChannelId[] = ["listen", "speak"];
+
+export interface ChannelHealth {
+  listen: HealthStatus;
+  speak: HealthStatus;
+}
+
+export interface AudioDevice {
+  id: string;
+  name: string;
+  channels: number;
+  isDefault: boolean;
+  loopback: boolean;
+}
+
+export interface AudioDeviceList {
+  speakers: AudioDevice[];
+  microphones: AudioDevice[];
+}
+
+export interface RealtimeServiceSettings {
+  protocol: "livetranslate";
+  baseUrl: string;
+  model: string;
+  voice: string;
+  enableVoiceClone: boolean;
+  voiceCloneFrequency: "never" | "once" | "always";
+  apiKeyStatus: SecretStatus;
+}
+
+export interface AudioChannelSettings {
+  enabled: boolean;
+  input: AudioInputKind;
+  inputDevice: string;
+  targetLanguage: string;
+  outputDevice: string;
+  playAudio: boolean;
+}
+
+export interface AudioSettings {
+  listen: AudioChannelSettings;
+  speak: AudioChannelSettings;
+}
+
 export interface RecognitionServiceSettings {
   protocol: "dashscope";
   baseUrl: string;
@@ -85,12 +137,17 @@ export interface CaptionSegment {
   createdAt: string;
   completedAt?: string;
   errorMessage?: string;
+  /** Which realtime direction produced this caption; absent in pipeline mode. */
+  channel?: ChannelId;
 }
 
 export interface PublicSettings {
   sourceLanguage: string;
   targetLanguage: string;
+  engine: EngineMode;
   recognition: RecognitionServiceSettings;
+  realtime: RealtimeServiceSettings;
+  audio: AudioSettings;
   translationProviders: TranslationProviderSettings[];
   activeTranslationProviderId: string;
   alwaysOnTop: boolean;
@@ -107,8 +164,18 @@ export interface TranslationProviderDraft extends Omit<TranslationProviderSettin
   clearApiKey?: boolean;
 }
 
-export interface SettingsDraft extends Omit<PublicSettings, "recognition" | "translationProviders"> {
+export interface RealtimeServiceDraft extends Omit<RealtimeServiceSettings, "apiKeyStatus"> {
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
+export interface SettingsDraft
+  extends Omit<
+    PublicSettings,
+    "recognition" | "translationProviders" | "realtime"
+  > {
   recognition: RecognitionServiceDraft;
+  realtime: RealtimeServiceDraft;
   translationProviders: TranslationProviderDraft[];
 }
 
@@ -123,7 +190,13 @@ export interface SessionState {
   startedAt: string | null;
   deviceName: string | null;
   partialTranscript: string;
+  /** Which channel owns `partialTranscript`, so two live channels cannot flicker. */
+  partialChannel: ChannelId | null;
+  /** Streaming translation for the current turn; realtime engine only. */
+  partialTranslation: string;
   health: ServiceHealth;
+  channels: ChannelHealth;
+  deviceNames: Partial<Record<ChannelId, string>>;
   queue: TranslationQueue;
   lastError: EngineError | null;
 }
@@ -136,12 +209,17 @@ export interface AppSnapshot {
 }
 
 /**
- * A session update. `health` is merged field by field, because most events only
- * learn something about one service and must not silently claim the other two
- * are healthy.
+ * A session update. `health`, `channels` and `deviceNames` are merged field by
+ * field, because most events only learn something about one service or one
+ * channel and must not silently claim the others are healthy.
  */
-export type SessionPatch = Omit<Partial<SessionState>, "health"> & {
+export type SessionPatch = Omit<
+  Partial<SessionState>,
+  "health" | "channels" | "deviceNames"
+> & {
   health?: Partial<ServiceHealth>;
+  channels?: Partial<ChannelHealth>;
+  deviceNames?: Partial<Record<ChannelId, string>>;
 };
 
 export interface EventEnvelope<T> {
@@ -161,11 +239,39 @@ export type TranslatorEvent =
 export const DEFAULT_SETTINGS: PublicSettings = {
   sourceLanguage: "自动检测",
   targetLanguage: "简体中文",
+  engine: "pipeline",
   recognition: {
     protocol: "dashscope",
     baseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
     model: "qwen-audio-3.0-asr-flash-streaming",
     apiKeyStatus: "missing",
+  },
+  realtime: {
+    protocol: "livetranslate",
+    baseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    model: "qwen3.5-livetranslate-flash-realtime",
+    voice: "",
+    enableVoiceClone: false,
+    voiceCloneFrequency: "once",
+    apiKeyStatus: "missing",
+  },
+  audio: {
+    listen: {
+      enabled: true,
+      input: "loopback",
+      inputDevice: "",
+      targetLanguage: "简体中文",
+      outputDevice: "",
+      playAudio: true,
+    },
+    speak: {
+      enabled: true,
+      input: "microphone",
+      inputDevice: "",
+      targetLanguage: "English",
+      outputDevice: "",
+      playAudio: true,
+    },
   },
   translationProviders: [
     {
@@ -183,10 +289,19 @@ export const DEFAULT_SETTINGS: PublicSettings = {
   subtitleSize: "medium",
 };
 
+export function cloneAudioChannel(channel: AudioChannelSettings): AudioChannelSettings {
+  return { ...channel };
+}
+
 export function cloneSettings(settings: PublicSettings): PublicSettings {
   return {
     ...settings,
     recognition: { ...settings.recognition },
+    realtime: { ...settings.realtime },
+    audio: {
+      listen: cloneAudioChannel(settings.audio.listen),
+      speak: cloneAudioChannel(settings.audio.speak),
+    },
     translationProviders: settings.translationProviders.map((provider) => ({
       ...provider,
       models: [...provider.models],
@@ -203,7 +318,11 @@ export function createInitialSnapshot(): AppSnapshot {
       startedAt: null,
       deviceName: "默认播放设备",
       partialTranscript: "",
+      partialChannel: null,
+      partialTranslation: "",
       health: { ...IDLE_HEALTH },
+      channels: { listen: "unknown", speak: "unknown" },
+      deviceNames: {},
       queue: createEmptyQueue(),
       lastError: null,
     },

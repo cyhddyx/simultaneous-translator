@@ -35,6 +35,8 @@ New-Item -ItemType Directory -Force -Path $OutputDir, $BuildRoot | Out-Null
     --specpath $BuildRoot `
     --hidden-import dashscope.audio.asr `
     --hidden-import soundcard.mediafoundation `
+    --hidden-import websockets.asyncio.client `
+    --hidden-import websockets.asyncio.server `
     $BridgePath
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller sidecar build failed."

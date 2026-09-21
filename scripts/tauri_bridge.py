@@ -48,6 +48,8 @@ from dataclasses import dataclass
 from typing import Any, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
+import livetranslate
+
 
 PROTOCOL_VERSION = 1
 MAX_INPUT_LINE_BYTES = 1_000_000
@@ -92,6 +94,11 @@ DEFAULT_SOURCE_LANGUAGE = "自动检测"
 
 TRANSLATION_PROTOCOLS = ("gemini", "openai")
 RECOGNITION_PROTOCOLS = ("dashscope",)
+LIVETRANSLATE_PROTOCOLS = livetranslate.LIVETRANSLATE_PROTOCOLS
+ENGINE_MODES = ("pipeline", "realtime")
+DEFAULT_LIVETRANSLATE_WS_URL = livetranslate.DEFAULT_LIVETRANSLATE_WS_URL
+DEFAULT_LIVETRANSLATE_MODEL = livetranslate.DEFAULT_LIVETRANSLATE_MODEL
+DEFAULT_VOICE_CLONE_FREQUENCY = "once"
 
 # Both wire protocols stream with text/event-stream framing.  Only ``data:``
 # carries a payload; ``[DONE]`` is the OpenAI terminator and Gemini simply ends
@@ -269,7 +276,7 @@ def normalize_provider_base_url(protocol: str, value: Any, field: str = "base_ur
         return normalize_gemini_base_url(value, field)
     if protocol == "openai":
         return normalize_openai_base_url(value, field)
-    if protocol == "dashscope":
+    if protocol == "dashscope" or protocol == "livetranslate":
         return normalize_dashscope_ws_url(value, field)
     raise ProtocolError(f"unsupported provider protocol: {protocol}")
 
@@ -323,10 +330,17 @@ class RuntimeConfig:
     recognition: ProviderSpec
     source_language: str
     target_language: str
+    engine: str = "pipeline"
+    realtime: ProviderSpec | None = None
+    channels: tuple[livetranslate.ChannelSpec, ...] = ()
+    realtime_options: livetranslate.RealtimeOptions = livetranslate.RealtimeOptions()
 
     @property
-    def secrets(self) -> tuple[str, str]:
-        return (self.translation.api_key, self.recognition.api_key)
+    def secrets(self) -> tuple[str, ...]:
+        keys = [self.translation.api_key, self.recognition.api_key]
+        if self.realtime is not None:
+            keys.append(self.realtime.api_key)
+        return tuple(keys)
 
     @classmethod
     def from_start_params(cls, params: Any) -> "RuntimeConfig":
@@ -347,16 +361,89 @@ class RuntimeConfig:
         values = dict(raw_config)
         values.update(raw_secrets)
 
+        engine = _string(_config_value(values, "engine"), "engine", default="pipeline").lower()
+        if engine not in ENGINE_MODES:
+            raise ProtocolError(f"engine must be one of {', '.join(ENGINE_MODES)}")
+        realtime_mode = engine == "realtime"
+
+        # The realtime model performs recognition and translation itself, so the
+        # pipeline credentials are irrelevant there and must not be demanded.
         translation_key = _string(
-            _config_value(values, "translation_api_key", os.environ.get("GEMINI_API_KEY")),
+            _config_value(
+                values,
+                "translation_api_key",
+                None if realtime_mode else os.environ.get("GEMINI_API_KEY"),
+            ),
             "translation_api_key",
-            required=True,
+            required=not realtime_mode,
         )
         recognition_key = _string(
-            _config_value(values, "recognition_api_key", os.environ.get("DASHSCOPE_API_KEY")),
+            _config_value(
+                values,
+                "recognition_api_key",
+                None if realtime_mode else os.environ.get("DASHSCOPE_API_KEY"),
+            ),
             "recognition_api_key",
-            required=True,
+            required=not realtime_mode,
         )
+        source_language = _string(
+            _config_value(values, "source_language"),
+            "source_language",
+            default=DEFAULT_SOURCE_LANGUAGE,
+        )
+        target_language = _string(
+            _config_value(values, "target_language"),
+            "target_language",
+            default=DEFAULT_TARGET_LANGUAGE,
+        )
+
+        realtime_spec: ProviderSpec | None = None
+        channels: tuple[livetranslate.ChannelSpec, ...] = ()
+        realtime_options = livetranslate.RealtimeOptions()
+        if realtime_mode:
+            realtime_spec = _provider_spec(
+                values,
+                "realtime",
+                api_key=_string(
+                    _config_value(
+                        values, "realtime_api_key", os.environ.get("DASHSCOPE_API_KEY")
+                    ),
+                    "realtime_api_key",
+                    required=True,
+                ),
+                allowed=LIVETRANSLATE_PROTOCOLS,
+                default_protocol="livetranslate",
+                default_base_url=DEFAULT_LIVETRANSLATE_WS_URL,
+                default_model=DEFAULT_LIVETRANSLATE_MODEL,
+            )
+            raw_realtime = _config_value(values, "realtime", {})
+            if raw_realtime is None:
+                raw_realtime = {}
+            if not isinstance(raw_realtime, dict):
+                raise ProtocolError("realtime must be an object")
+            frequency = _string(
+                _config_value(raw_realtime, "voice_clone_frequency"),
+                "realtime.voice_clone_frequency",
+                default=DEFAULT_VOICE_CLONE_FREQUENCY,
+            ).lower()
+            if frequency not in livetranslate.VOICE_CLONE_FREQUENCIES:
+                frequency = DEFAULT_VOICE_CLONE_FREQUENCY
+            realtime_options = livetranslate.RealtimeOptions(
+                voice=_string(_config_value(raw_realtime, "voice"), "realtime.voice"),
+                enable_voice_clone=bool(
+                    _config_value(raw_realtime, "enable_voice_clone", False)
+                ),
+                voice_clone_frequency=frequency,
+            )
+            try:
+                channels = livetranslate.parse_channel_specs(
+                    _config_value(values, "audio", {}),
+                    default_target_language=target_language,
+                )
+            except ValueError as exc:
+                raise ProtocolError(str(exc)) from exc
+            if not livetranslate.enabled_channels(channels):
+                raise ProtocolError("realtime engine requires at least one enabled audio channel")
 
         return cls(
             translation=_provider_spec(
@@ -377,17 +464,33 @@ class RuntimeConfig:
                 default_base_url=DEFAULT_DASHSCOPE_WS_URL,
                 default_model=DEFAULT_ASR_MODEL,
             ),
-            source_language=_string(
-                _config_value(values, "source_language"),
-                "source_language",
-                default=DEFAULT_SOURCE_LANGUAGE,
-            ),
-            target_language=_string(
-                _config_value(values, "target_language"),
-                "target_language",
-                default=DEFAULT_TARGET_LANGUAGE,
-            ),
+            source_language=source_language,
+            target_language=target_language,
+            engine=engine,
+            realtime=realtime_spec,
+            channels=channels,
+            realtime_options=realtime_options,
         )
+
+
+def create_session(server: "BridgeServer", session_id: str, config: RuntimeConfig) -> Any:
+    """Build the session implementation the requested engine needs."""
+
+    if config.engine != "realtime":
+        return TranslationSession(server, session_id, config)
+    if config.realtime is None:
+        raise ProtocolError("realtime engine requires a realtime service configuration")
+    return livetranslate.RealtimeSession(
+        server,
+        session_id,
+        config,
+        base_url=config.realtime.base_url,
+        model=config.realtime.model,
+        api_key=config.realtime.api_key,
+        options=config.realtime_options,
+        specs=livetranslate.enabled_channels(config.channels),
+        startup_timeout_s=AUDIO_STARTUP_TIMEOUT_S,
+    )
 
 
 class JsonlWriter:
@@ -1411,6 +1514,43 @@ class BridgeServer:
             session.mark_audio_ready()
             self.writer.event("audio.ready", session.session_id, {})
 
+    def on_realtime_channel(
+        self,
+        session: TranslationSession,
+        channel: str,
+        status: str,
+        *,
+        device: dict[str, Any] | None = None,
+        detail: str = "",
+    ) -> None:
+        """Report one realtime channel's device and lifecycle state."""
+
+        with self._session_lock:
+            if (
+                self._shutting_down
+                or self._current_session is not session
+                or session.stop_event.is_set()
+            ):
+                return
+            if device is not None:
+                self.writer.event(
+                    "audio.device", session.session_id, {**device, "channel": channel}
+                )
+            payload: dict[str, Any] = {"channel": channel, "status": status}
+            if detail:
+                payload["detail"] = detail
+            self.writer.event("channel.status", session.session_id, payload)
+            # "streaming" is the first point where real audio is flowing, so it
+            # is the honest analogue of the pipeline's ASR "opened" event.
+            if status == "streaming" and session.state != "listening":
+                session.state = "listening"
+                self.writer.event("state", session.session_id, {"state": "listening"})
+
+    def on_realtime_all_channels_closed(self, session: TranslationSession) -> None:
+        """Retire a realtime session once its last channel thread has exited."""
+
+        self.on_audio_worker_stopped(session)
+
     def on_audio_startup_timeout(self, session: TranslationSession) -> None:
         with self._session_lock:
             if (
@@ -1487,7 +1627,7 @@ class BridgeServer:
                     uuid.UUID(session_id)
                 except ValueError as exc:
                     raise ProtocolError("session_id must be a valid UUID string") from exc
-            session = TranslationSession(self, session_id, config)
+            session = create_session(self, session_id, config)
         except ProtocolError as exc:
             self.writer.response(
                 request_id,
@@ -1670,6 +1810,23 @@ class BridgeServer:
             session.cancel_pending_translations()
             session.join_audio_worker()
 
+    def _list_devices(self, request_id: Any) -> None:
+        """Enumerate the WASAPI endpoints the realtime engine can bind to."""
+
+        try:
+            devices = livetranslate.list_audio_devices()
+        except Exception as exc:  # noqa: BLE001 - reported as a probe failure
+            self.writer.response(
+                request_id,
+                ok=False,
+                error={
+                    "code": "audio_devices_failed",
+                    "message": f"无法枚举音频设备：{exc}"[:500],
+                },
+            )
+            return
+        self.writer.response(request_id, ok=True, result=devices)
+
     def _ping(self, request_id: Any) -> None:
         with self._session_lock:
             session = self._current_session
@@ -1720,6 +1877,8 @@ class BridgeServer:
             self._probe_models(request_id, params)
         elif command == "probe.connect":
             self._probe_connect(request_id, params)
+        elif command == "devices":
+            self._list_devices(request_id)
         elif command == "shutdown":
             self._shutdown(request_id)
             return False
@@ -1767,6 +1926,7 @@ class BridgeServer:
                     "shutdown",
                     "probe.models",
                     "probe.connect",
+                    "devices",
                 ],
             },
         )

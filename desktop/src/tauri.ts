@@ -7,10 +7,15 @@ import {
   createEmptyQueue,
   createInitialSnapshot,
   type AppSnapshot,
+  type AudioChannelSettings,
+  type AudioDevice,
+  type AudioDeviceList,
   type CaptionSegment,
+  type ChannelId,
   type EngineError,
   type EventEnvelope,
   type PublicSettings,
+  type RealtimeServiceSettings,
   type SettingsDraft,
   type SettingsValidation,
   type TranslationProviderDraft,
@@ -143,6 +148,14 @@ class MockTranslator {
             && draft.recognition.baseUrl.trim() === this.snapshot.settings.recognition.baseUrl
           ? this.snapshot.settings.recognition.apiKeyStatus
           : "missing";
+    const realtimeStatus = draft.realtime.clearApiKey
+      ? "missing"
+      : draft.realtime.apiKey?.trim()
+        ? "secure_store"
+        : draft.realtime.protocol === this.snapshot.settings.realtime.protocol
+            && draft.realtime.baseUrl.trim() === this.snapshot.settings.realtime.baseUrl
+          ? this.snapshot.settings.realtime.apiKeyStatus
+          : "missing";
     const translationProviders = draft.translationProviders.map((provider) => {
       const current = this.snapshot.settings.translationProviders.find((item) => item.id === provider.id);
       const apiKeyStatus = provider.clearApiKey
@@ -158,11 +171,25 @@ class MockTranslator {
     this.snapshot.settings = {
       sourceLanguage: draft.sourceLanguage,
       targetLanguage: draft.targetLanguage,
+      engine: draft.engine,
       recognition: {
         protocol: draft.recognition.protocol,
         baseUrl: draft.recognition.baseUrl,
         model: draft.recognition.model,
         apiKeyStatus: recognitionStatus,
+      },
+      realtime: {
+        protocol: draft.realtime.protocol,
+        baseUrl: draft.realtime.baseUrl,
+        model: draft.realtime.model,
+        voice: draft.realtime.voice,
+        enableVoiceClone: draft.realtime.enableVoiceClone,
+        voiceCloneFrequency: draft.realtime.voiceCloneFrequency,
+        apiKeyStatus: realtimeStatus,
+      },
+      audio: {
+        listen: { ...draft.audio.listen },
+        speak: { ...draft.audio.speak },
       },
       translationProviders,
       activeTranslationProviderId: draft.activeTranslationProviderId,
@@ -285,6 +312,11 @@ function validateDraft(draft: SettingsDraft): SettingsValidation {
 
   validateUrl(draft.recognition.baseUrl, "wss:", "recognition.baseUrl");
   if (!draft.recognition.model.trim()) fieldErrors["recognition.model"] = "请输入语音识别模型名称。";
+  validateUrl(draft.realtime.baseUrl, "wss:", "realtime.baseUrl");
+  if (!draft.realtime.model.trim()) fieldErrors["realtime.model"] = "请输入同传模型名称。";
+  if (draft.engine === "realtime" && !draft.audio.listen.enabled && !draft.audio.speak.enabled) {
+    fieldErrors.audio = "实时同传至少需要启用一个翻译通道。";
+  }
   if (!draft.translationProviders.length) fieldErrors.translationProviders = "请至少添加一个翻译服务商。";
   const ids = new Set<string>();
   draft.translationProviders.forEach((provider) => {
@@ -311,11 +343,25 @@ function emitTauri<T>(type: TranslatorEvent["type"], data: EventEnvelope<T>, lis
 interface BackendSettingsSnapshot {
   sourceLanguage: string;
   targetLanguage: string;
+  engine: string;
   recognition: {
     protocol: "dashscope";
     baseUrl: string;
     model: string;
     apiKeyStatus: string;
+  };
+  realtime: {
+    protocol: "livetranslate";
+    baseUrl: string;
+    model: string;
+    voice: string;
+    enableVoiceClone: boolean;
+    voiceCloneFrequency: string;
+    apiKeyStatus: string;
+  };
+  audio: {
+    listen: unknown;
+    speak: unknown;
   };
   translationProviders: Array<{
     id: string;
@@ -380,16 +426,53 @@ function toSecretStatus(value: string): PublicSettings["recognition"]["apiKeySta
   return "missing";
 }
 
+function toEngineMode(value: unknown): PublicSettings["engine"] {
+  return value === "realtime" ? "realtime" : "pipeline";
+}
+
+function toChannelId(value: unknown): ChannelId {
+  return value === "speak" ? "speak" : "listen";
+}
+
+function toAudioChannel(raw: unknown, fallback: AudioChannelSettings): AudioChannelSettings {
+  const channel = asRecord(raw);
+  const input = channel.input === "microphone" ? "microphone" : "loopback";
+  return {
+    enabled: typeof channel.enabled === "boolean" ? channel.enabled : fallback.enabled,
+    input,
+    inputDevice: asString(channel.inputDevice, ""),
+    targetLanguage: asString(channel.targetLanguage, fallback.targetLanguage),
+    outputDevice: asString(channel.outputDevice, ""),
+    playAudio: typeof channel.playAudio === "boolean" ? channel.playAudio : true,
+  };
+}
+
 function toPublicSettings(raw: BackendSettingsSnapshot): PublicSettings {
   const subtitleSize = raw.captionScale === "small" || raw.captionScale === "large" ? raw.captionScale : "medium";
+  const realtime = asRecord(raw.realtime);
+  const audio = asRecord(raw.audio);
   return {
     sourceLanguage: raw.sourceLanguage,
     targetLanguage: raw.targetLanguage,
+    engine: toEngineMode(raw.engine),
     recognition: {
       protocol: "dashscope",
       baseUrl: raw.recognition.baseUrl,
       model: raw.recognition.model,
       apiKeyStatus: toSecretStatus(raw.recognition.apiKeyStatus),
+    },
+    realtime: {
+      protocol: "livetranslate",
+      baseUrl: asString(realtime.baseUrl, DEFAULT_SETTINGS.realtime.baseUrl),
+      model: asString(realtime.model, DEFAULT_SETTINGS.realtime.model),
+      voice: asString(realtime.voice, ""),
+      enableVoiceClone: realtime.enableVoiceClone === true,
+      voiceCloneFrequency: toVoiceCloneFrequency(realtime.voiceCloneFrequency),
+      apiKeyStatus: toSecretStatus(asString(realtime.apiKeyStatus)),
+    },
+    audio: {
+      listen: toAudioChannel(audio.listen, DEFAULT_SETTINGS.audio.listen),
+      speak: toAudioChannel(audio.speak, DEFAULT_SETTINGS.audio.speak),
     },
     translationProviders: raw.translationProviders.map((provider) => ({
       ...provider,
@@ -402,17 +485,48 @@ function toPublicSettings(raw: BackendSettingsSnapshot): PublicSettings {
   };
 }
 
+function toVoiceCloneFrequency(value: unknown): RealtimeServiceSettings["voiceCloneFrequency"] {
+  return value === "never" || value === "always" ? value : "once";
+}
+
+function toBackendAudioChannel(channel: AudioChannelSettings) {
+  return {
+    enabled: channel.enabled,
+    input: channel.input,
+    inputDevice: channel.inputDevice.trim(),
+    targetLanguage: channel.targetLanguage.trim(),
+    outputDevice: channel.outputDevice.trim(),
+    playAudio: channel.playAudio,
+  };
+}
+
 function toBackendSettings(draft: SettingsDraft) {
   const recognitionApiKey = draft.recognition.apiKey?.trim();
+  const realtimeApiKey = draft.realtime.apiKey?.trim();
   return {
     sourceLanguage: draft.sourceLanguage.trim(),
     targetLanguage: draft.targetLanguage.trim(),
+    engine: draft.engine,
     recognition: {
       protocol: draft.recognition.protocol,
       baseUrl: draft.recognition.baseUrl.trim(),
       model: draft.recognition.model.trim(),
       ...(recognitionApiKey ? { apiKey: recognitionApiKey } : {}),
       ...(draft.recognition.clearApiKey ? { clearApiKey: true } : {}),
+    },
+    realtime: {
+      protocol: draft.realtime.protocol,
+      baseUrl: draft.realtime.baseUrl.trim(),
+      model: draft.realtime.model.trim(),
+      voice: draft.realtime.voice.trim(),
+      enableVoiceClone: draft.realtime.enableVoiceClone,
+      voiceCloneFrequency: draft.realtime.voiceCloneFrequency,
+      ...(realtimeApiKey ? { apiKey: realtimeApiKey } : {}),
+      ...(draft.realtime.clearApiKey ? { clearApiKey: true } : {}),
+    },
+    audio: {
+      listen: toBackendAudioChannel(draft.audio.listen),
+      speak: toBackendAudioChannel(draft.audio.speak),
     },
     translationProviders: draft.translationProviders.map((provider) => {
       const apiKey = provider.apiKey?.trim();
@@ -468,12 +582,23 @@ function queueFor(sessionId: string): TranslationQueue {
   return bridgeQueues.get(sessionId) ?? createEmptyQueue();
 }
 
-function configured(settings: PublicSettings): boolean {
+/**
+ * Whether the current engine has everything it needs to start.
+ *
+ * The realtime engine recognises and translates with one DashScope key, so the
+ * text provider is never consulted there.
+ */
+export function isConfigurationComplete(settings: PublicSettings): boolean {
+  const usable = (status: PublicSettings["recognition"]["apiKeyStatus"]) =>
+    status === "environment" || status === "secure_store";
+  if (settings.engine === "realtime") {
+    const channels =
+      (settings.audio.listen.enabled ? 1 : 0) + (settings.audio.speak.enabled ? 1 : 0);
+    return usable(settings.realtime.apiKeyStatus) && channels > 0;
+  }
   const activeProvider = settings.translationProviders.find(
     (provider) => provider.id === settings.activeTranslationProviderId,
   );
-  const usable = (status: PublicSettings["recognition"]["apiKeyStatus"]) =>
-    status === "environment" || status === "secure_store";
   return usable(settings.recognition.apiKeyStatus) && Boolean(activeProvider && usable(activeProvider.apiKeyStatus));
 }
 
@@ -508,7 +633,7 @@ export const translatorApi = {
     const snapshot = createInitialSnapshot();
     snapshot.revision = bridgeRevision;
     snapshot.settings = settings;
-    snapshot.session.phase = configured(settings) ? "idle" : "needs_configuration";
+    snapshot.session.phase = isConfigurationComplete(settings) ? "idle" : "needs_configuration";
     if (activeSession.sessionId) {
       // The sidecar continues independently of a WebView reload. Reattach to
       // its known session ID so subsequent events are not discarded as stale.
@@ -584,6 +709,27 @@ export const translatorApi = {
     });
   },
 
+  async listAudioDevices(): Promise<AudioDeviceList> {
+    if (!isTauriRuntime()) {
+      return { speakers: [], microphones: [] };
+    }
+    const raw = asRecord(await invoke<unknown>("list_audio_devices"));
+    const toDevices = (value: unknown): AudioDevice[] =>
+      Array.isArray(value)
+        ? value.map((item) => {
+            const device = asRecord(item);
+            return {
+              id: asString(device.id),
+              name: asString(device.name, asString(device.id)),
+              channels: asNumber(device.channels, 1),
+              isDefault: device.isDefault === true,
+              loopback: device.loopback === true,
+            };
+          })
+        : [];
+    return { speakers: toDevices(raw.speakers), microphones: toDevices(raw.microphones) };
+  },
+
   async copyText(text: string): Promise<void> {
     await copyInBrowser(text);
   },
@@ -609,6 +755,10 @@ export const translatorApi = {
             sessionId,
             startedAt: now(),
             partialTranscript: "",
+            partialChannel: null,
+            partialTranslation: "",
+            deviceNames: {},
+            channels: { listen: "connecting", speak: "connecting" },
             health: { audio: "connecting", recognition: "connecting", translation: "connecting" },
             queue: queueFor(sessionId),
             lastError: null,
@@ -619,13 +769,19 @@ export const translatorApi = {
         // and nothing has reached the translation service yet, so both stay
         // "connecting" until real traffic proves otherwise.
         if (state === "listening") emit("session", { phase: "listening" });
-        if (state === "stopping") emit("session", { phase: "stopping", partialTranscript: "" });
+        if (state === "stopping") {
+          emit("session", { phase: "stopping", partialTranscript: "", partialTranslation: "" });
+        }
         if (state === "stopped") {
           emit("session", {
             phase: "idle",
             sessionId: null,
             startedAt: null,
             partialTranscript: "",
+            partialChannel: null,
+            partialTranslation: "",
+            deviceNames: {},
+            channels: { listen: "unknown", speak: "unknown" },
             health: { ...IDLE_HEALTH },
             queue: createEmptyQueue(),
           });
@@ -637,9 +793,30 @@ export const translatorApi = {
       if (!sessionId) return;
 
       if (bridge.event === "audio.device") {
+        const channel = toChannelId(data.channel);
+        const name = asString(data.name, "默认播放设备");
         emit("session", {
-          deviceName: asString(data.name, "默认播放设备"),
+          deviceNames: { [channel]: name },
+          // The tile shows the incoming direction when it is live, because that
+          // is the audio the operator is actually listening to.
+          ...(channel === "listen" ? { deviceName: name } : {}),
         });
+        return;
+      }
+
+      if (bridge.event === "channel.status") {
+        const channel = toChannelId(data.channel);
+        const status = asString(data.status);
+        if (status === "failed") {
+          emit("session", { channels: { [channel]: "failed" }, health: { audio: "failed" } });
+        } else if (status === "ready" || status === "streaming") {
+          emit("session", {
+            channels: { [channel]: "ready" },
+            health: { audio: "ready", translation: "ready" },
+          });
+        } else {
+          emit("session", { channels: { [channel]: "connecting" } });
+        }
         return;
       }
 
@@ -657,10 +834,18 @@ export const translatorApi = {
       }
 
       if (bridge.event === "source.partial") {
+        // A live line owned by whichever direction spoke last; the caption chip
+        // tells the operator which channel it belongs to.
         emit("session", {
           partialTranscript: asString(data.text),
+          partialChannel: toChannelId(data.channel),
           health: { recognition: "ready" },
         });
+        return;
+      }
+
+      if (bridge.event === "translation.partial") {
+        emit("session", { partialTranslation: asString(data.text) });
         return;
       }
 
@@ -673,7 +858,14 @@ export const translatorApi = {
           lagMs: Math.max(queue.lagMs, 400),
         };
         bridgeQueues.set(sessionId, nextQueue);
-        emit("session", { health: { recognition: "ready" } });
+        // The final transcript now lives in its own caption, so the live line is
+        // released for the next turn.
+        emit("session", {
+          health: { recognition: "ready" },
+          partialTranscript: "",
+          partialChannel: null,
+          partialTranslation: "",
+        });
         emit("caption", {
           id: `${sessionId}:${sourceSequence}`,
           sessionId,
@@ -681,6 +873,7 @@ export const translatorApi = {
           sourceText: asString(data.text),
           status: "translating",
           createdAt: now(),
+          channel: toChannelId(data.channel),
         });
         emit("queue", nextQueue);
         return;
@@ -691,7 +884,7 @@ export const translatorApi = {
         const queue = queueFor(sessionId);
         const nextQueue = { ...queue, pending: Math.max(0, queue.pending - 1), lagMs: 0 };
         bridgeQueues.set(sessionId, nextQueue);
-        emit("session", { health: { translation: "ready" } });
+        emit("session", { health: { translation: "ready" }, partialTranslation: "" });
         emit("caption", {
           id: `${sessionId}:${sourceSequence}`,
           sessionId,
@@ -701,6 +894,7 @@ export const translatorApi = {
           status: "translated",
           createdAt: now(),
           completedAt: now(),
+          channel: toChannelId(data.channel),
         });
         emit("queue", nextQueue);
         return;

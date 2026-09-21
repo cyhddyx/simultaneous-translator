@@ -5,9 +5,11 @@ import {
   CircleAlert,
   Eye,
   EyeOff,
+  Headphones,
   KeyRound,
+  Languages,
   LoaderCircle,
-  MonitorUp,
+  Mic,
   Plus,
   Radio,
   RefreshCw,
@@ -23,6 +25,10 @@ import {
 
 import { translatorApi } from "./tauri";
 import type {
+  AudioChannelSettings,
+  AudioDevice,
+  AudioDeviceList,
+  ChannelId,
   PublicSettings,
   SecretStatus,
   SettingsDraft,
@@ -32,8 +38,44 @@ import type {
 } from "./types";
 
 type SettingsSection = "general" | "audio" | "services" | "privacy";
-type ServiceView = "recognition" | "translation";
+type ServiceView = "recognition" | "translation" | "realtime";
 type ProviderAction = "models" | "connection";
+
+/** Mirrors AUDIO_LANGUAGES in livetranslate.py: labels the model understands. */
+const AUDIO_LANGUAGES = [
+  "自动检测",
+  "简体中文",
+  "English",
+  "日本語",
+  "한국어",
+  "粤语",
+  "Русский",
+  "Français",
+  "Deutsch",
+  "Español",
+  "Português",
+  "Italiano",
+  "Bahasa Indonesia",
+  "Tiếng Việt",
+  "ไทย",
+  "العربية",
+  "हिन्दी",
+  "Ελληνικά",
+  "Türkçe",
+];
+
+const CHANNEL_META: Array<{ id: ChannelId; title: string; description: string }> = [
+  {
+    id: "listen",
+    title: "收听通道（对方 → 我）",
+    description: "采集系统播放的声音，翻译成我的语言后播放给我听。",
+  },
+  {
+    id: "speak",
+    title: "发言通道（我 → 对方）",
+    description: "采集麦克风，翻译成对方的语言后送到指定输出设备。",
+  },
+];
 
 interface ProviderNotice {
   providerId: string;
@@ -87,11 +129,25 @@ function sameProviderTarget(
 const toDraft = (settings: PublicSettings): SettingsDraft => ({
   sourceLanguage: settings.sourceLanguage,
   targetLanguage: settings.targetLanguage,
+  engine: settings.engine,
   recognition: {
     protocol: "dashscope",
     baseUrl: settings.recognition.baseUrl,
     model: settings.recognition.model,
     clearApiKey: false,
+  },
+  realtime: {
+    protocol: "livetranslate",
+    baseUrl: settings.realtime.baseUrl,
+    model: settings.realtime.model,
+    voice: settings.realtime.voice,
+    enableVoiceClone: settings.realtime.enableVoiceClone,
+    voiceCloneFrequency: settings.realtime.voiceCloneFrequency,
+    clearApiKey: false,
+  },
+  audio: {
+    listen: { ...settings.audio.listen },
+    speak: { ...settings.audio.speak },
   },
   translationProviders: settings.translationProviders.map((provider) => ({
     id: provider.id,
@@ -121,6 +177,7 @@ function draftFingerprint(draft: SettingsDraft): string {
   return JSON.stringify({
     ...draft,
     recognition: secretFields(draft.recognition),
+    realtime: secretFields(draft.realtime),
     translationProviders: draft.translationProviders.map(secretFields),
   });
 }
@@ -271,6 +328,138 @@ function ToggleRow({
   );
 }
 
+function AudioChannelCard({
+  meta,
+  channel,
+  devices,
+  busy,
+  error,
+  onReload,
+  onChange,
+}: {
+  meta: { id: ChannelId; title: string; description: string };
+  channel: AudioChannelSettings;
+  devices: AudioDeviceList | null;
+  busy: boolean;
+  error: string | null;
+  onReload: () => void;
+  onChange: (patch: Partial<AudioChannelSettings>) => void;
+}) {
+  const Icon = meta.id === "listen" ? Headphones : Mic;
+  const isLoopback = channel.input === "loopback";
+  const options: AudioDevice[] = isLoopback ? devices?.speakers ?? [] : devices?.microphones ?? [];
+  const defaultLabel = isLoopback ? "默认播放设备（跟随系统）" : "默认麦克风（跟随系统）";
+
+  return (
+    <article className="audio-channel">
+      <header className="audio-channel__heading">
+        <Icon size={20} aria-hidden="true" />
+        <div>
+          <strong>{meta.title}</strong>
+          <span>{meta.description}</span>
+        </div>
+        <span className="audio-channel__state">{channel.enabled ? "已启用" : "已停用"}</span>
+      </header>
+
+      <ToggleRow
+        label="启用该通道"
+        description="关闭后不会采集音频，也不会调用模型。"
+        checked={channel.enabled}
+        onChange={(value) => onChange({ enabled: value })}
+      />
+
+      <div className="field-grid">
+        <label className="field-group">
+          <span className="field-label">音频来源</span>
+          <select
+            value={channel.input}
+            onChange={(event) => {
+              const next = event.target.value as AudioChannelSettings["input"];
+              // A speaker id is not a valid microphone id (and vice versa), so a
+              // stale selection would silently fail to open at session start.
+              onChange(
+                next === channel.input
+                  ? { input: next }
+                  : { input: next, inputDevice: "" },
+              );
+            }}
+          >
+            <option value="loopback">系统声音（回环采集）</option>
+            <option value="microphone">麦克风</option>
+          </select>
+        </label>
+        <label className="field-group">
+          <span className="field-label">
+            输入设备
+            <button
+              className="icon-button icon-button--compact"
+              type="button"
+              onClick={onReload}
+              disabled={busy}
+              aria-label="重新检测音频设备"
+              title="重新检测音频设备"
+            >
+              <RefreshCw size={14} className={busy ? "is-spinning" : undefined} />
+            </button>
+          </span>
+          <select
+            value={channel.inputDevice}
+            onChange={(event) => onChange({ inputDevice: event.target.value })}
+          >
+            <option value="">{defaultLabel}</option>
+            {options.map((device) => (
+              <option key={device.id} value={device.id}>
+                {device.name}
+                {device.isDefault ? "（系统默认）" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field-group">
+          <span className="field-label">译文语言</span>
+          <select
+            value={channel.targetLanguage}
+            onChange={(event) => onChange({ targetLanguage: event.target.value })}
+          >
+            {AUDIO_LANGUAGES.filter((language) => language !== "自动检测").map((language) => (
+              <option key={language} value={language}>
+                {language}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field-group">
+          <span className="field-label">译文播放设备</span>
+          <select
+            value={channel.outputDevice}
+            onChange={(event) => onChange({ outputDevice: event.target.value })}
+          >
+            <option value="">默认播放设备（跟随系统）</option>
+            {(devices?.speakers ?? []).map((device) => (
+              <option key={device.id} value={device.id}>
+                {device.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {error && <span className="field-error">{error}</span>}
+
+      <ToggleRow
+        label="播放译文语音"
+        description={
+          isLoopback
+            ? "把对方的说话翻译后直接播放给你听。"
+            : "把你说的话翻译后送到上面的播放设备；配合虚拟声卡即可发送给对方。"
+        }
+        checked={channel.playAudio}
+        onChange={(value) => onChange({ playAudio: value })}
+      />
+    </article>
+  );
+}
+
 export function SettingsDialog({ settings, onClose, onSave, onValidate }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>("general");
   const [serviceView, setServiceView] = useState<ServiceView>("translation");
@@ -282,7 +471,23 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
   const [fieldErrors, setFieldErrors] = useState<SettingsValidation["fieldErrors"]>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [devices, setDevices] = useState<AudioDeviceList | null>(null);
+  const [devicesBusy, setDevicesBusy] = useState(false);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
+
+  const loadDevices = useCallback(async () => {
+    setDevicesBusy(true);
+    setDevicesError(null);
+    try {
+      setDevices(await translatorApi.listAudioDevices());
+    } catch (error) {
+      setDevices(null);
+      setDevicesError(errorMessage(error, "无法读取音频设备列表。"));
+    } finally {
+      setDevicesBusy(false);
+    }
+  }, []);
 
   useEffect(() => {
     setDraft(toDraft(settings));
@@ -295,6 +500,13 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
   useEffect(() => {
     setNewModel("");
   }, [selectedProviderId]);
+
+  useEffect(() => {
+    // Enumeration runs through the sidecar, so it costs one short process
+    // launch; loading it once per dialog open keeps the selects populated
+    // without probing on every keystroke.
+    void loadDevices();
+  }, [loadDevices]);
 
   const dirty = useMemo(
     () => draftFingerprint(draft) !== draftFingerprint(toDraft(settings)),
@@ -327,6 +539,11 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
   const recognitionStatus: SecretStatus = recognitionTargetChanged
     ? "missing"
     : settings.recognition.apiKeyStatus;
+  const realtimeTargetChanged = settings.realtime.protocol !== draft.realtime.protocol
+    || endpointForComparison(settings.realtime.baseUrl) !== endpointForComparison(draft.realtime.baseUrl);
+  const realtimeStatus: SecretStatus = realtimeTargetChanged
+    ? "missing"
+    : settings.realtime.apiKeyStatus;
 
   const clearFieldErrors = (...fields: string[]) => {
     setFieldErrors((current) => {
@@ -361,6 +578,25 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
     }));
     setProviderNotice(null);
     Object.keys(patch).forEach((field) => clearFieldErrors(`provider.${providerId}.${field}`));
+  };
+
+  const updateRealtime = <K extends keyof SettingsDraft["realtime"]>(
+    key: K,
+    value: SettingsDraft["realtime"][K],
+  ) => {
+    setDraft((current) => ({
+      ...current,
+      realtime: { ...current.realtime, [key]: value },
+    }));
+    clearFieldErrors(`realtime.${String(key)}`);
+  };
+
+  const updateAudioChannel = (channel: ChannelId, patch: Partial<AudioChannelSettings>) => {
+    setDraft((current) => ({
+      ...current,
+      audio: { ...current.audio, [channel]: { ...current.audio[channel], ...patch } },
+    }));
+    clearFieldErrors("audio");
   };
 
   const addProvider = () => {
@@ -663,6 +899,30 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
                     </label>
                   </div>
                   <fieldset className="segmented-field">
+                    <legend>翻译引擎</legend>
+                    <div className="segmented-control">
+                      <button
+                        type="button"
+                        className={draft.engine === "pipeline" ? "is-active" : ""}
+                        onClick={() => update("engine", "pipeline")}
+                      >
+                        管线翻译
+                      </button>
+                      <button
+                        type="button"
+                        className={draft.engine === "realtime" ? "is-active" : ""}
+                        onClick={() => update("engine", "realtime")}
+                      >
+                        实时同传
+                      </button>
+                    </div>
+                  </fieldset>
+                  <p className="settings-inline-note">
+                    {draft.engine === "realtime"
+                      ? "实时同传用一个 Qwen LiveTranslate 模型同时完成识别、翻译与语音合成，并在“音频”里为两个方向分别选择输入与播放设备。"
+                      : "管线翻译沿用语音识别 + 文本翻译模型，只采集系统播放声音并输出字幕。"}
+                  </p>
+                  <fieldset className="segmented-field">
                     <legend>字幕尺寸</legend>
                     <div className="segmented-control">
                       <button
@@ -703,19 +963,32 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
                 <div className="settings-section__heading">
                   <Volume2 size={18} aria-hidden="true" />
                   <div>
-                    <h3>系统回环音频</h3>
-                    <p>只采集 Windows 默认播放设备，不使用麦克风。</p>
+                    <h3>音频通道</h3>
+                    <p>
+                      {draft.engine === "realtime"
+                        ? "为“对方 → 我”和“我 → 对方”分别选择采集与播放设备。"
+                        : "管线翻译只采集系统播放声音并输出字幕，实时同传才会使用这里配置的通道。"}
+                    </p>
                   </div>
                 </div>
-                <div className="device-preview">
-                  <MonitorUp size={20} aria-hidden="true" />
-                  <div>
-                    <strong>默认播放设备</strong>
-                    <span>开始同传时由应用重新检测</span>
-                  </div>
-                  <span className="device-preview__state">系统控制</span>
-                </div>
-                <p className="settings-inline-note">更改 Windows 输出设备后，请停止并重新开始同传。</p>
+                {CHANNEL_META.map((meta) => (
+                  <AudioChannelCard
+                    key={meta.id}
+                    meta={meta}
+                    channel={draft.audio[meta.id]}
+                    devices={devices}
+                    busy={devicesBusy}
+                    error={meta.id === "listen" ? devicesError : null}
+                    onReload={loadDevices}
+                    onChange={(patch) => updateAudioChannel(meta.id, patch)}
+                  />
+                ))}
+                {fieldErrors.audio && <span className="field-error">{fieldErrors.audio}</span>}
+                <p className="settings-inline-note">
+                  双向同传时建议佩戴耳机：否则“收听通道”播放的译文会被回环再次采集，形成回声。
+                  若要把自己的译文发送给对方，请在系统里安装虚拟声卡（如 VB-CABLE），
+                  并把“发言通道”的译文播放设备指向该虚拟声卡的输入端。
+                </p>
               </section>
             )}
 
@@ -743,6 +1016,18 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
                     翻译模型
                   </button>
                   <button
+                    id="realtime-service-tab"
+                    type="button"
+                    role="tab"
+                    aria-selected={serviceView === "realtime"}
+                    aria-controls="realtime-service-panel"
+                    className={serviceView === "realtime" ? "is-active" : ""}
+                    onClick={() => setServiceView("realtime")}
+                  >
+                    <Languages size={15} aria-hidden="true" />
+                    实时同传
+                  </button>
+                  <button
                     id="recognition-service-tab"
                     type="button"
                     role="tab"
@@ -755,6 +1040,89 @@ export function SettingsDialog({ settings, onClose, onSave, onValidate }: Settin
                     语音识别
                   </button>
                 </div>
+
+                {serviceView === "realtime" && (
+                  <div
+                    id="realtime-service-panel"
+                    className="recognition-editor"
+                    role="tabpanel"
+                    aria-labelledby="realtime-service-tab"
+                  >
+                    <div className="service-panel-heading">
+                      <div className="service-mark" aria-hidden="true">L</div>
+                      <div>
+                        <strong>Qwen LiveTranslate 实时同传</strong>
+                        <span>一个模型同时完成识别、翻译与语音合成</span>
+                      </div>
+                    </div>
+                    <label className="field-group">
+                      <span className="field-label">WebSocket 地址</span>
+                      <input
+                        value={draft.realtime.baseUrl}
+                        onChange={(event) => updateRealtime("baseUrl", event.target.value)}
+                        inputMode="url"
+                        spellCheck={false}
+                      />
+                      {fieldErrors["realtime.baseUrl"] && (
+                        <span className="field-error">{fieldErrors["realtime.baseUrl"]}</span>
+                      )}
+                    </label>
+                    <label className="field-group">
+                      <span className="field-label">同传模型</span>
+                      <input
+                        value={draft.realtime.model}
+                        onChange={(event) => updateRealtime("model", event.target.value)}
+                        placeholder="例如 qwen3.5-livetranslate-flash-realtime"
+                        spellCheck={false}
+                      />
+                      {fieldErrors["realtime.model"] && (
+                        <span className="field-error">{fieldErrors["realtime.model"]}</span>
+                      )}
+                    </label>
+                    <label className="field-group">
+                      <span className="field-label">音色（可选）</span>
+                      <input
+                        value={draft.realtime.voice}
+                        onChange={(event) => updateRealtime("voice", event.target.value)}
+                        placeholder="留空使用服务默认音色，例如 Tina"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <ToggleRow
+                      label="启用音色克隆"
+                      description="让译文保留说话人的音色，仅在该模型支持时生效。"
+                      checked={draft.realtime.enableVoiceClone}
+                      onChange={(value) => updateRealtime("enableVoiceClone", value)}
+                    />
+                    {draft.realtime.enableVoiceClone && (
+                      <label className="field-group">
+                        <span className="field-label">音色克隆频率</span>
+                        <select
+                          value={draft.realtime.voiceCloneFrequency}
+                          onChange={(event) =>
+                            updateRealtime(
+                              "voiceCloneFrequency",
+                              event.target.value as SettingsDraft["realtime"]["voiceCloneFrequency"],
+                            )
+                          }
+                        >
+                          <option value="never">不自动克隆</option>
+                          <option value="once">首次克隆后复用</option>
+                          <option value="always">每次重新克隆</option>
+                        </select>
+                      </label>
+                    )}
+                    <SecretField
+                      label="DashScope API Key"
+                      status={realtimeStatus}
+                      value={draft.realtime.apiKey}
+                      onChange={(value) => updateRealtime("apiKey", value)}
+                      clearRequested={Boolean(draft.realtime.clearApiKey)}
+                      onClearChange={(clear) => updateRealtime("clearApiKey", clear)}
+                      canClearStored={realtimeTargetChanged && settings.realtime.apiKeyStatus !== "missing"}
+                    />
+                  </div>
+                )}
 
                 {serviceView === "recognition" && (
                   <div
