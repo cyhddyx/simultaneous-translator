@@ -1393,7 +1393,12 @@ class BridgeServer:
             )
 
     def emit_session_event(
-        self, session: TranslationSession, event: str, data: dict[str, Any] | None = None
+        self,
+        session: TranslationSession,
+        event: str,
+        data: dict[str, Any] | None = None,
+        *,
+        allow_stopping: bool = False,
     ) -> bool:
         """Atomically reject callbacks from stopped or replaced sessions."""
 
@@ -1401,7 +1406,7 @@ class BridgeServer:
             if (
                 self._shutting_down
                 or self._current_session is not session
-                or session.stop_event.is_set()
+                or (session.stop_event.is_set() and not allow_stopping)
             ):
                 return False
             self.writer.event(event, session.session_id, data)

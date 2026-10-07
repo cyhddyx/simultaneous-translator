@@ -32,6 +32,42 @@ const isTauriRuntime = () =>
 const deepCopy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 const now = () => new Date().toISOString();
+const CAPTION_HISTORY_STORAGE_KEY = "simultaneous-translator.caption-history";
+
+function readCaptionHistory(): CaptionSegment[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(CAPTION_HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is CaptionSegment =>
+        Boolean(item) &&
+        typeof item === "object" &&
+        typeof (item as CaptionSegment).id === "string" &&
+        typeof (item as CaptionSegment).sessionId === "string" &&
+        typeof (item as CaptionSegment).sequence === "number" &&
+        typeof (item as CaptionSegment).sourceText === "string" &&
+        typeof (item as CaptionSegment).status === "string" &&
+        typeof (item as CaptionSegment).createdAt === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeCaptionHistory(captions: CaptionSegment[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      CAPTION_HISTORY_STORAGE_KEY,
+      JSON.stringify(captions),
+    );
+  } catch {
+    // Storage can be unavailable in private or restricted WebView contexts.
+  }
+}
 
 const mockSentences = [
   {
@@ -722,6 +758,7 @@ export const translatorApi = {
     const snapshot = createInitialSnapshot();
     snapshot.revision = bridgeRevision;
     snapshot.settings = settings;
+    snapshot.captions = readCaptionHistory();
     snapshot.session.phase = isConfigurationComplete(settings)
       ? "idle"
       : "needs_configuration";
@@ -767,8 +804,15 @@ export const translatorApi = {
 
   async clearHistory(): Promise<void> {
     if (!isTauriRuntime()) return mockTranslator.clearHistory();
-    // The current bridge deliberately keeps no caption persistence; the UI owns
-    // its bounded in-memory history and clears it immediately.
+    try {
+      window.localStorage.removeItem(CAPTION_HISTORY_STORAGE_KEY);
+    } catch {
+      // The UI still clears its in-memory copy when storage is unavailable.
+    }
+  },
+
+  persistCaptionHistory(captions: CaptionSegment[]): void {
+    writeCaptionHistory(captions);
   },
 
   async validateSettings(draft: SettingsDraft): Promise<SettingsValidation> {

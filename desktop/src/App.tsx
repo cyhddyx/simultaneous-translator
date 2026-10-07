@@ -177,7 +177,11 @@ function applyTranslatorEvent(
     if (event.data.sessionId && !("sessionId" in event.data.payload)) {
       session.sessionId = event.data.sessionId;
     }
-    return { ...snapshot, revision, session };
+    return {
+      ...snapshot,
+      revision,
+      session,
+    };
   }
 
   if (event.type === "caption") {
@@ -191,7 +195,14 @@ function applyTranslatorEvent(
         ...caption,
         createdAt: captions[index].createdAt,
       };
-    captions.sort((left, right) => left.sequence - right.sequence);
+    // `sequence` is local to a sidecar session. Timestamps keep records in
+    // arrival order when the UI survives a stop/start cycle.
+    captions.sort(
+      (left, right) =>
+        left.createdAt.localeCompare(right.createdAt) ||
+        left.sequence - right.sequence ||
+        left.id.localeCompare(right.id),
+    );
     return {
       ...snapshot,
       revision,
@@ -326,6 +337,7 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [dismissedErrorId, setDismissedErrorId] = useState<string | null>(null);
   const unsubscribeRef = useRef<(() => void) | null>(null);
+  const historyHydratedRef = useRef(false);
 
   const applyEvent = useCallback((event: TranslatorEvent) => {
     setSnapshot((current) => applyTranslatorEvent(current, event));
@@ -347,6 +359,7 @@ export default function App() {
           setSnapshot((current) =>
             initial.revision >= current.revision ? initial : current,
           );
+          historyHydratedRef.current = true;
         }
       } catch (error) {
         if (!disposed) {
@@ -379,6 +392,12 @@ export default function App() {
   }, [applyEvent]);
 
   useEffect(() => {
+    if (historyHydratedRef.current) {
+      translatorApi.persistCaptionHistory(snapshot.captions);
+    }
+  }, [snapshot.captions]);
+
+  useEffect(() => {
     if (!toast) return undefined;
     const timer = window.setTimeout(() => setToast(null), 2800);
     return () => window.clearTimeout(timer);
@@ -393,7 +412,13 @@ export default function App() {
   // A stopped session keeps its history below, but the live stage must not
   // imply that its final subtitle is still being translated.
   const currentCaption = active
-    ? (snapshot.captions[snapshot.captions.length - 1] ?? null)
+    ? snapshot.captions
+        .filter((caption) => caption.sessionId === session.sessionId)
+        .reduce<CaptionSegment | null>(
+          (latest, caption) =>
+            !latest || caption.createdAt > latest.createdAt ? caption : latest,
+          null,
+        )
     : null;
   const visibleError =
     session.lastError && session.lastError.id !== dismissedErrorId

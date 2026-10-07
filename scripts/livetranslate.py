@@ -943,8 +943,23 @@ class RealtimeSession:
 
     # ------------------------------------------------------ caption assembly
 
+    def _emit_session_event(
+        self, event: str, data: dict[str, Any], *, allow_stopping: bool = False
+    ) -> bool:
+        if allow_stopping:
+            try:
+                return self.server.emit_session_event(
+                    self, event, data, allow_stopping=True
+                )
+            except TypeError as error:
+                # Keep lightweight test and embedding servers compatible with
+                # the extended BridgeServer callback signature.
+                if "allow_stopping" not in str(error):
+                    raise
+        return self.server.emit_session_event(self, event, data)
+
     def on_channel_transcript(self, channel: str, transcript: str) -> None:
-        if not transcript or self.stop_event.is_set():
+        if not transcript:
             return
         orphans = self._orphan_translations.get(channel)
         if orphans:
@@ -953,6 +968,10 @@ class RealtimeSession:
             if sequence is not None:
                 self._pending_asr[channel] = [(seq, source) for seq, source in self._pending_asr[channel] if seq != sequence]
                 self._emit_translation(channel, sequence, transcript, text)
+            else:
+                # Stopping can race the final transcript. Keep the completed
+                # translation available until the source line is accepted.
+                orphans.insert(0, text)
             return
         self._emit_source_final(channel, transcript)
 
@@ -966,8 +985,6 @@ class RealtimeSession:
         )
 
     def on_channel_translation_done(self, channel: str, response_key: str, text: str) -> None:
-        if self.stop_event.is_set():
-            return
         if not text:
             return
         mapping = self._response_seqs.get(channel, {})
@@ -995,17 +1012,23 @@ class RealtimeSession:
             sequence = self._sequence
             self._source_text[sequence] = transcript
             self._pending_asr.setdefault(channel, []).append((sequence, transcript))
-        if not self.server.emit_session_event(
-            self,
+        if not self._emit_session_event(
             "source.final",
             {"source_seq": sequence, "text": transcript, "channel": channel},
+            allow_stopping=True,
         ):
+            with self._lock:
+                self._source_text.pop(sequence, None)
+                self._pending_asr[channel] = [
+                    (seq, source)
+                    for seq, source in self._pending_asr.get(channel, [])
+                    if seq != sequence
+                ]
             return None
         return sequence
 
     def _emit_translation(self, channel: str, sequence: int, source_text: str, text: str) -> None:
-        self.server.emit_session_event(
-            self,
+        self._emit_session_event(
             "translation",
             {
                 "source_seq": sequence,
@@ -1013,4 +1036,5 @@ class RealtimeSession:
                 "text": text,
                 "channel": channel,
             },
+            allow_stopping=True,
         )
