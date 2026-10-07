@@ -48,6 +48,11 @@ export const windowControls = {
     await target()?.close();
   },
 
+  /** Subtitle overlay pin. Needs `core:window:allow-set-always-on-top`. */
+  async setAlwaysOnTop(value: boolean): Promise<void> {
+    await target()?.setAlwaysOnTop(value);
+  },
+
   async isMaximized(): Promise<boolean> {
     return (await target()?.isMaximized()) ?? false;
   },

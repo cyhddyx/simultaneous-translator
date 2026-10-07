@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -20,8 +20,21 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
 use uuid::Uuid;
 
-mod virtual_microphone;
 mod translation_languages;
+mod tray;
+mod virtual_microphone;
+
+// Tauri's `tray-icon` feature pulls in `muda`, whose Windows backend imports
+// `TaskDialogIndirect` — a symbol that only exists in the Common-Controls v6
+// assembly. `tauri-build` embeds a manifest requesting v6 into binary targets only,
+// so this library's unit-test harness would resolve `comctl32.dll` to the v5 shim
+// and die with `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` before running a test.
+// Linking the same compiled resource (see `build.rs`) into the test harness alone
+// gives it the manifest without colliding with the binary targets, which receive
+// the resource through the `-bins` bucket.
+#[cfg(all(test, windows))]
+#[link(name = "resource", kind = "static")]
+extern "C" {}
 
 // Dev and packaged builds share Tauri's application identifier, so they need
 // separate storage names or a release build will inherit local test providers.
@@ -526,6 +539,46 @@ struct EngineProcess {
 #[derive(Clone)]
 struct EngineManager {
     process: Arc<Mutex<Option<EngineProcess>>>,
+    // Sidecar responses for runtime channel commands are correlated by request id.
+    // `start_stdout_forwarder` claims them here instead of forwarding them, so the
+    // caller sees the effective value the sidecar actually applied.
+    pending: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>,
+}
+
+impl EngineManager {
+    /// Hands a `type == "response"` payload to its waiter, if any.
+    ///
+    /// Returns `true` when the payload belonged to a pending request; the caller
+    /// must then skip the `translator-event` forwarding path.
+    fn claim_response(&self, payload: &Value) -> bool {
+        if payload.get("type").and_then(Value::as_str) != Some("response") {
+            return false;
+        }
+        let Some(id) = payload.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        let waiter = match self.pending.lock() {
+            Ok(mut pending) => pending.remove(id),
+            Err(poisoned) => poisoned.into_inner().remove(id),
+        };
+        match waiter {
+            Some(waiter) => {
+                // Dropping the receiver first is fine: the send simply fails.
+                let _ = waiter.send(payload.clone());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drops every waiter so a blocked `request_engine_blocking` returns immediately
+    /// instead of waiting for its full timeout after the session is gone.
+    fn clear_pending(&self) {
+        match self.pending.lock() {
+            Ok(mut pending) => pending.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -538,6 +591,7 @@ impl Default for EngineManager {
     fn default() -> Self {
         Self {
             process: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -633,10 +687,8 @@ fn decode_public_settings_versioned(
                 .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?;
             PublicSettings::from(legacy)
         }
-        2 | 3 | 4 | 5 | 6 | 7 | 8 => {
-            serde_json::from_value::<PublicSettings>(value)
-                .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?
-        }
+        2 | 3 | 4 | 5 | 6 | 7 | 8 => serde_json::from_value::<PublicSettings>(value)
+            .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?,
         version => return Err(SettingsDecodeError::UnsupportedVersion(version)),
     };
     if version < 6 {
@@ -661,8 +713,15 @@ fn decode_public_settings_versioned(
     }
     if version < 8 {
         settings.audio.listen.voice_mode = "system".into();
-        settings.audio.speak.voice_mode = if settings.realtime.enable_voice_clone { "clone" } else { "system" }.into();
-        if settings.audio.listen.input == "loopback" && settings.audio.listen.input_device.is_empty() {
+        settings.audio.speak.voice_mode = if settings.realtime.enable_voice_clone {
+            "clone"
+        } else {
+            "system"
+        }
+        .into();
+        if settings.audio.listen.input == "loopback"
+            && settings.audio.listen.input_device.is_empty()
+        {
             settings.audio.listen.input = "system".into();
         }
     }
@@ -672,7 +731,8 @@ fn decode_public_settings_versioned(
 }
 
 fn save_public_settings(app: &AppHandle, settings: &PublicSettings) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(settings).map_err(|error| format!("无法序列化设置：{error}"))?;
+    let content = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("无法序列化设置：{error}"))?;
     let path = settings_path(app)?;
     let temporary = path.with_file_name(format!("settings.{}.tmp", Uuid::new_v4()));
     fs::write(&temporary, content).map_err(|error| format!("无法写入临时设置：{error}"))?;
@@ -697,7 +757,11 @@ fn normalize_endpoint(
     if url.scheme() != scheme || url.host_str().is_none() {
         return Err(format!("{label} 必须使用 {scheme}:// 安全地址"));
     }
-    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(format!("{label} 地址不能包含凭据、查询参数或片段"));
     }
 
@@ -874,7 +938,10 @@ fn normalize_public_settings(settings: PublicSettings) -> Result<PublicSettings,
     {
         return Err("源语言和目标语言不能为空且不能过长".into());
     }
-    if !matches!(settings.caption_scale.as_str(), "small" | "medium" | "large") {
+    if !matches!(
+        settings.caption_scale.as_str(),
+        "small" | "medium" | "large"
+    ) {
         return Err("字幕大小无效".into());
     }
 
@@ -929,10 +996,7 @@ fn normalize_settings(input: &SettingsInput) -> Result<PublicSettings, String> {
         active_translation_provider_id: input.active_translation_provider_id.clone(),
         keep_on_top: input.keep_on_top,
         caption_scale: input.caption_scale.clone(),
-        engine: input
-            .engine
-            .clone()
-            .unwrap_or_else(default_engine),
+        engine: input.engine.clone().unwrap_or_else(default_engine),
         realtime: input
             .realtime
             .as_ref()
@@ -973,7 +1037,8 @@ fn channel_from_input(input: AudioChannelInput) -> AudioChannelSettings {
 }
 
 fn credential_entry(account: &str) -> Result<Entry, String> {
-    Entry::new(KEYRING_SERVICE, account).map_err(|error| format!("无法访问 Windows 凭据管理器：{error}"))
+    Entry::new(KEYRING_SERVICE, account)
+        .map_err(|error| format!("无法访问 Windows 凭据管理器：{error}"))
 }
 
 fn read_secret(account: &str) -> Result<Option<String>, String> {
@@ -1133,8 +1198,7 @@ fn inspect_secret_for_upgrade(
         let secret = serde_json::from_str::<LegacyEnvironmentBinding>(binding)
             .ok()
             .filter(|binding| {
-                binding.version == LEGACY_SECRET_ENVELOPE_VERSION
-                    && binding.scope == *legacy_scope
+                binding.version == LEGACY_SECRET_ENVELOPE_VERSION && binding.scope == *legacy_scope
             })
             .map(|_| stored.trim().to_string())
             .filter(|secret| !secret.is_empty());
@@ -1164,12 +1228,11 @@ fn environment_binding_needs_upgrade(
         {
             false
         }
-        Some(binding) => serde_json::from_str::<LegacyEnvironmentBinding>(binding).is_ok_and(
-            |binding| {
-                binding.version == LEGACY_SECRET_ENVELOPE_VERSION
-                    && binding.scope == *legacy_scope
-            },
-        ),
+        Some(binding) => {
+            serde_json::from_str::<LegacyEnvironmentBinding>(binding).is_ok_and(|binding| {
+                binding.version == LEGACY_SECRET_ENVELOPE_VERSION && binding.scope == *legacy_scope
+            })
+        }
         None => false,
     }
 }
@@ -1178,9 +1241,8 @@ fn environment_binding_matches(account: &str, scope: &SecretScope) -> Result<boo
     let Some(stored) = read_secret(account)? else {
         return Ok(false);
     };
-    Ok(serde_json::from_str::<EnvironmentBinding>(&stored).is_ok_and(|binding| {
-        binding.version == SECRET_ENVELOPE_VERSION && binding.scope == *scope
-    }))
+    Ok(serde_json::from_str::<EnvironmentBinding>(&stored)
+        .is_ok_and(|binding| binding.version == SECRET_ENVELOPE_VERSION && binding.scope == *scope))
 }
 
 fn encode_environment_binding(scope: SecretScope) -> Result<String, String> {
@@ -1193,10 +1255,7 @@ fn encode_environment_binding(scope: SecretScope) -> Result<String, String> {
     Ok(encoded)
 }
 
-fn read_scoped_secret(
-    account: &str,
-    scope: &SecretScope,
-) -> Result<ScopedSecret, String> {
+fn read_scoped_secret(account: &str, scope: &SecretScope) -> Result<ScopedSecret, String> {
     let Some(stored) = read_secret(account)? else {
         return Ok(ScopedSecret::Missing);
     };
@@ -1569,8 +1628,8 @@ fn snapshot(app: &AppHandle) -> Result<SettingsSnapshot, String> {
 }
 
 fn snapshot_from_settings(settings: PublicSettings) -> SettingsSnapshot {
-    let recognition_status = recognition_secret_source(&settings.recognition)
-        .unwrap_or(SecretSource::Unavailable);
+    let recognition_status =
+        recognition_secret_source(&settings.recognition).unwrap_or(SecretSource::Unavailable);
     let realtime_status =
         realtime_secret_source(&settings.realtime).unwrap_or(SecretSource::Unavailable);
     let translation_providers = settings
@@ -1578,8 +1637,8 @@ fn snapshot_from_settings(settings: PublicSettings) -> SettingsSnapshot {
         .iter()
         .cloned()
         .map(|provider| {
-            let api_key_status = provider_secret_source(&provider)
-                .unwrap_or(SecretSource::Unavailable);
+            let api_key_status =
+                provider_secret_source(&provider).unwrap_or(SecretSource::Unavailable);
             TranslationProviderSnapshot {
                 provider,
                 api_key_status,
@@ -1608,7 +1667,8 @@ fn snapshot_from_settings(settings: PublicSettings) -> SettingsSnapshot {
 }
 
 fn write_json_line(stdin: &mut ChildStdin, payload: Value) -> Result<(), String> {
-    let line = serde_json::to_string(&payload).map_err(|error| format!("无法编码引擎指令：{error}"))?;
+    let line =
+        serde_json::to_string(&payload).map_err(|error| format!("无法编码引擎指令：{error}"))?;
     stdin
         .write_all(line.as_bytes())
         .and_then(|_| stdin.write_all(b"\n"))
@@ -1643,8 +1703,74 @@ fn start_stdout_reader(stdout: ChildStdout) -> mpsc::Receiver<Value> {
 }
 
 fn forward_engine_payload(app: &AppHandle, payload: Value) {
+    // Sidecar payloads keep flowing to `translator-event` unchanged; the native
+    // runtime state is updated on the side (contract runtime-channel-control §5).
+    tray::observe_engine_payload(app, &payload);
     if payload.get("type").and_then(Value::as_str) == Some("event") {
         let _ = app.emit("translator-event", payload);
+    }
+}
+
+/// Writes one sidecar request and waits (bounded) for the matching `response`.
+///
+/// The waiter is registered *before* the write so a fast response cannot be
+/// missed. Returns `Ok(None)` when the sidecar did not answer in time: the
+/// request itself was accepted, and any real state change still arrives as a
+/// `runtime.channel` / `runtime.mute` event.
+fn request_engine_blocking(
+    manager: &EngineManager,
+    session_id: &str,
+    command: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Option<Value>, String> {
+    let request_id = Uuid::new_v4().to_string();
+    let (sender, receiver) = mpsc::channel();
+    match manager.pending.lock() {
+        Ok(mut pending) => {
+            pending.insert(request_id.clone(), sender);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(request_id.clone(), sender);
+        }
+    }
+
+    let request = json!({
+        "type": "request",
+        "id": request_id,
+        "command": command,
+        "params": params,
+    });
+    let write_result = {
+        let mut process = manager
+            .process
+            .lock()
+            .map_err(|_| "翻译引擎状态不可用".to_string())?;
+        match process.as_mut() {
+            Some(engine) if engine.session_id == session_id => {
+                write_json_line(&mut engine.stdin, request)
+            }
+            Some(_) => Err("会话已结束或已被替换。".to_string()),
+            None => Err("翻译引擎未在运行。".to_string()),
+        }
+    };
+    if let Err(error) = write_result {
+        if let Ok(mut pending) = manager.pending.lock() {
+            pending.remove(&request_id);
+        }
+        return Err(error);
+    }
+
+    match receiver.recv_timeout(timeout) {
+        Ok(payload) => Ok(Some(payload)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Ok(mut pending) = manager.pending.lock() {
+                pending.remove(&request_id);
+            }
+            Ok(None)
+        }
+        // The sidecar exited (or the engine was cleaned up) before answering.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
     }
 }
 
@@ -1652,14 +1778,11 @@ fn is_stopped_state(payload: &Value, session_id: &str) -> bool {
     payload.get("type").and_then(Value::as_str) == Some("event")
         && payload.get("event").and_then(Value::as_str) == Some("state")
         && payload.get("session_id").and_then(Value::as_str) == Some(session_id)
-        && payload
-            .pointer("/data/state")
-            .and_then(Value::as_str)
-            == Some("stopped")
+        && payload.pointer("/data/state").and_then(Value::as_str) == Some("stopped")
 }
 
 fn clear_matching_engine(manager: &EngineManager, session_id: &str) -> bool {
-    match manager.process.lock() {
+    let cleared = match manager.process.lock() {
         Ok(mut process) => {
             let belongs_to_session = process
                 .as_ref()
@@ -1673,7 +1796,11 @@ fn clear_matching_engine(manager: &EngineManager, session_id: &str) -> bool {
             belongs_to_session
         }
         Err(_) => false,
+    };
+    if cleared {
+        manager.clear_pending();
     }
+    cleared
 }
 
 fn start_stdout_forwarder(
@@ -1685,6 +1812,11 @@ fn start_stdout_forwarder(
     thread::spawn(move || {
         for payload in receiver {
             let stopped = is_stopped_state(&payload, &session_id);
+            if manager.claim_response(&payload) {
+                // A runtime channel / mute response for `request_engine_blocking`:
+                // it is not an event, so it never reaches `translator-event`.
+                continue;
+            }
             forward_engine_payload(&app, payload);
             if stopped {
                 clear_matching_engine(&manager, &session_id);
@@ -1693,6 +1825,8 @@ fn start_stdout_forwarder(
         }
 
         let should_report_exit = clear_matching_engine(&manager, &session_id);
+        // Nothing can answer pending requests any more.
+        manager.clear_pending();
 
         if should_report_exit {
             let _ = app.emit(
@@ -2041,7 +2175,10 @@ struct ActiveSessionSnapshot {
 }
 
 fn active_session_blocking(manager: &EngineManager) -> Result<ActiveSessionSnapshot, String> {
-    let mut process = manager.process.lock().map_err(|_| "翻译引擎状态不可用".to_string())?;
+    let mut process = manager
+        .process
+        .lock()
+        .map_err(|_| "翻译引擎状态不可用".to_string())?;
     let has_exited = if let Some(engine) = process.as_mut() {
         engine
             .child
@@ -2067,7 +2204,10 @@ async fn get_active_session(
     spawn_command(move || active_session_blocking(&manager)).await
 }
 
-fn fetch_provider_models_blocking(app: AppHandle, input: ProviderProbeInput) -> Result<Value, String> {
+fn fetch_provider_models_blocking(
+    app: AppHandle,
+    input: ProviderProbeInput,
+) -> Result<Value, String> {
     let provider = normalize_probe_provider(&input)?;
     let api_key = resolve_probe_key(&app, &input, &provider)?;
     let result = run_probe_request("probe.models", probe_params(&provider, &api_key))?;
@@ -2092,7 +2232,10 @@ fn fetch_provider_models_blocking(app: AppHandle, input: ProviderProbeInput) -> 
     }))
 }
 
-fn test_provider_connection_blocking(app: AppHandle, input: ProviderProbeInput) -> Result<Value, String> {
+fn test_provider_connection_blocking(
+    app: AppHandle,
+    input: ProviderProbeInput,
+) -> Result<Value, String> {
     if input.provider.model.trim().is_empty() {
         return Err("请先添加并选择一个模型".into());
     }
@@ -2141,16 +2284,17 @@ async fn test_provider_connection(
 }
 
 #[tauri::command]
-async fn list_audio_devices(
-    manager: State<'_, ProbeManager>,
-) -> Result<Value, String> {
+async fn list_audio_devices(manager: State<'_, ProbeManager>) -> Result<Value, String> {
     let gate = manager.audio_gate.clone();
     // Device enumeration reuses the probe path: one throwaway sidecar, one
     // request, then the sidecar dies, so it never disturbs a live session.
     spawn_command(move || {
-        let _guard = gate.lock().map_err(|_| "音频设备查询状态异常，请重启应用".to_string())?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| "音频设备查询状态异常，请重启应用".to_string())?;
         run_probe_request("devices", json!({}))
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2158,7 +2302,10 @@ async fn save_settings(app: AppHandle, input: SettingsInput) -> Result<SettingsS
     spawn_command(move || save_settings_blocking(&app, input)).await
 }
 
-fn save_settings_blocking(app: &AppHandle, input: SettingsInput) -> Result<SettingsSnapshot, String> {
+fn save_settings_blocking(
+    app: &AppHandle,
+    input: SettingsInput,
+) -> Result<SettingsSnapshot, String> {
     let _guard = lock_settings_credentials()?;
     let previous = load_public_settings_internal(app, false)?;
     let normalized = normalize_settings(&input)?;
@@ -2168,7 +2315,8 @@ fn save_settings_blocking(app: &AppHandle, input: SettingsInput) -> Result<Setti
         input.recognition.clear_api_key.unwrap_or(false),
         "语音识别 API Key",
     )?;
-    let recognition_target_changed = previous.recognition.protocol != normalized.recognition.protocol
+    let recognition_target_changed = previous.recognition.protocol
+        != normalized.recognition.protocol
         || previous.recognition.base_url != normalized.recognition.base_url;
     if recognition_target_changed
         && recognition_change.is_none()
@@ -2179,8 +2327,8 @@ fn save_settings_blocking(app: &AppHandle, input: SettingsInput) -> Result<Setti
     {
         return Err("语音识别服务地址已更改，请重新输入 API Key 或明确删除旧密钥".into());
     }
-    let reset_recognition_environment_binding = input.recognition.clear_api_key.unwrap_or(false)
-        || recognition_target_changed;
+    let reset_recognition_environment_binding =
+        input.recognition.clear_api_key.unwrap_or(false) || recognition_target_changed;
 
     let realtime_input = input.realtime.as_ref();
     let realtime_change = match realtime_input {
@@ -2202,9 +2350,10 @@ fn save_settings_blocking(app: &AppHandle, input: SettingsInput) -> Result<Setti
     {
         return Err("实时同传服务地址已更改，请重新输入 API Key 或明确删除旧密钥".into());
     }
-    let reset_realtime_environment_binding =
-        realtime_input.and_then(|realtime| realtime.clear_api_key).unwrap_or(false)
-            || realtime_target_changed;
+    let reset_realtime_environment_binding = realtime_input
+        .and_then(|realtime| realtime.clear_api_key)
+        .unwrap_or(false)
+        || realtime_target_changed;
 
     let mut provider_changes = Vec::with_capacity(input.translation_providers.len());
     for (provider_input, provider) in input
@@ -2280,10 +2429,7 @@ fn save_settings_blocking(app: &AppHandle, input: SettingsInput) -> Result<Setti
                     &mut storage,
                     REALTIME_ACCOUNT.into(),
                     &secret,
-                    secret_scope(
-                        &normalized.realtime.protocol,
-                        &normalized.realtime.base_url,
-                    )?,
+                    secret_scope(&normalized.realtime.protocol, &normalized.realtime.base_url)?,
                 )?;
                 for (account, value) in storage {
                     plan_secret(account, value);
@@ -2438,7 +2584,22 @@ async fn start_translation(
     spawn_command(move || start_translation_blocking(app, &manager)).await
 }
 
-fn start_translation_blocking(app: AppHandle, manager: &EngineManager) -> Result<StartResult, String> {
+fn start_translation_blocking(
+    app: AppHandle,
+    manager: &EngineManager,
+) -> Result<StartResult, String> {
+    match start_translation_inner(app.clone(), manager) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            // A failed launch must not leave a session id behind: the native
+            // dispatcher decides start-vs-stop by the presence of a session.
+            tray::publish_start_failure(&app, &error);
+            Err(error)
+        }
+    }
+}
+
+fn start_translation_inner(app: AppHandle, manager: &EngineManager) -> Result<StartResult, String> {
     let settings_guard = lock_settings_credentials()?;
     let settings = load_public_settings_internal(&app, false)?;
     let recognition_key = String::new();
@@ -2456,7 +2617,23 @@ fn start_translation_blocking(app: AppHandle, manager: &EngineManager) -> Result
         &realtime_key,
     )?;
 
-    let mut process = manager.process.lock().map_err(|_| "翻译引擎状态不可用".to_string())?;
+    // Publish the new session id *before* the request reaches the sidecar, so the
+    // `state{starting}` event that follows is not dropped as a stale session.
+    // Runtime channel switches start from the configured values (runtime-channel
+    // contract §1, rule 2).
+    tray::publish_session_starting(
+        &app,
+        &session_id,
+        settings.audio.listen.enabled,
+        settings.audio.speak.enabled,
+    );
+
+    // Any waiter belongs to the previous session and can never be answered.
+    manager.clear_pending();
+    let mut process = manager
+        .process
+        .lock()
+        .map_err(|_| "翻译引擎状态不可用".to_string())?;
     stop_locked(&mut process);
 
     let mut child = launch_engine()?;
@@ -2476,7 +2653,11 @@ fn start_translation_blocking(app: AppHandle, manager: &EngineManager) -> Result
         let _ = child.wait();
         return Err(with_engine_detail(error, &stderr_log));
     }
-    *process = Some(EngineProcess { child, stdin, session_id: session_id.clone() });
+    *process = Some(EngineProcess {
+        child,
+        stdin,
+        session_id: session_id.clone(),
+    });
     start_stdout_forwarder(
         app.clone(),
         stdout_receiver,
@@ -2488,20 +2669,39 @@ fn start_translation_blocking(app: AppHandle, manager: &EngineManager) -> Result
 
 #[tauri::command]
 async fn stop_translation(
+    app: AppHandle,
     manager: State<'_, EngineManager>,
     session_id: String,
 ) -> Result<(), String> {
     let manager = manager.inner().clone();
-    spawn_command(move || stop_translation_blocking(&manager, &session_id)).await
+    spawn_command(move || stop_translation_blocking(&app, &manager, &session_id)).await
 }
 
-fn stop_translation_blocking(manager: &EngineManager, session_id: &str) -> Result<(), String> {
-    let mut process = manager.process.lock().map_err(|_| "翻译引擎状态不可用".to_string())?;
-    if process
-        .as_ref()
-        .is_some_and(|engine| engine.session_id == session_id)
-    {
-        stop_locked(&mut process);
+fn stop_translation_blocking(
+    app: &AppHandle,
+    manager: &EngineManager,
+    session_id: &str,
+) -> Result<(), String> {
+    let stopped = {
+        let mut process = manager
+            .process
+            .lock()
+            .map_err(|_| "翻译引擎状态不可用".to_string())?;
+        if process
+            .as_ref()
+            .is_some_and(|engine| engine.session_id == session_id)
+        {
+            stop_locked(&mut process);
+            true
+        } else {
+            false
+        }
+    };
+    if stopped {
+        // The session is gone: reset the runtime channels and health, and drop
+        // every pending sidecar request.
+        manager.clear_pending();
+        tray::publish_session_stopped(app);
     }
     Ok(())
 }
@@ -2510,10 +2710,18 @@ fn cleanup_engine(manager: &EngineManager) {
     if let Ok(mut process) = manager.process.lock() {
         stop_locked(&mut process);
     }
+    manager.clear_pending();
 }
 
 pub fn run() {
     tauri::Builder::default()
+        // Global shortcuts stay native-only: no WebView ever gets the
+        // `global-shortcut:*` capability (tray-shortcuts contract §11).
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| tray::on_global_shortcut(app, shortcut, event))
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -2524,8 +2732,16 @@ pub fn run() {
         .manage(EngineManager::default())
         .manage(ProbeManager::default())
         .manage(virtual_microphone::InstallerState::default())
+        .manage(tray::RuntimeHub::default())
         .setup(|app| {
-            if let Ok(settings) = load_public_settings(&app.handle()) {
+            let handle = app.handle().clone();
+            // A missing tray must not stop the app from starting: the main window
+            // keeps working, only the native entry points are unavailable.
+            if let Err(error) = tray::init(&handle) {
+                eprintln!("system tray unavailable: {error}");
+            }
+            tray::register_global_shortcuts(&handle);
+            if let Ok(settings) = load_public_settings(&handle) {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_always_on_top(settings.keep_on_top);
                 }
@@ -2542,15 +2758,34 @@ pub fn run() {
             virtual_microphone::open_virtual_microphone_link,
             save_settings,
             start_translation,
-            stop_translation
+            stop_translation,
+            tray::get_runtime_state,
+            tray::dispatch_native_action
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                cleanup_engine(window.state::<EngineManager>().inner());
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                // Quitting (tray "退出应用") lets every window close normally.
+                if tray::is_quitting(app) {
+                    return;
+                }
+                // Otherwise the window hides to the tray and the translation
+                // session keeps running (contract §10).
+                api.prevent_close();
+                let _ = window.hide();
+                if window.label() == tray::SUBTITLE_WINDOW_LABEL {
+                    tray::set_subtitle_visible(app, false);
+                }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running the simultaneous translator desktop app");
+        .build(tauri::generate_context!())
+        .expect("error while building the simultaneous translator desktop app")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Last-resort guard so the Python sidecar never outlives the app.
+                tray::on_app_exit(app);
+            }
+        });
 }
 
 #[cfg(test)]
@@ -2566,7 +2801,8 @@ mod tests {
             let loaded = decode_public_settings(&serde_json::to_string(&saved).unwrap()).unwrap();
             assert_eq!(loaded.audio.listen.target_language, target);
             assert!(loaded.audio.listen.play_audio);
-            let error = build_start_request("request", "session", &loaded, "", "", "test").unwrap_err();
+            let error =
+                build_start_request("request", "session", &loaded, "", "", "test").unwrap_err();
             assert!(error.contains("仅支持文字"));
         }
     }
@@ -2578,10 +2814,20 @@ mod tests {
         settings.audio.speak.enabled = true;
         settings.audio.speak.play_audio = true;
         let request = build_start_request("request", "session", &settings, "", "", "test").unwrap();
-        assert_eq!(request["params"]["config"]["audio"]["listen"]["targetLanguage"], "粤语");
-        assert_eq!(request["params"]["config"]["audio"]["speak"]["targetLanguage"], "English");
+        assert_eq!(
+            request["params"]["config"]["audio"]["listen"]["targetLanguage"],
+            "粤语"
+        );
+        assert_eq!(
+            request["params"]["config"]["audio"]["speak"]["targetLanguage"],
+            "English"
+        );
         settings.audio.speak.target_language = "希腊语".into();
-        assert!(build_start_request("request", "session", &settings, "", "", "test").unwrap_err().contains("发言"));
+        assert!(
+            build_start_request("request", "session", &settings, "", "", "test")
+                .unwrap_err()
+                .contains("发言")
+        );
         settings.audio.speak.enabled = false;
         assert!(build_start_request("request", "session", &settings, "", "", "test").is_ok());
         settings.audio.listen.target_language = "unknown-language".into();
@@ -2648,7 +2894,9 @@ mod tests {
     #[test]
     fn rejects_unsupported_future_settings_version() {
         let future = u64::from(SETTINGS_SCHEMA_VERSION) + 1;
-        let error = decode_public_settings(&json!({"schemaVersion": future, "translationProviders": []}).to_string())
+        let error = decode_public_settings(
+            &json!({"schemaVersion": future, "translationProviders": []}).to_string(),
+        )
         .expect_err("future settings must not be interpreted as v2");
         assert_eq!(error, SettingsDecodeError::UnsupportedVersion(future));
     }
@@ -2732,8 +2980,8 @@ mod tests {
         assert_eq!(source_version, 3);
 
         let base_url = "https://relay.example/tenant-a";
-        let current_scope = secret_scope("openai", base_url)
-            .expect("current endpoint scope should be created");
+        let current_scope =
+            secret_scope("openai", base_url).expect("current endpoint scope should be created");
         let legacy_scope = legacy_secret_scope("openai", base_url)
             .expect("legacy endpoint scope should be created");
         let stored = json!({
@@ -2773,8 +3021,8 @@ mod tests {
     #[test]
     fn only_an_existing_legacy_environment_binding_can_be_upgraded() {
         let base_url = "https://relay.example/tenant-a";
-        let current_scope = secret_scope("gemini", base_url)
-            .expect("current endpoint scope should be created");
+        let current_scope =
+            secret_scope("gemini", base_url).expect("current endpoint scope should be created");
         let legacy_scope = legacy_secret_scope("gemini", base_url)
             .expect("legacy endpoint scope should be created");
         let stored_binding = json!({
@@ -2842,15 +3090,30 @@ mod tests {
     fn start_request_contains_only_realtime_configuration_and_key() {
         let settings = PublicSettings::default();
         let request = build_start_request(
-            "request-id", "session-id", &settings,
-            "recognition-secret", "translation-secret", "realtime-secret",
-        ).expect("request should serialize");
-        assert_eq!(request.pointer("/params/config/engine"), Some(&json!(ENGINE_REALTIME)));
+            "request-id",
+            "session-id",
+            &settings,
+            "recognition-secret",
+            "translation-secret",
+            "realtime-secret",
+        )
+        .expect("request should serialize");
+        assert_eq!(
+            request.pointer("/params/config/engine"),
+            Some(&json!(ENGINE_REALTIME))
+        );
         assert!(request.pointer("/params/config/translation").is_none());
         assert!(request.pointer("/params/config/recognition").is_none());
-        assert!(request.pointer("/params/secrets/translation_api_key").is_none());
-        assert!(request.pointer("/params/secrets/recognition_api_key").is_none());
-        assert_eq!(request.pointer("/params/secrets/realtime_api_key"), Some(&json!("realtime-secret")));
+        assert!(request
+            .pointer("/params/secrets/translation_api_key")
+            .is_none());
+        assert!(request
+            .pointer("/params/secrets/recognition_api_key")
+            .is_none());
+        assert_eq!(
+            request.pointer("/params/secrets/realtime_api_key"),
+            Some(&json!("realtime-secret"))
+        );
     }
 
     #[cfg(windows)]
@@ -3147,10 +3410,22 @@ mod tests {
             request.pointer("/params/config/audio/speak/outputDevice"),
             Some(&json!("cable-input"))
         );
-        assert_eq!(request.pointer("/params/config/audio/listen/voiceMode"), Some(&json!("system")));
-        assert_eq!(request.pointer("/params/config/audio/speak/voiceMode"), Some(&json!("clone")));
-        assert_eq!(request.pointer("/params/config/audio/listen/targetLanguage"), Some(&json!("简体中文")));
-        assert_eq!(request.pointer("/params/config/audio/speak/targetLanguage"), Some(&json!("English")));
+        assert_eq!(
+            request.pointer("/params/config/audio/listen/voiceMode"),
+            Some(&json!("system"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/speak/voiceMode"),
+            Some(&json!("clone"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/listen/targetLanguage"),
+            Some(&json!("简体中文"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/speak/targetLanguage"),
+            Some(&json!("English"))
+        );
         assert_eq!(
             request.pointer("/params/secrets/realtime_api_key"),
             Some(&json!("realtime-secret"))

@@ -14,6 +14,14 @@ Requests
 ``{"id": "...", "command": "shutdown", "params": {}}``
 ``{"id": "...", "command": "probe.models", "params": {"kind": ..., "provider": {...}, "secrets": {...}}}``
 ``{"id": "...", "command": "probe.connect", "params": {"kind": ..., "provider": {...}, "secrets": {...}}}``
+``{"id": "...", "command": "set_runtime_channel", "params": {"session_id": "...", "channel": "listen|speak", "enabled": true}}``
+``{"id": "...", "command": "set_speak_muted", "params": {"session_id": "...", "muted": true}}``
+
+``set_runtime_channel`` and ``set_speak_muted`` change only this session's
+in-memory runtime state; they never write a settings file and they never stop,
+reconnect or rebuild the realtime session.  A rebuilt session starts again from
+the configured ``audio.<channel>.enabled`` values with ``speak_muted = false``.
+See ``docs/runtime-channel-control.md`` for the frozen contract.
 
 ``start`` params carry one provider per service::
 
@@ -105,6 +113,153 @@ DEFAULT_VOICE_CLONE_FREQUENCY = "once"
 # the body instead.
 SSE_DATA_PREFIX = "data:"
 SSE_DONE_SENTINEL = "[DONE]"
+
+# ---------------------------------------------------------------------------
+# Runtime channel control (docs/runtime-channel-control.md, incremental v1).
+#
+# This module owns the JSONL protocol surface Rust talks to, so every literal of
+# that surface is declared here as a named constant.  The additions are strictly
+# incremental: the existing commands, events, codes and fields keep their names
+# and meanings.
+# ---------------------------------------------------------------------------
+COMMAND_SET_RUNTIME_CHANNEL = "set_runtime_channel"
+COMMAND_SET_SPEAK_MUTED = "set_speak_muted"
+RUNTIME_COMMANDS = (COMMAND_SET_RUNTIME_CHANNEL, COMMAND_SET_SPEAK_MUTED)
+
+EVENT_RUNTIME_CHANNEL = "runtime.channel"
+EVENT_RUNTIME_MUTE = "runtime.mute"
+EVENT_NETWORK_STATUS = "network.status"
+EVENT_AUDIO_STATUS = "audio.status"
+RUNTIME_EVENTS = (
+    EVENT_RUNTIME_CHANNEL,
+    EVENT_RUNTIME_MUTE,
+    EVENT_NETWORK_STATUS,
+    EVENT_AUDIO_STATUS,
+)
+
+CHANNEL_LISTEN = "listen"
+CHANNEL_SPEAK = "speak"
+RUNTIME_CHANNELS = (CHANNEL_LISTEN, CHANNEL_SPEAK)
+
+# Stable error codes for the runtime commands (contract section 3.2).
+ERROR_INVALID_PARAMS = "invalid_params"
+ERROR_INVALID_CHANNEL = "invalid_channel"
+ERROR_NO_ACTIVE_SESSION = "no_active_session"
+ERROR_SESSION_MISMATCH = "session_mismatch"
+ERROR_CHANNEL_NOT_CONFIGURED = "channel_not_configured"
+ERROR_INTERNAL = "internal_error"
+RUNTIME_COMMAND_ERROR_CODES = (
+    ERROR_INVALID_PARAMS,
+    ERROR_INVALID_CHANNEL,
+    ERROR_NO_ACTIVE_SESSION,
+    ERROR_SESSION_MISMATCH,
+    ERROR_CHANNEL_NOT_CONFIGURED,
+    ERROR_INTERNAL,
+)
+
+# Contract 4.4: the ``service`` field added to every ``error`` event.
+SERVICE_AUDIO = "audio"
+SERVICE_NETWORK = "network"
+SERVICE_CONFIGURATION = "configuration"
+SERVICE_SYSTEM = "system"
+ERROR_SERVICES = (SERVICE_AUDIO, SERVICE_NETWORK, SERVICE_CONFIGURATION, SERVICE_SYSTEM)
+
+# Contract 4.4 codes added on top of the existing ones.  Codes that already
+# existed (``asr_error``, ``audio_playback_failed``, ``audio_startup_timeout``,
+# ``translation_failed``, ...) keep their names; these are only additions for
+# scenarios that previously had no dedicated code or fell into a catch-all.
+ERROR_CODE_AUDIO_START_FAILED = "audio_start_failed"
+ERROR_CODE_AUDIO_DEVICE_LOST = "audio_device_lost"
+ERROR_CODE_WEBSOCKET_CONNECT_FAILED = "websocket_connect_failed"
+ERROR_CODE_WEBSOCKET_RECONNECTING = "websocket_reconnecting"
+ERROR_CODE_AUTH_FAILED = "auth_failed"
+ERROR_CODE_TRANSLATION_TIMEOUT = "translation_timeout"
+ERROR_CODE_TRANSLATION_DISCONNECTED = "translation_disconnected"
+CONTRACT_ERROR_CODES = (
+    ERROR_CODE_AUDIO_START_FAILED,
+    ERROR_CODE_AUDIO_DEVICE_LOST,
+    ERROR_CODE_WEBSOCKET_CONNECT_FAILED,
+    ERROR_CODE_WEBSOCKET_RECONNECTING,
+    ERROR_CODE_AUTH_FAILED,
+    ERROR_CODE_TRANSLATION_TIMEOUT,
+    ERROR_CODE_TRANSLATION_DISCONNECTED,
+)
+
+# Contract 4.4 scenario table.  The lookup is by code first, because a code
+# identifies the failing service more precisely than the legacy ``scope`` does;
+# ``scope`` is kept unchanged for the existing frontend fallback.
+ERROR_CODE_SERVICES: dict[str, str] = {
+    # Audio device and playback failures (existing codes keep their names).
+    "audio_startup_timeout": SERVICE_AUDIO,
+    "audio_device_missing": SERVICE_AUDIO,
+    "audio_device_failed": SERVICE_AUDIO,
+    "audio_or_asr_failed": SERVICE_AUDIO,
+    "audio_worker_start_failed": SERVICE_AUDIO,
+    "audio_playback_failed": SERVICE_AUDIO,
+    "audio_devices_failed": SERVICE_AUDIO,
+    ERROR_CODE_AUDIO_START_FAILED: SERVICE_AUDIO,
+    ERROR_CODE_AUDIO_DEVICE_LOST: SERVICE_AUDIO,
+    # Realtime WebSocket and translation-service failures.
+    "realtime_connect_timeout": SERVICE_NETWORK,
+    "realtime_connection_closed": SERVICE_NETWORK,
+    "realtime_receive_failed": SERVICE_NETWORK,
+    "realtime_send_failed": SERVICE_NETWORK,
+    "realtime_protocol_error": SERVICE_NETWORK,
+    "realtime_configuration_timeout": SERVICE_NETWORK,
+    "realtime_stream_timeout": SERVICE_NETWORK,
+    "realtime_channel_failed": SERVICE_NETWORK,
+    "asr_error": SERVICE_NETWORK,
+    "asr_closed": SERVICE_NETWORK,
+    "asr_complete": SERVICE_NETWORK,
+    "translation_failed": SERVICE_NETWORK,
+    "translation_submit_failed": SERVICE_SYSTEM,
+    ERROR_CODE_WEBSOCKET_CONNECT_FAILED: SERVICE_NETWORK,
+    ERROR_CODE_WEBSOCKET_RECONNECTING: SERVICE_NETWORK,
+    ERROR_CODE_AUTH_FAILED: SERVICE_NETWORK,
+    ERROR_CODE_TRANSLATION_TIMEOUT: SERVICE_NETWORK,
+    ERROR_CODE_TRANSLATION_DISCONNECTED: SERVICE_NETWORK,
+    # Invalid configuration: language, device, voice or output mode.
+    "realtime_output_mismatch": SERVICE_CONFIGURATION,
+    "realtime_voice_clone_unsupported": SERVICE_CONFIGURATION,
+    "invalid_start_config": SERVICE_CONFIGURATION,
+}
+
+# Only used when a code is not in the table above.
+ERROR_SCOPE_SERVICES: dict[str, str] = {
+    "audio": SERVICE_AUDIO,
+    "network": SERVICE_NETWORK,
+    "configuration": SERVICE_CONFIGURATION,
+    "system": SERVICE_SYSTEM,
+}
+
+
+def error_service_for(scope: str, code: str) -> str:
+    """Resolve contract 4.4's ``service`` for one error event."""
+
+    service = ERROR_CODE_SERVICES.get(code)
+    if service is not None:
+        return service
+    return ERROR_SCOPE_SERVICES.get(scope, SERVICE_SYSTEM)
+
+
+def translation_failure_classification(error: BaseException) -> tuple[str, str]:
+    """Map one translation failure onto contract 4.4's codes.
+
+    Failures that already had a code keep ``translation_failed``; the new codes
+    are used only when the exception actually identifies a timeout or a dropped
+    connection, which is what the table describes.
+    """
+
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - httpx ships with the desktop runtime
+        return "translation_failed", SERVICE_NETWORK
+    if isinstance(error, httpx.TimeoutException):
+        return ERROR_CODE_TRANSLATION_TIMEOUT, SERVICE_NETWORK
+    if isinstance(error, (httpx.TransportError, ConnectionError, OSError)):
+        return ERROR_CODE_TRANSLATION_DISCONNECTED, SERVICE_NETWORK
+    return "translation_failed", SERVICE_NETWORK
+
 
 
 def preload_audio_dependencies() -> None:
@@ -1093,6 +1248,11 @@ class AudioWorker(threading.Thread):
                 server.on_audio_ready(session)
                 while not session.stop_event.is_set():
                     audio = np.asarray(recorder.record(numframes=frame_count))
+                    # Same runtime gate as the realtime capture loop: the frame is
+                    # dropped before it reaches the recognition engine, and the
+                    # recorder keeps draining the device so nothing is buffered.
+                    if not livetranslate.channel_audio_enabled(session, CHANNEL_LISTEN):
+                        continue
                     if audio.ndim == 1:
                         mono = audio
                     else:
@@ -1108,6 +1268,7 @@ class AudioWorker(threading.Thread):
                     code="audio_or_asr_failed",
                     message=f"音频采集或识别失败：{exc}",
                     recoverable=True,
+                    service=SERVICE_AUDIO,
                 )
         finally:
             self._session.mark_audio_startup_settled()
@@ -1132,6 +1293,13 @@ class TranslationSession:
         self._audio_ready = False
         self._audio_startup_lock = threading.Lock()
         self.state = "starting"
+        # Configuration state lives in ``config.channels``; these two attributes
+        # are the memory-only runtime state of this session, so a rebuilt session
+        # starts from the configured defaults again (contract section 1).
+        self.runtime = livetranslate.RuntimeChannelState(
+            {spec.channel: spec.enabled for spec in config.channels}
+        )
+        self.status_tracker = livetranslate.HealthStatusTracker()
         self.translator = TranslationService(config)
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"translation-{session_id[:8]}")
         # This semaphore is the admission gate for the executor's logical queue.
@@ -1230,6 +1398,7 @@ class TranslationSession:
                 code="translation_submit_failed",
                 message=f"翻译任务提交失败：{exc}",
                 recoverable=True,
+                service=SERVICE_SYSTEM,
             )
             return
 
@@ -1249,6 +1418,7 @@ class TranslationSession:
             return
         except Exception as exc:
             message = self.server._redact(f"翻译失败：{exc}", self.config)
+            code, service = translation_failure_classification(exc)
             self.server.emit_session_event(
                 self,
                 "translation.failed",
@@ -1261,9 +1431,10 @@ class TranslationSession:
             self.server.emit_session_error(
                 self,
                 scope="translation",
-                code="translation_failed",
+                code=code,
                 message=message,
                 recoverable=True,
+                service=service,
             )
         else:
             # is_current_session also checks stop_event, so stale HTTP responses
@@ -1420,17 +1591,54 @@ class BridgeServer:
         code: str,
         message: str,
         recoverable: bool,
+        service: str | None = None,
     ) -> None:
         self.emit_session_event(
             session,
             "error",
             {
                 "scope": scope,
+                "service": service or error_service_for(scope, code),
                 "code": code,
                 "message": self._redact(message, session.config),
                 "recoverable": recoverable,
             },
         )
+
+    def emit_session_status(
+        self,
+        session: TranslationSession,
+        event: str,
+        status: str,
+        *,
+        channel: str = "",
+        detail: str = "",
+    ) -> bool:
+        """Publish a health status, but only when it actually changed.
+
+        Contract 4.3: ``network.status`` and ``audio.status`` are edge-driven, so
+        the last published value lives on the session and a rebuilt session
+        starts over.  The whole check-and-publish runs under ``_session_lock``,
+        exactly like ``emit_session_event``, so a stopping session cannot emit a
+        late status after its ``state: stopped``.
+        """
+
+        with self._session_lock:
+            if (
+                self._shutting_down
+                or self._current_session is not session
+                or session.stop_event.is_set()
+            ):
+                return False
+            tracker = getattr(session, "status_tracker", None)
+            if tracker is not None and not tracker.changed(event, status, channel):
+                return False
+            payload: dict[str, Any] = {"status": status}
+            if channel:
+                payload["channel"] = channel
+            payload["detail"] = self._redact(detail, session.config)
+            self.writer.event(event, session.session_id, payload)
+            return True
 
     def stop_session_with_error(
         self,
@@ -1440,6 +1648,7 @@ class BridgeServer:
         code: str,
         message: str,
         recoverable: bool,
+        service: str | None = None,
     ) -> bool:
         """Report a fatal session error and make every later callback stale."""
 
@@ -1455,6 +1664,7 @@ class BridgeServer:
                 session.session_id,
                 {
                     "scope": scope,
+                    "service": service or error_service_for(scope, code),
                     "code": code,
                     "message": self._redact(message, session.config),
                     "recoverable": recoverable,
@@ -1486,6 +1696,7 @@ class BridgeServer:
             code="asr_error",
             message=message,
             recoverable=True,
+            service=SERVICE_NETWORK,
         )
 
     def on_asr_ended(self, session: TranslationSession, status: str) -> None:
@@ -1508,6 +1719,7 @@ class BridgeServer:
             code=f"asr_{status}",
             message=message,
             recoverable=True,
+            service=SERVICE_NETWORK,
         )
 
     def on_audio_ready(self, session: TranslationSession) -> None:
@@ -1572,6 +1784,7 @@ class BridgeServer:
                 session.session_id,
                 {
                     "scope": "audio",
+                    "service": SERVICE_AUDIO,
                     "code": "audio_startup_timeout",
                     "message": "打开默认播放设备超时，请检查音频设备后重新开始同传。",
                     "recoverable": True,
@@ -1690,6 +1903,7 @@ class BridgeServer:
                 code="audio_worker_start_failed",
                 message=f"无法启动音频线程：{exc}",
                 recoverable=True,
+                service=SERVICE_AUDIO,
             )
             self.on_audio_worker_stopped(session)
 
@@ -1847,6 +2061,201 @@ class BridgeServer:
                 },
             )
 
+    # ------------------------------------------------- runtime channel control
+
+    @staticmethod
+    def _runtime_error(code: str, message: str) -> dict[str, str]:
+        return {"code": code, "message": message}
+
+    def _runtime_command_session(
+        self, session_id: str
+    ) -> tuple[Any, dict[str, str] | None]:
+        """Resolve the session of a runtime command.
+
+        Must be called with ``_session_lock`` held so the session cannot be
+        stopped or replaced between validation and the state change.  Returns
+        ``(session, None)`` on success and ``(None, error)`` otherwise.
+        """
+
+        session = self._current_session
+        if session is None or session.stop_event.is_set():
+            return None, self._runtime_error(ERROR_NO_ACTIVE_SESSION, "当前没有活跃的会话。")
+        if session.session_id != session_id:
+            return None, self._runtime_error(ERROR_SESSION_MISMATCH, "会话已结束或已被替换。")
+        return session, None
+
+    @classmethod
+    def _parse_runtime_params(
+        cls, params: Any
+    ) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+        """Validate the shared shape of a runtime command (contract 2, 3.2).
+
+        A missing value is a parameter problem (``invalid_params``); a value that
+        is present but outside the allowed set is reported with its own code.
+        """
+
+        if not isinstance(params, dict):
+            return None, cls._runtime_error(ERROR_INVALID_PARAMS, "params 必须是一个对象。")
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None, cls._runtime_error(
+                ERROR_INVALID_PARAMS, "缺少 session_id，或它不是非空字符串。"
+            )
+        return {"session_id": session_id.strip()}, None
+
+    def _set_runtime_channel(self, request_id: Any, params: Any) -> None:
+        """Enable or disable one channel for the running session (contract 2.1)."""
+
+        parsed, error = self._parse_runtime_params(params)
+        if error is not None:
+            self.writer.response(request_id, ok=False, error=error)
+            return
+        if "channel" not in params or params["channel"] is None:
+            self.writer.response(
+                request_id,
+                ok=False,
+                error=self._runtime_error(ERROR_INVALID_PARAMS, "缺少 channel。"),
+            )
+            return
+        channel = params["channel"]
+        if channel not in RUNTIME_CHANNELS:
+            self.writer.response(
+                request_id,
+                ok=False,
+                error=self._runtime_error(ERROR_INVALID_CHANNEL, "channel 必须是 listen 或 speak。"),
+            )
+            return
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            self.writer.response(
+                request_id,
+                ok=False,
+                error=self._runtime_error(ERROR_INVALID_PARAMS, "enabled 必须是 JSON 布尔值。"),
+            )
+            return
+
+        with self._session_lock:
+            session, error = self._runtime_command_session(parsed["session_id"])
+            if error is not None:
+                self.writer.response(request_id, ok=False, error=error)
+                return
+            runtime = getattr(session, "runtime", None)
+            if runtime is None:
+                self.writer.response(
+                    request_id,
+                    ok=False,
+                    error=self._runtime_error(ERROR_INTERNAL, "当前会话不支持运行时通道开关。"),
+                )
+                return
+            if not runtime.configured(channel):
+                self.writer.response(
+                    request_id,
+                    ok=False,
+                    error=self._runtime_error(
+                        ERROR_CHANNEL_NOT_CONFIGURED,
+                        f"配置中未启用 {channel} 通道，无法在运行时开启。",
+                    ),
+                )
+                return
+            # Contract 1.5 (Agent 0 ruling, 2026-10-07): turning the speak channel
+            # off must release the mute in the same call.
+            #
+            # Section 1 defines mute as "the channel still exists, it just stops
+            # submitting microphone audio", so once the channel is closed the flag
+            # has no object left and becomes a ghost state.  Section 7 makes
+            # speakEnabled a precondition of toggle_speak_mute, so letting
+            # speakMuted=true coexist with speakEnabled=false would show the tray
+            # the contradictory "speak channel unchecked + mute speak checked",
+            # and the practical failure mode is that Ctrl+Shift+S reopens the
+            # microphone with no sound and no visible reason.
+            #
+            # Released *before* the channel flips so that both the state and the
+            # events keep every intermediate step truthful: muted can never be
+            # observed as true while the speak channel is off.  Re-enabling never
+            # writes the flag back (contract 1.5, second paragraph).
+            released_mute = False
+            if channel == CHANNEL_SPEAK and not enabled:
+                released_mute = runtime.set_speak_muted(False)
+            changed = runtime.set_channel(channel, enabled)
+            effective = runtime.effective_enabled(channel)
+            self.writer.response(
+                request_id,
+                ok=True,
+                result={
+                    "session_id": session.session_id,
+                    "channel": channel,
+                    "enabled": effective,
+                    "changed": changed,
+                },
+            )
+            if released_mute:
+                self.emit_session_event(session, EVENT_RUNTIME_MUTE, {"muted": False})
+            if changed:
+                # Only a real change is announced, so a repeated idempotent call
+                # does not make the UI re-render the same state (contract 4.2).
+                self.emit_session_event(
+                    session,
+                    EVENT_RUNTIME_CHANNEL,
+                    {
+                        "channel": channel,
+                        "enabled": effective,
+                        "configured": runtime.configured(channel),
+                    },
+                )
+
+    def _set_speak_muted(self, request_id: Any, params: Any) -> None:
+        """Mute or unmute the microphone of the running session (contract 2.2)."""
+
+        parsed, error = self._parse_runtime_params(params)
+        if error is not None:
+            self.writer.response(request_id, ok=False, error=error)
+            return
+        if "muted" not in params or not isinstance(params["muted"], bool):
+            self.writer.response(
+                request_id,
+                ok=False,
+                error=self._runtime_error(ERROR_INVALID_PARAMS, "muted 必须是 JSON 布尔值。"),
+            )
+            return
+        muted = params["muted"]
+
+        with self._session_lock:
+            session, error = self._runtime_command_session(parsed["session_id"])
+            if error is not None:
+                self.writer.response(request_id, ok=False, error=error)
+                return
+            runtime = getattr(session, "runtime", None)
+            if runtime is None:
+                self.writer.response(
+                    request_id,
+                    ok=False,
+                    error=self._runtime_error(ERROR_INTERNAL, "当前会话不支持运行时静音。"),
+                )
+                return
+            if not runtime.configured(CHANNEL_SPEAK):
+                self.writer.response(
+                    request_id,
+                    ok=False,
+                    error=self._runtime_error(
+                        ERROR_CHANNEL_NOT_CONFIGURED, "配置中未启用发言通道，静音只对存在的通道有效。"
+                    ),
+                )
+                return
+            changed = runtime.set_speak_muted(muted)
+            self.writer.response(
+                request_id,
+                ok=True,
+                result={
+                    "session_id": session.session_id,
+                    "muted": runtime.speak_muted(),
+                    "changed": changed,
+                },
+            )
+            if changed:
+                self.emit_session_event(
+                    session, EVENT_RUNTIME_MUTE, {"muted": runtime.speak_muted()}
+                )
+
     def handle_request(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             self.writer.response(
@@ -1886,6 +2295,10 @@ class BridgeServer:
             self._probe_connect(request_id, params)
         elif command == "devices":
             self._list_devices(request_id)
+        elif command == COMMAND_SET_RUNTIME_CHANNEL:
+            self._set_runtime_channel(request_id, params)
+        elif command == COMMAND_SET_SPEAK_MUTED:
+            self._set_speak_muted(request_id, params)
         elif command == "shutdown":
             self._shutdown(request_id)
             return False
@@ -1934,6 +2347,8 @@ class BridgeServer:
                     "probe.models",
                     "probe.connect",
                     "devices",
+                    COMMAND_SET_RUNTIME_CHANNEL,
+                    COMMAND_SET_SPEAK_MUTED,
                 ],
             },
         )

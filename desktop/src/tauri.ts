@@ -3,6 +3,14 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { audioLanguageErrors } from "./translationLanguages";
 
 import {
+  MockOpenSettingsChannel,
+  MockRuntimeController,
+  normalizeRuntimeState,
+  type MockRuntimeOptions,
+} from "./runtime";
+import { engineErrorTitle, errorServiceFromEvent } from "./snapshot";
+
+import {
   DEFAULT_SETTINGS,
   IDLE_HEALTH,
   createEmptyQueue,
@@ -17,6 +25,8 @@ import {
   type EventEnvelope,
   type PublicSettings,
   type RealtimeServiceSettings,
+  type RuntimeAction,
+  type RuntimeState,
   type SettingsDraft,
   type SettingsValidation,
   type TranslationProviderDraft,
@@ -25,6 +35,16 @@ import {
 } from "./types";
 
 type EventListener = (event: TranslatorEvent) => void;
+type RuntimeStateListener = (state: RuntimeState) => void;
+
+/**
+ * Legacy per-session commands. Kept only for compatibility with callers outside
+ * this module; every UI action goes through `dispatch_native_action` so the
+ * tray menu, the global shortcuts and the main window share one dispatcher
+ * (docs/tray-shortcuts-contract.md §1 and §12).
+ */
+const LEGACY_START_TRANSLATION = "start_translation";
+const LEGACY_STOP_TRANSLATION = "stop_translation";
 
 const isTauriRuntime = () =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -103,6 +123,45 @@ class MockTranslator {
   private timers = new Set<number>();
   private sentenceIndex = 0;
   private sequence = 0;
+  /**
+   * Browser-only runtime state machine. It exposes the same three entry points
+   * as the native layer so the UI has exactly one code path; it is never used
+   * when `isTauriRuntime()` is true.
+   */
+  private runtime: MockRuntimeController;
+
+  constructor() {
+    const options: MockRuntimeOptions = {
+      channelEnabled: () => ({
+        listen: this.snapshot.settings.audio.listen.enabled,
+        speak: this.snapshot.settings.audio.speak.enabled,
+      }),
+      guardStart: () => {
+        const errors = audioLanguageErrors(this.snapshot.settings.audio);
+        const keys = Object.keys(errors);
+        return keys.length ? Object.values(errors).join("\n") : null;
+      },
+      onSessionStarted: (sessionId) => {
+        void this.start(sessionId);
+      },
+      onSessionStopped: (sessionId) => {
+        void this.stop(sessionId ?? this.snapshot.session.sessionId);
+      },
+    };
+    this.runtime = new MockRuntimeController(options);
+  }
+
+  getRuntimeState(): RuntimeState {
+    return this.runtime.getRuntimeState();
+  }
+
+  dispatchNativeAction(action: RuntimeAction): RuntimeState {
+    return this.runtime.dispatchNativeAction(action);
+  }
+
+  subscribeRuntimeState(listener: RuntimeStateListener): UnlistenFn {
+    return this.runtime.subscribeRuntimeState(listener);
+  }
 
   getSnapshot(): AppSnapshot {
     return deepCopy(this.snapshot);
@@ -119,15 +178,17 @@ class MockTranslator {
     };
   }
 
-  async start(): Promise<{ sessionId: string }> {
+  /** `sessionId` is supplied by the mock runtime controller so both mock
+   * state machines agree on the same identifier. */
+  async start(sessionId?: string): Promise<{ sessionId: string }> {
     const languageErrors = audioLanguageErrors(this.snapshot.settings.audio);
     if (Object.keys(languageErrors).length) throw new Error(Object.values(languageErrors).join("\n"));
     this.clearTimers();
-    const sessionId = `mock-${Date.now()}`;
+    const activeSessionId = sessionId ?? `mock-${Date.now()}`;
     this.snapshot.session = {
       ...this.snapshot.session,
       phase: "starting",
-      sessionId,
+      sessionId: activeSessionId,
       startedAt: now(),
       partialTranscript: "",
       health: {
@@ -139,10 +200,10 @@ class MockTranslator {
       lastError: null,
     };
     this.bump();
-    this.emit("session", this.snapshot.session, sessionId);
+    this.emit("session", this.snapshot.session, activeSessionId);
 
     this.schedule(() => {
-      if (this.snapshot.session.sessionId !== sessionId) return;
+      if (this.snapshot.session.sessionId !== activeSessionId) return;
       this.snapshot.session = {
         ...this.snapshot.session,
         phase: "listening",
@@ -158,11 +219,11 @@ class MockTranslator {
         },
       };
       this.bump();
-      this.emit("session", this.snapshot.session, sessionId);
-      this.runSentence(sessionId);
+      this.emit("session", this.snapshot.session, activeSessionId);
+      this.runSentence(activeSessionId);
     }, 700);
 
-    return { sessionId };
+    return { sessionId: activeSessionId };
   }
 
   async stop(sessionId: string | null): Promise<void> {
@@ -401,6 +462,9 @@ class MockTranslator {
 
 const mockTranslator = new MockTranslator();
 
+/** Browser stand-in for the native tray `open-settings` broadcast. */
+const mockOpenSettings = new MockOpenSettingsChannel();
+
 function validateDraft(draft: SettingsDraft): SettingsValidation {
   const fieldErrors: SettingsValidation["fieldErrors"] = audioLanguageErrors(draft.audio);
   const validateUrl = (
@@ -510,6 +574,24 @@ interface BridgeEvent {
 
 let bridgeRevision = 0;
 const bridgeQueues = new Map<string, TranslationQueue>();
+
+/**
+ * Highest runtime revision already applied. Native commands return the
+ * authoritative snapshot, so a `runtime-state` broadcast that arrives late is
+ * dropped instead of rolling the UI back (contract §5 and §6).
+ */
+let runtimeRevision = -1;
+
+function rememberRuntimeState(state: RuntimeState): RuntimeState {
+  runtimeRevision = Math.max(runtimeRevision, state.revision);
+  return state;
+}
+
+function acceptRuntimeRevision(revision: number): boolean {
+  if (revision <= runtimeRevision) return false;
+  runtimeRevision = revision;
+  return true;
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -787,14 +869,14 @@ export const translatorApi = {
     // Only one session can be live at a time, so any queue state still tracked
     // here belongs to a sidecar that has already been replaced.
     bridgeQueues.clear();
-    return invoke<StartTranslationResult>("start_translation");
+    return invoke<StartTranslationResult>(LEGACY_START_TRANSLATION);
   },
 
   async stopSession(sessionId: string | null): Promise<void> {
     if (!isTauriRuntime()) return mockTranslator.stop(sessionId);
     if (!sessionId) return;
     try {
-      await invoke("stop_translation", { sessionId });
+      await invoke(LEGACY_STOP_TRANSLATION, { sessionId });
     } finally {
       // Stopping kills the sidecar, so no terminal "stopped" event arrives to
       // release this entry.
@@ -905,6 +987,49 @@ export const translatorApi = {
 
   async copyText(text: string): Promise<void> {
     await copyInBrowser(text);
+  },
+
+  /**
+   * Current runtime state (tray status, runtime channels, mute, shortcut
+   * failures). Frozen contract: docs/tray-shortcuts-contract.md §5.
+   */
+  async getRuntimeState(): Promise<RuntimeState> {
+    if (!isTauriRuntime()) return mockTranslator.getRuntimeState();
+    const raw = await invoke<unknown>("get_runtime_state");
+    return rememberRuntimeState(normalizeRuntimeState(raw));
+  },
+
+  /**
+   * The single action entry point, shared with the tray menu and the global
+   * shortcuts. The returned state is the authoritative snapshot after the
+   * action; the caller does not need to wait for a `runtime-state` event.
+   */
+  async dispatchNativeAction(action: RuntimeAction): Promise<RuntimeState> {
+    if (!isTauriRuntime()) return mockTranslator.dispatchNativeAction(action);
+    const raw = await invoke<unknown>("dispatch_native_action", { action });
+    return rememberRuntimeState(normalizeRuntimeState(raw));
+  },
+
+  /** Broadcast to every window, including the subtitle overlay (contract §6). */
+  async subscribeRuntimeState(
+    listener: RuntimeStateListener,
+  ): Promise<UnlistenFn> {
+    if (!isTauriRuntime()) return mockTranslator.subscribeRuntimeState(listener);
+    return listen<unknown>("runtime-state", (event) => {
+      const state = normalizeRuntimeState(event.payload);
+      if (!acceptRuntimeRevision(state.revision)) return;
+      listener(state);
+    });
+  },
+
+  /**
+   * Tray menu item `设置` (tray-shortcuts-contract §9): the native layer shows
+   * the main window and then emits `open-settings`, which must open the
+   * settings dialog. The event name is the frozen literal.
+   */
+  async subscribeOpenSettings(handler: () => void): Promise<UnlistenFn> {
+    if (!isTauriRuntime()) return mockOpenSettings.subscribe(handler);
+    return listen("open-settings", () => handler());
   },
 
   async subscribe(listener: EventListener): Promise<UnlistenFn> {
@@ -1138,24 +1263,10 @@ export const translatorApi = {
 
       if (bridge.event === "error") {
         const scope = asString(data.scope);
-        const service: EngineError["service"] =
-          scope === "audio"
-            ? "audio"
-            : scope === "asr"
-              ? "recognition"
-              : scope === "translation"
-                ? "translation"
-                : "system";
-        const title =
-          service === "audio"
-            ? asString(data.code) === "audio_playback_failed"
-              ? "译文播放失败"
-              : "音频采集失败"
-            : service === "recognition"
-              ? "语音识别失败"
-              : service === "translation"
-                ? "翻译服务失败"
-                : "翻译引擎错误";
+        const code = asString(data.code);
+        // `service` wins; `scope` is the legacy fallback.
+        const service = errorServiceFromEvent(data.service, scope);
+        const title = engineErrorTitle(service, code);
         emit("error", {
           id: `${sessionId}:${revision}:${asString(data.code, "error")}`,
           sessionId,

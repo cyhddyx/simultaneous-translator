@@ -20,7 +20,16 @@ keyring = { version = "3", features = ["windows-native"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tauri = { version = "2", features = [] }
+# `tray-icon` enables the system tray used by the native runtime controls;
+# `image-png` is what lets the tray reuse the packaged 32x32 PNG through
+# `Image::from_bytes` instead of shipping a second icon asset.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# Pinned to the 2.3.x line on purpose: 2.4.0 requires `tauri ^2.12`, which drags the
+# `tauri` crate past the `@tauri-apps/api` version in `desktop/package.json` and makes
+# `tauri build` abort with "Found version mismatched Tauri packages". `~` (not `^`) is
+# what keeps `cargo update` from resolving back onto 2.4.0; only widen this together
+# with the npm @tauri-apps packages.
+tauri-plugin-global-shortcut = "~2.3.2"
 tauri-plugin-single-instance = "2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }

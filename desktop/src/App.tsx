@@ -6,8 +6,10 @@ import {
   type ReactNode,
 } from "react";
 import {
+  Captions,
   CheckCircle2,
   CircleAlert,
+  CircleDashed,
   Copy,
   Headphones,
   LoaderCircle,
@@ -20,8 +22,11 @@ import {
   Square,
   Timer,
   Trash2,
+  TriangleAlert,
   Volume2,
+  VolumeX,
   Waves,
+  WifiOff,
   X,
 } from "lucide-react";
 
@@ -30,30 +35,38 @@ import { AmbientVisualizer } from "./AmbientVisualizer";
 import { ResizeHandles, WindowControls } from "./TitleBar";
 import { isConfigurationComplete, translatorApi } from "./tauri";
 import {
-  IDLE_HEALTH,
-  createEmptyQueue,
+  applyRuntimeState,
+  describeRuntimeActionResult,
+  describeRuntimeChange,
+  runtimeChangeSignature,
+  runtimeCoversService,
+  runtimeErrorRows,
+  shortcutFailureNotice,
+  trayStatusLabel,
+  type RuntimeChangeKind,
+} from "./runtime";
+import {
+  applyTranslatorEvent,
+  captionStatusLabel,
+  errorMessage,
+  formatCaptionHistory,
+  formatCaptionTime,
+  isSessionActive,
+  latestSessionCaption,
+} from "./snapshot";
+import {
   createInitialSnapshot,
   type AppSnapshot,
   type CaptionSegment,
   type HealthStatus,
+  type RuntimeAction,
+  type RuntimeState,
   type SessionPhase,
-  type SessionState,
   type SettingsDraft,
+  type TrayStatus,
   type TranslatorEvent,
 } from "./types";
 import { WaveformCanvas } from "./WaveformCanvas";
-
-const MAX_VISIBLE_HISTORY = 40;
-
-function errorMessage(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message) return error.message;
-  if (typeof error === "string" && error.trim()) return error.trim();
-  if (error && typeof error === "object" && "message" in error) {
-    const message = (error as { message?: unknown }).message;
-    if (typeof message === "string" && message.trim()) return message.trim();
-  }
-  return fallback;
-}
 
 function formatElapsed(startedAt: string | null, now: number): string {
   if (!startedAt) return "00:00";
@@ -66,15 +79,6 @@ function formatElapsed(startedAt: string | null, now: number): string {
     .padStart(2, "0");
   const seconds = (duration % 60).toString().padStart(2, "0");
   return `${minutes}:${seconds}`;
-}
-
-function formatCaptionTime(value: string): string {
-  return new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(new Date(value));
 }
 
 function phaseLabel(phase: SessionPhase): string {
@@ -127,140 +131,14 @@ function channelLabel(health: HealthStatus): string {
   return "待机";
 }
 
-function sessionCanReceive(
-  event: TranslatorEvent,
-  snapshot: AppSnapshot,
-): boolean {
-  if (event.type === "settings") return true;
-  const incomingSessionId = event.data.sessionId;
-  if (incomingSessionId === snapshot.session.sessionId) return true;
-
-  // The first "starting" event may arrive before startSession() resolves.
-  if (
-    !snapshot.session.sessionId &&
-    event.type === "session" &&
-    event.data.payload.phase === "starting" &&
-    incomingSessionId
-  ) {
-    return true;
-  }
-
-  // Configuration errors are intentionally not tied to a live session.
-  return (
-    !incomingSessionId &&
-    event.type === "error" &&
-    event.data.payload.service === "configuration"
-  );
-}
-
-function applyTranslatorEvent(
-  snapshot: AppSnapshot,
-  event: TranslatorEvent,
-): AppSnapshot {
-  if (
-    event.data.revision < snapshot.revision ||
-    !sessionCanReceive(event, snapshot)
-  )
-    return snapshot;
-  const revision = Math.max(snapshot.revision, event.data.revision);
-
-  if (event.type === "session") {
-    const { health, channels, deviceNames, ...rest } = event.data.payload;
-    const session: SessionState = { ...snapshot.session, ...rest };
-    // Health and per-channel state arrive one entry at a time, so merge instead
-    // of replacing the whole map.
-    if (health) session.health = { ...snapshot.session.health, ...health };
-    if (channels)
-      session.channels = { ...snapshot.session.channels, ...channels };
-    if (deviceNames)
-      session.deviceNames = { ...snapshot.session.deviceNames, ...deviceNames };
-    if (event.data.sessionId && !("sessionId" in event.data.payload)) {
-      session.sessionId = event.data.sessionId;
-    }
-    return {
-      ...snapshot,
-      revision,
-      session,
-    };
-  }
-
-  if (event.type === "caption") {
-    const caption = event.data.payload;
-    const index = snapshot.captions.findIndex((item) => item.id === caption.id);
-    const captions = [...snapshot.captions];
-    if (index === -1) captions.push(caption);
-    else
-      captions[index] = {
-        ...captions[index],
-        ...caption,
-        createdAt: captions[index].createdAt,
-      };
-    // `sequence` is local to a sidecar session. Timestamps keep records in
-    // arrival order when the UI survives a stop/start cycle.
-    captions.sort(
-      (left, right) =>
-        left.createdAt.localeCompare(right.createdAt) ||
-        left.sequence - right.sequence ||
-        left.id.localeCompare(right.id),
-    );
-    return {
-      ...snapshot,
-      revision,
-      captions: captions.slice(-MAX_VISIBLE_HISTORY),
-    };
-  }
-
-  if (event.type === "queue") {
-    return {
-      ...snapshot,
-      revision,
-      session: { ...snapshot.session, queue: event.data.payload },
-    };
-  }
-
-  if (event.type === "error") {
-    const health = { ...snapshot.session.health };
-    if (event.data.payload.service === "audio") health.audio = "failed";
-    if (event.data.payload.service === "recognition")
-      health.recognition = "failed";
-    if (event.data.payload.service === "translation")
-      health.translation = "failed";
-    return {
-      ...snapshot,
-      revision,
-      session: {
-        ...snapshot.session,
-        lastError: event.data.payload,
-        health,
-      },
-    };
-  }
-
-  return { ...snapshot, revision, settings: event.data.payload };
-}
-
-function formatCaptionHistory(captions: CaptionSegment[]): string {
-  return captions
-    .map((caption) => {
-      const source = `${formatCaptionTime(caption.createdAt)}  ${caption.sourceText}`;
-      const translation =
-        caption.translationText ?? `（${captionStatusLabel(caption)}）`;
-      return `${source}\n${translation}`;
-    })
-    .join("\n\n");
-}
-
-function captionStatusLabel(caption: CaptionSegment): string {
-  const labels: Record<CaptionSegment["status"], string> = {
-    queued: "等待翻译",
-    translating: "正在翻译",
-    translated: "已翻译",
-    timed_out: "翻译超时",
-    failed: "翻译失败",
-    dropped: "为保持实时性已跳过",
-  };
-  return labels[caption.status];
-}
+/** Five-state tray status: icon + text + colour, never colour alone. */
+const TRAY_STATUS_ICONS: Record<TrayStatus, typeof Volume2> = {
+  not_started: CircleDashed,
+  connecting: LoaderCircle,
+  translating: CheckCircle2,
+  audio_error: VolumeX,
+  network_error: WifiOff,
+};
 
 function useElapsed(startedAt: string | null, active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
@@ -331,16 +209,36 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(() =>
     createInitialSnapshot(),
   );
+  const [runtime, setRuntime] = useState<RuntimeState | null>(null);
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [actionPending, setActionPending] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [dismissedErrorId, setDismissedErrorId] = useState<string | null>(null);
+  const [dismissedRuntimeErrors, setDismissedRuntimeErrors] = useState<string[]>(
+    [],
+  );
+  const [dismissedShortcutNotice, setDismissedShortcutNotice] = useState<
+    string | null
+  >(null);
   const unsubscribeRef = useRef<(() => void) | null>(null);
+  const runtimeUnsubscribeRef = useRef<(() => void) | null>(null);
   const historyHydratedRef = useRef(false);
+  // Last applied runtime state, so a change can be classified before rendering.
+  const runtimeRef = useRef<RuntimeState | null>(null);
+  // Set by a local dispatch so the resulting state change does not toast twice.
+  const suppressRuntimeToastRef = useRef<{
+    signature: RuntimeChangeKind;
+    revision: number;
+  } | null>(null);
+  const actionPendingRef = useRef(false);
 
   const applyEvent = useCallback((event: TranslatorEvent) => {
     setSnapshot((current) => applyTranslatorEvent(current, event));
+  }, []);
+
+  const applyRuntimeEvent = useCallback((incoming: RuntimeState) => {
+    setRuntime((current) => applyRuntimeState(current, incoming));
   }, []);
 
   useEffect(() => {
@@ -391,6 +289,95 @@ export default function App() {
     };
   }, [applyEvent]);
 
+  // Tray menu item "设置" (tray-shortcuts-contract §9): the native layer shows
+  // this window and then emits `open-settings`; the dialog is the only thing
+  // left for the frontend to do. Also keeps the tray item from being the one
+  // menu entry that shows a window without opening its target.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    void translatorApi
+      .subscribeOpenSettings(() => setSettingsOpen(true))
+      .then((dispose) => {
+        // React Strict Mode subscribes twice while verifying cleanup, and the
+        // first cleanup runs before this promise resolves: drop the stale
+        // registration instead of leaking it.
+        if (disposed) dispose();
+        else unlisten = dispose;
+      })
+      .catch((error) => {
+        console.warn("托盘设置事件不可用：", errorMessage(error, "未知原因"));
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+      unlisten = null;
+    };
+  }, []);
+
+  // Runtime state (tray status, runtime channels, mute, shortcut failures) is
+  // owned by the native layer; this window only mirrors it.
+  useEffect(() => {
+    let disposed = false;
+
+    const connect = async () => {
+      try {
+        const unsubscribe =
+          await translatorApi.subscribeRuntimeState(applyRuntimeEvent);
+        if (disposed) {
+          unsubscribe();
+          return;
+        }
+        runtimeUnsubscribeRef.current = unsubscribe;
+        const initial = await translatorApi.getRuntimeState();
+        if (!disposed) {
+          setRuntime((current) => applyRuntimeState(current, initial));
+        }
+      } catch (error) {
+        // A native build without the runtime channel must not break captions:
+        // the runtime bar stays hidden and every action still reports its own
+        // error when pressed.
+        console.warn(
+          "运行时状态不可用：",
+          errorMessage(error, "未知原因"),
+        );
+      }
+    };
+
+    void connect();
+    return () => {
+      disposed = true;
+      runtimeUnsubscribeRef.current?.();
+      runtimeUnsubscribeRef.current = null;
+    };
+  }, [applyRuntimeEvent]);
+
+  // Tray menu and global shortcuts change the runtime state without touching
+  // this window, so every observed transition becomes a short toast. A change
+  // caused by a local button press is suppressed: that button already reported
+  // its own result.
+  useEffect(() => {
+    const previous = runtimeRef.current;
+    runtimeRef.current = runtime;
+    if (!previous || !runtime) return;
+    if (runtime.revision <= previous.revision) return;
+    const signature = runtimeChangeSignature(previous, runtime);
+    if (!signature) return;
+    const expected = suppressRuntimeToastRef.current;
+    suppressRuntimeToastRef.current = null;
+    if (
+      expected &&
+      expected.signature === signature &&
+      expected.revision === runtime.revision
+    ) {
+      return;
+    }
+    const message = describeRuntimeChange(previous, runtime);
+    if (message) setToast(message);
+  }, [runtime]);
+
   useEffect(() => {
     if (historyHydratedRef.current) {
       translatorApi.persistCaptionHistory(snapshot.captions);
@@ -404,26 +391,25 @@ export default function App() {
   }, [toast]);
 
   const session = snapshot.session;
-  const active =
-    session.phase === "starting" ||
-    session.phase === "listening" ||
-    session.phase === "stopping";
+  // The native runtime state owns the session phase.
+  //
+  // `needs_configuration` is the ONLY sanctioned exception — see
+  // docs/runtime-channel-control.md §1.6: sidecar `state` events are the only
+  // source of `sessionPhase` and the sidecar has no notion of an incomplete
+  // configuration, so Rust never reports `needs_configuration`. Overriding the
+  // phase keeps "开始同传" pointing at the settings dialog instead of failing;
+  // it is not, and must never become, a derivation of `trayStatus`
+  // (tray-shortcuts-contract §12.4).
+  const phase: SessionPhase = runtime
+    ? runtime.sessionPhase === "idle" && session.phase === "needs_configuration"
+      ? session.phase
+      : runtime.sessionPhase
+    : session.phase;
+  const active = isSessionActive(phase);
   const elapsed = useElapsed(session.startedAt, active);
   // A stopped session keeps its history below, but the live stage must not
   // imply that its final subtitle is still being translated.
-  const currentCaption = active
-    ? snapshot.captions
-        .filter((caption) => caption.sessionId === session.sessionId)
-        .reduce<CaptionSegment | null>(
-          (latest, caption) =>
-            !latest || caption.createdAt > latest.createdAt ? caption : latest,
-          null,
-        )
-    : null;
-  const visibleError =
-    session.lastError && session.lastError.id !== dismissedErrorId
-      ? session.lastError
-      : null;
+  const currentCaption = active ? latestSessionCaption(snapshot) : null;
   const writeLocalError = useCallback((title: string, message: string) => {
     setSnapshot((current) => ({
       ...current,
@@ -441,83 +427,46 @@ export default function App() {
     }));
   }, []);
 
-  const handleSessionControl = async () => {
-    if (actionPending || session.phase === "stopping") return;
-    if (session.phase === "needs_configuration") {
+  /**
+   * The only way this window changes session or channel state. Tray menu and
+   * global shortcuts call the same native dispatcher, so all three entry points
+   * share one implementation.
+   */
+  const runRuntimeAction = useCallback(
+    async (action: RuntimeAction) => {
+      if (actionPendingRef.current) return;
+      actionPendingRef.current = true;
+      setActionPending(true);
+      try {
+        const before = runtimeRef.current;
+        const next = await translatorApi.dispatchNativeAction(action);
+        const signature = runtimeChangeSignature(before, next);
+        if (signature) {
+          suppressRuntimeToastRef.current = { signature, revision: next.revision };
+        }
+        setRuntime((current) => applyRuntimeState(current, next));
+        setDismissedErrorId(null);
+        setDismissedRuntimeErrors([]);
+        const message = describeRuntimeActionResult(action, before, next);
+        if (message) setToast(message);
+      } catch (error) {
+        // The native layer returns a ready-to-display Chinese message.
+        setToast(`操作失败：${errorMessage(error, "无法执行该操作。")}`);
+      } finally {
+        actionPendingRef.current = false;
+        setActionPending(false);
+      }
+    },
+    [],
+  );
+
+  const handleSessionControl = () => {
+    if (actionPendingRef.current) return;
+    if (phase === "needs_configuration") {
       setSettingsOpen(true);
       return;
     }
-
-    setActionPending(true);
-    try {
-      if (session.phase === "starting" || session.phase === "listening") {
-        setSnapshot((current) => ({
-          ...current,
-          session: {
-            ...current.session,
-            phase: "stopping",
-            partialTranscript: "",
-          },
-        }));
-        await translatorApi.stopSession(session.sessionId);
-        setSnapshot((current) => ({
-          ...current,
-          session: {
-            ...current.session,
-            phase: "idle",
-            sessionId: null,
-            startedAt: null,
-            partialTranscript: "",
-            health: { ...IDLE_HEALTH },
-            queue: createEmptyQueue(),
-            lastError: null,
-          },
-        }));
-      } else {
-        const result = await translatorApi.startSession();
-        setDismissedErrorId(null);
-        setSnapshot((current) => {
-          if (current.session.sessionId === result.sessionId) return current;
-          return {
-            ...current,
-            session: {
-              ...current.session,
-              phase: "starting",
-              sessionId: result.sessionId,
-              startedAt: new Date().toISOString(),
-              partialTranscript: "",
-            },
-          };
-        });
-      }
-    } catch (error) {
-      const message = errorMessage(error, "无法更新同传会话状态。");
-      if (session.phase === "starting" || session.phase === "listening") {
-        setSnapshot((current) => ({
-          ...current,
-          session: {
-            ...current.session,
-            phase: "idle",
-            sessionId: null,
-            startedAt: null,
-            partialTranscript: "",
-            health: { ...IDLE_HEALTH },
-            queue: createEmptyQueue(),
-            lastError: {
-              id: `stop-${Date.now()}`,
-              service: "system",
-              title: "停止会话失败",
-              message,
-              recoverable: true,
-            },
-          },
-        }));
-      } else {
-        writeLocalError("会话操作失败", message);
-      }
-    } finally {
-      setActionPending(false);
-    }
+    void runRuntimeAction("start_or_stop_session");
   };
 
   const handleCopy = async () => {
@@ -569,11 +518,11 @@ export default function App() {
     // handleSessionControl opens the settings dialog for needs_configuration and
     // starts a session for idle/error; anything else is already running.
     if (
-      session.phase === "error" ||
-      session.phase === "idle" ||
-      session.phase === "needs_configuration"
+      phase === "error" ||
+      phase === "idle" ||
+      phase === "needs_configuration"
     ) {
-      void handleSessionControl();
+      handleSessionControl();
     }
   };
 
@@ -604,6 +553,56 @@ export default function App() {
       : liveChannel === "listen"
         ? "对方在说"
         : "";
+
+  const trayStatus = runtime?.trayStatus ?? null;
+  const TrayIcon = trayStatus ? TRAY_STATUS_ICONS[trayStatus] : CircleDashed;
+  const trayStatusText = trayStatus ? trayStatusLabel(trayStatus) : "状态不可用";
+  const listenConfigured = snapshot.settings.audio.listen.enabled;
+  const speakConfigured = snapshot.settings.audio.speak.enabled;
+  const listenOn = runtime?.listenEnabled ?? false;
+  const speakOn = runtime?.speakEnabled ?? false;
+  const speakMuted = runtime?.speakMuted ?? false;
+  const subtitleVisible = runtime?.subtitleVisible ?? false;
+  const runtimeReady = runtime !== null;
+  const runtimeRows = runtimeErrorRows(runtime);
+  const visibleRuntimeRows = runtimeRows.filter(
+    (row) => !dismissedRuntimeErrors.includes(row.key),
+  );
+  const shortcutNotice = runtime
+    ? shortcutFailureNotice(runtime.shortcutFailures)
+    : null;
+  const showShortcutNotice =
+    shortcutNotice !== null && shortcutNotice !== dismissedShortcutNotice;
+  const visibleError =
+    session.lastError &&
+    session.lastError.id !== dismissedErrorId &&
+    // Audio / network failures are reported by the runtime area, with distinct
+    // wording and colour; keeping both would report one error twice.
+    !runtimeCoversService(runtimeRows, session.lastError.service)
+      ? session.lastError
+      : null;
+
+  const listenChannelHint = !listenConfigured
+    ? "收听通道未在设置中启用"
+    : !active
+      ? "请先开始同传，再使用通道控制"
+      : listenOn
+        ? "关闭收听通道"
+        : "开启收听通道";
+  const speakChannelHint = !speakConfigured
+    ? "发言通道未在设置中启用"
+    : !active
+      ? "请先开始同传，再使用通道控制"
+      : speakOn
+        ? "关闭发言通道"
+        : "开启发言通道";
+  const muteHint = !active
+    ? "请先开始同传，再使用通道控制"
+    : !speakOn
+      ? "发言通道未开启"
+      : speakMuted
+        ? "取消静音"
+        : "静音发言";
 
   return (
     <main className="app-shell">
@@ -679,18 +678,99 @@ export default function App() {
             <WindowControls />
           </header>
           <div className="translation-scroll">
+            <section className="runtime-bar" aria-label="运行时状态与通道控制">
+              <span
+                className={
+                  trayStatus
+                    ? `runtime-pill runtime-pill--${trayStatus}`
+                    : "runtime-pill runtime-pill--unavailable"
+                }
+                role="status"
+                aria-live="polite"
+                title={`托盘状态：${trayStatusText}`}
+              >
+                <TrayIcon
+                  size={15}
+                  className={trayStatus === "connecting" ? "spin" : undefined}
+                  aria-hidden="true"
+                />
+                <span className="runtime-pill__label">{trayStatusText}</span>
+              </span>
+
+              <div className="runtime-switches">
+                <button
+                  className={`runtime-switch${listenOn ? " is-on" : ""}`}
+                  type="button"
+                  onClick={() => void runRuntimeAction("toggle_listen_channel")}
+                  disabled={!runtimeReady || actionPending || !active || !listenConfigured}
+                  aria-pressed={listenOn}
+                  aria-label={`收听通道：${listenOn ? "已开启" : "已关闭"}`}
+                  title={listenChannelHint}
+                >
+                  <Headphones size={15} aria-hidden="true" />
+                  <span>收听</span>
+                  <em>{listenOn ? "开" : "关"}</em>
+                </button>
+
+                <button
+                  className={`runtime-switch${speakOn ? " is-on" : ""}`}
+                  type="button"
+                  onClick={() => void runRuntimeAction("toggle_speak_channel")}
+                  disabled={!runtimeReady || actionPending || !active || !speakConfigured}
+                  aria-pressed={speakOn}
+                  aria-label={`发言通道：${speakOn ? "已开启" : "已关闭"}`}
+                  title={speakChannelHint}
+                >
+                  <Mic size={15} aria-hidden="true" />
+                  <span>发言</span>
+                  <em>{speakOn ? "开" : "关"}</em>
+                </button>
+
+                <button
+                  className={`runtime-switch${speakMuted ? " is-muted" : ""}`}
+                  type="button"
+                  onClick={() => void runRuntimeAction("toggle_speak_mute")}
+                  disabled={!runtimeReady || actionPending || !active || !speakOn}
+                  aria-pressed={speakMuted}
+                  aria-label={`发言静音：${speakMuted ? "已静音" : "未静音"}`}
+                  title={muteHint}
+                >
+                  {speakMuted ? (
+                    <VolumeX size={15} aria-hidden="true" />
+                  ) : (
+                    <Volume2 size={15} aria-hidden="true" />
+                  )}
+                  <span>静音</span>
+                  <em>{speakMuted ? "已静音" : "未静音"}</em>
+                </button>
+
+                <button
+                  className={`runtime-switch${subtitleVisible ? " is-on" : ""}`}
+                  type="button"
+                  onClick={() => void runRuntimeAction("toggle_subtitle_window")}
+                  disabled={!runtimeReady || actionPending}
+                  aria-pressed={subtitleVisible}
+                  aria-label={`字幕悬浮窗：${subtitleVisible ? "已显示" : "已隐藏"}`}
+                  title={subtitleVisible ? "隐藏字幕悬浮窗" : "显示字幕悬浮窗"}
+                >
+                  <Captions size={15} aria-hidden="true" />
+                  <span>字幕窗</span>
+                  <em>{subtitleVisible ? "显示中" : "已隐藏"}</em>
+                </button>
+              </div>
+            </section>
+
             <div className="translation-toolbar">
               <div
-                className={`session-chip session-chip--${session.phase}`}
+                className={`session-chip session-chip--${phase}`}
                 aria-live="polite"
               >
-                {session.phase === "starting" ||
-                session.phase === "stopping" ? (
+                {phase === "starting" || phase === "stopping" ? (
                   <LoaderCircle size={14} className="spin" aria-hidden="true" />
                 ) : (
                   <span className="session-chip__dot" aria-hidden="true" />
                 )}
-                <span>{loading ? "正在加载" : phaseLabel(session.phase)}</span>
+                <span>{loading ? "正在加载" : phaseLabel(phase)}</span>
               </div>
               <div className="translation-directions" aria-label="双向翻译语言">
                 {(["listen", "speak"] as const).map((id) => {
@@ -710,6 +790,82 @@ export default function App() {
                 })}
               </div>
             </div>
+
+            {showShortcutNotice && shortcutNotice && (
+              <section
+                className="runtime-notice runtime-notice--shortcut"
+                role="status"
+              >
+                <TriangleAlert size={17} aria-hidden="true" />
+                <div className="runtime-notice__copy">
+                  <strong>全局快捷键未全部生效</strong>
+                  <span>{shortcutNotice}</span>
+                </div>
+                <button
+                  className="icon-button icon-button--quiet"
+                  type="button"
+                  onClick={() => setDismissedShortcutNotice(shortcutNotice)}
+                  aria-label="关闭快捷键提示"
+                  title="关闭快捷键提示"
+                >
+                  <X size={16} />
+                </button>
+              </section>
+            )}
+
+            {visibleRuntimeRows.map((row) => (
+              <section
+                key={row.key}
+                className={`runtime-error runtime-error--${row.service}${
+                  row.severity === "warning" ? " runtime-error--warning" : ""
+                }`}
+                role={row.severity === "warning" ? "status" : "alert"}
+              >
+                {row.service === "audio" ? (
+                  <VolumeX size={18} aria-hidden="true" />
+                ) : row.service === "network" ? (
+                  <WifiOff size={18} aria-hidden="true" />
+                ) : (
+                  <CircleAlert size={18} aria-hidden="true" />
+                )}
+                <div className="runtime-error__copy">
+                  <strong>{row.title}</strong>
+                  <span>{row.message}</span>
+                </div>
+                <div className="runtime-error__actions">
+                  {row.severity === "error" && row.recoverable && !active && (
+                    // Retry reuses `start_or_stop_session` on purpose: the
+                    // RuntimeAction set is frozen at the seven values in
+                    // tray-shortcuts-contract §4 and a dedicated "reconnect"
+                    // action would have to be added to the tray, the global
+                    // shortcuts and this window at once. A future standalone
+                    // reconnect must change the contract document first.
+                    <button
+                      className="button button--secondary button--compact"
+                      type="button"
+                      onClick={() => void runRuntimeAction("start_or_stop_session")}
+                      disabled={actionPending}
+                      title="重新开始同传"
+                    >
+                      <RefreshCw size={14} aria-hidden="true" />
+                      重试
+                    </button>
+                  )}
+                  <button
+                    className="icon-button icon-button--quiet"
+                    type="button"
+                    onClick={() =>
+                      setDismissedRuntimeErrors((current) => [...current, row.key])
+                    }
+                    aria-label={`关闭${row.title}提示`}
+                    title="关闭提示"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              </section>
+            ))}
+
             {visibleError && (
               <section className="error-banner" role="alert">
                 <CircleAlert size={18} aria-hidden="true" />
@@ -915,12 +1071,12 @@ export default function App() {
               <button
                 className={`microphone-button${active ? " is-active" : ""}`}
                 type="button"
-                onClick={() => void handleSessionControl()}
+                onClick={handleSessionControl}
                 disabled={
-                  loading || actionPending || session.phase === "stopping"
+                  loading || actionPending || phase === "stopping"
                 }
                 aria-label={
-                  session.phase === "needs_configuration"
+                  phase === "needs_configuration"
                     ? "配置同传"
                     : active
                       ? "停止同传"
@@ -928,7 +1084,7 @@ export default function App() {
                 }
                 aria-pressed={active}
                 title={
-                  session.phase === "needs_configuration"
+                  phase === "needs_configuration"
                     ? "配置同传"
                     : active
                       ? "停止同传"
@@ -936,8 +1092,8 @@ export default function App() {
                 }
               >
                 {actionPending ||
-                session.phase === "starting" ||
-                session.phase === "stopping" ? (
+                phase === "starting" ||
+                phase === "stopping" ? (
                   <LoaderCircle size={26} className="spin" />
                 ) : active ? (
                   <Square size={24} />
@@ -959,12 +1115,12 @@ export default function App() {
             <span className="session-controls__label" role="status">
               {loading
                 ? "正在加载"
-                : session.phase === "needs_configuration"
+                : phase === "needs_configuration"
                   ? "配置同传"
-                  : session.phase === "stopping"
+                  : phase === "stopping"
                     ? "正在停止"
                     : active
-                      ? phaseLabel(session.phase)
+                      ? phaseLabel(phase)
                       : "开始同传"}
             </span>
           </footer>

@@ -1,9 +1,13 @@
 """Channel voice policies and device-loopback feedback protection."""
+import asyncio
 import unittest
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
+
+import numpy as np
 
 import livetranslate as live
 from system_capture import SystemCapture
@@ -104,6 +108,159 @@ class AudioIsolationTests(unittest.TestCase):
         channel = self.channel(voice_mode="system")
         channel._handle_event({"type": "session.updated", "session": {"enable_voice_clone": True}}, None)
         self.assertTrue(channel._failed)
+
+
+class RuntimeAudioGateTests(unittest.TestCase):
+    """Contract section 6: a closed channel drops frames before the engine.
+
+    ``_capture_loop`` sends one WebSocket frame per captured chunk, so counting
+    ``websocket.send`` calls while driving the loop is the exact measurement of
+    whether audio reached the engine.
+    """
+
+    FRAMES = 4  # the last record sets stop_event, so a fully open run sends 3.
+
+    def session(self, channels=("listen", "speak")):
+        specs = tuple(
+            live.ChannelSpec(channel, True, "microphone", "", "English", "", True, "")
+            for channel in channels
+        )
+        return SimpleNamespace(
+            specs=specs,
+            startup_timeout_s=1,
+            stop_event=threading.Event(),
+            runtime=live.RuntimeChannelState({spec.channel: True for spec in specs}),
+            status_tracker=live.HealthStatusTracker(),
+            set_channel_network=lambda *_args, **_kwargs: None,
+        )
+
+    def channel(self, session, name="listen"):
+        spec = next(spec for spec in session.specs if spec.channel == name)
+        return live.LiveTranslateChannel(
+            MagicMock(), session, spec, base_url="wss://test", model="test",
+            api_key="test", options=live.RealtimeOptions(),
+        )
+
+    def drive(self, channel, frames=None):
+        """Run the real capture loop for a fixed number of captured chunks."""
+
+        frames = frames or self.FRAMES
+        produced = []
+        recorder = MagicMock()
+
+        def capture(numframes):
+            produced.append(1)
+            if len(produced) >= frames:
+                channel._session.stop_event.set()
+            return np.zeros((numframes, 1), dtype="float32")
+
+        recorder.record = MagicMock(side_effect=capture)
+        websocket = MagicMock()
+        websocket.send = AsyncMock()
+
+        async def run():
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                await asyncio.wait_for(channel._capture_loop(websocket, pool, recorder), 10)
+            finally:
+                pool.shutdown(wait=False)
+
+        asyncio.run(run())
+        channel._session.stop_event.clear()
+        return produced, websocket
+
+    def test_a_closed_channel_drops_every_frame_before_the_engine(self):
+        session = self.session(("listen",))
+        channel = self.channel(session)
+        session.runtime.set_channel("listen", False)
+
+        produced, websocket = self.drive(channel)
+
+        self.assertEqual(len(produced), self.FRAMES)
+        websocket.send.assert_not_awaited()
+        websocket.close.assert_not_called()
+        self.assertEqual(channel._dropped_frames, self.FRAMES - 1)
+
+    def test_an_open_channel_still_sends_every_frame(self):
+        session = self.session(("listen",))
+        channel = self.channel(session)
+
+        produced, websocket = self.drive(channel)
+
+        self.assertEqual(len(produced), self.FRAMES)
+        self.assertEqual(websocket.send.await_count, self.FRAMES - 1)
+        payload = websocket.send.await_args.args[0]
+        self.assertIn('"type": "input_audio_buffer.append"', payload)
+
+    def test_reenabling_resumes_on_the_same_channel_object(self):
+        session = self.session(("listen",))
+        channel = self.channel(session)
+        session.runtime.set_channel("listen", False)
+
+        _, closed = self.drive(channel)
+        session.runtime.set_channel("listen", True)
+        _, reopened = self.drive(channel)
+
+        closed.send.assert_not_awaited()
+        self.assertEqual(reopened.send.await_count, self.FRAMES - 1)
+        # Resuming must not have rebuilt anything: same channel, same session.
+        self.assertIs(channel._session, session)
+        self.assertFalse(channel._failed)
+
+    def test_muting_drops_only_the_microphone_frames(self):
+        session = self.session(("listen", "speak"))
+        speak = self.channel(session, "speak")
+        listen = self.channel(session, "listen")
+        session.runtime.set_speak_muted(True)
+
+        _, muted = self.drive(speak)
+        _, open_listen = self.drive(listen)
+
+        muted.send.assert_not_awaited()
+        self.assertEqual(open_listen.send.await_count, self.FRAMES - 1)
+        # Muting is not the same as disabling: the channel is still enabled and
+        # the session was never stopped.
+        self.assertTrue(session.runtime.effective_enabled("speak"))
+        self.assertFalse(session.stop_event.is_set())
+
+    def test_unmuting_resumes_the_microphone_on_the_same_object(self):
+        session = self.session(("speak",))
+        channel = self.channel(session, "speak")
+        session.runtime.set_speak_muted(True)
+
+        _, muted = self.drive(channel)
+        session.runtime.set_speak_muted(False)
+        _, resumed = self.drive(channel)
+
+        muted.send.assert_not_awaited()
+        self.assertEqual(resumed.send.await_count, self.FRAMES - 1)
+        self.assertIs(channel._session, session)
+
+    def test_closing_one_channel_leaves_the_sibling_streaming(self):
+        session = self.session(("listen", "speak"))
+        listen = self.channel(session, "listen")
+        speak = self.channel(session, "speak")
+        session.runtime.set_channel("listen", False)
+
+        _, closed = self.drive(listen)
+        _, sibling = self.drive(speak)
+
+        closed.send.assert_not_awaited()
+        self.assertEqual(sibling.send.await_count, self.FRAMES - 1)
+        self.assertTrue(session.runtime.effective_enabled("speak"))
+
+    def test_a_session_without_runtime_state_keeps_streaming(self):
+        # Lightweight duck-typed sessions must keep the pre-existing behaviour.
+        spec = live.ChannelSpec("listen", True, "microphone", "", "English", "", True, "")
+        session = SimpleNamespace(specs=(spec,), startup_timeout_s=1, stop_event=threading.Event())
+        channel = live.LiveTranslateChannel(
+            MagicMock(), session, spec, base_url="wss://test", model="test",
+            api_key="test", options=live.RealtimeOptions(),
+        )
+
+        _, websocket = self.drive(channel)
+
+        self.assertEqual(websocket.send.await_count, self.FRAMES - 1)
 
 
 if __name__ == "__main__":

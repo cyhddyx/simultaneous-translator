@@ -87,8 +87,18 @@ export interface TranslationProviderSettings {
   apiKeyStatus: SecretStatus;
 }
 
+/**
+ * `network` was added for the runtime-channel contract
+ * (docs/runtime-channel-control.md §4.4). It is a superset of the previous
+ * values, so every existing consumer keeps working.
+ */
 export type ErrorService =
-  "audio" | "recognition" | "translation" | "configuration" | "system";
+  | "audio"
+  | "network"
+  | "recognition"
+  | "translation"
+  | "configuration"
+  | "system";
 
 export interface EngineError {
   id: string;
@@ -340,4 +350,70 @@ export function createInitialSnapshot(): AppSnapshot {
     captions: [],
     settings: cloneSettings(DEFAULT_SETTINGS),
   };
+}
+
+/* ==========================================================================
+   Runtime state — tray / global shortcuts / runtime channel control
+   Frozen contract: docs/tray-shortcuts-contract.md §2-§5.
+   Field names here are the wire format (Rust `rename_all = "camelCase"`);
+   do not rename them without changing the contract first.
+   ========================================================================== */
+
+export type TrayStatus =
+  | "not_started"
+  | "connecting"
+  | "translating"
+  | "audio_error"
+  | "network_error";
+
+/** Same five values as HealthStatus; the contract refers to it by this name. */
+export type RuntimeHealth = HealthStatus;
+
+/** Health of the audio / network chain, as reported by the Python sidecar. */
+export type RuntimeService = "audio" | "network" | "configuration" | "system";
+
+export type RuntimeAction =
+  | "start_or_stop_session"
+  | "toggle_speak_mute"
+  | "toggle_listen_channel"
+  | "toggle_speak_channel"
+  | "toggle_subtitle_window"
+  | "show_main_window"
+  | "quit_application";
+
+export interface ShortcutFailure {
+  /** Normalised accelerator text, for example "Ctrl+Shift+Space". */
+  accelerator: string;
+  action: RuntimeAction;
+  /** Registration failure reason, shown in the main window. */
+  reason: string;
+}
+
+export interface RuntimeError {
+  id: string;
+  service: RuntimeService;
+  code: string;
+  message: string;
+  recoverable: boolean;
+  sessionId: string | null;
+}
+
+export interface RuntimeState {
+  /** Monotonic. Updates with `revision <= current` must be discarded. */
+  revision: number;
+  trayStatus: TrayStatus;
+  sessionPhase: SessionPhase;
+  sessionId: string | null;
+  audioHealth: RuntimeHealth;
+  networkHealth: RuntimeHealth;
+  /** Runtime effective value, not the value stored in the settings file. */
+  listenEnabled: boolean;
+  speakEnabled: boolean;
+  speakMuted: boolean;
+  subtitleVisible: boolean;
+  /** Accelerators that failed to register; empty when all of them succeeded. */
+  shortcutFailures: ShortcutFailure[];
+  lastError: RuntimeError | null;
+  /** RFC3339. */
+  updatedAt: string;
 }

@@ -8,6 +8,8 @@
     "build": "tsc -b && vite build",
     "test:audio": "node --experimental-strip-types --test tests/virtual-microphone.test.mjs",
     "test:languages": "node --experimental-strip-types --test tests/translation-languages.test.mjs",
+    "test:runtime": "node --experimental-strip-types --test tests/runtime-state.test.mjs tests/runtime-mock.test.mjs",
+    "test:subtitle": "node --experimental-strip-types --test tests/subtitle-window.test.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "tauri": "tauri",
     "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/tauri.ps1 dev",

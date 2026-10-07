@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1513,6 +1514,377 @@ class RealtimeChannelEventTests(unittest.TestCase):
 
         self.assertEqual([event for event, _ in server.events], ["source.final", "translation"])
         self.assertEqual(server.events[1][1]["text"], "你好")
+
+
+# ---------------------------------------------------------------------------
+# Runtime channel control: error classification and health events
+# (docs/runtime-channel-control.md sections 4.3 and 4.4).
+# ---------------------------------------------------------------------------
+
+REALTIME_SECRET = "realtime-secret"
+CONTRACT_SESSION_ID = "5c9a4f2e-7b31-4d08-9e6a-1f2c3d4e5f60"
+
+
+class _RecordingServer:
+    """Duck-typed bridge that records everything the engine reports."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+        self.errors: list[tuple[str, str, bool]] = []
+        self.statuses: list[tuple[str, str, str, str]] = []
+
+    def emit_session_event(
+        self, _session: object, event: str, data: dict, **_kwargs: object
+    ) -> bool:
+        self.events.append((event, data))
+        return True
+
+    def emit_session_error(
+        self,
+        _session: object,
+        *,
+        scope: str,
+        code: str,
+        message: str,
+        recoverable: bool,
+        service: str = "system",
+    ) -> None:
+        self.errors.append((code, service, recoverable))
+
+    def emit_session_status(
+        self, _session: object, event: str, status: str, *, channel: str = "", detail: str = ""
+    ) -> bool:
+        self.statuses.append((event, status, channel, detail))
+        return True
+
+    def on_realtime_channel(
+        self, _session: object, channel: str, status: str, *, device: object = None, detail: str = ""
+    ) -> None:
+        self.events.append(("channel.status", {"channel": channel, "status": status, "detail": detail}))
+
+
+class _ContractSession:
+    """Session double for the bridge-level error paths."""
+
+    def __init__(self, session_id: str = "session-contract") -> None:
+        self.session_id = session_id
+        self.config = _runtime_config()
+        self.stop_event = threading.Event()
+        self.state = "starting"
+        self.audio_ready = False
+        self.cancelled = False
+
+    def begin_stop(self) -> None:
+        self.stop_event.set()
+
+    def cancel_pending_translations(self) -> None:
+        self.cancelled = True
+
+
+def _error_events(stdout: io.StringIO) -> list[dict]:
+    return [
+        payload
+        for payload in (json.loads(line) for line in stdout.getvalue().splitlines())
+        if payload.get("event") == "error"
+    ]
+
+
+def _realtime_contract_session(
+    server: object,
+    *,
+    channels: dict | None = None,
+    play_audio: bool = False,
+    voice_mode: str = "",
+) -> tuple[object, object]:
+    config = bridge.RuntimeConfig.from_start_params(
+        {
+            "engine": "realtime",
+            "targetLanguage": "简体中文",
+            "realtime": {"model": "qwen3.8-livetranslate-flash-realtime"},
+            "audio": channels
+            if channels is not None
+            else {"listen": {"enabled": True, "playAudio": play_audio, "voiceMode": voice_mode}},
+            "secrets": {"realtimeApiKey": REALTIME_SECRET},
+        }
+    )
+    session = livetranslate.RealtimeSession(
+        server,
+        CONTRACT_SESSION_ID,
+        config,
+        base_url=config.realtime.base_url,
+        model=config.realtime.model,
+        api_key=REALTIME_SECRET,
+        options=livetranslate.RealtimeOptions(),
+        specs=livetranslate.enabled_channels(config.channels),
+        startup_timeout_s=1.0,
+    )
+    return session, session.channels[0]
+
+
+def _drive_capture(channel: object, recorder: object, websocket: object) -> None:
+    async def run() -> None:
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            await channel._capture_loop(websocket, pool, recorder)  # type: ignore[attr-defined]
+        finally:
+            pool.shutdown(wait=False)
+
+    asyncio.run(run())
+
+
+class ErrorServiceContractTests(unittest.TestCase):
+    """Contract 4.4: every error event carries a ``service`` classification."""
+
+    SCENARIOS = {
+        # 音频设备启动失败 / 中断 / 播放失败
+        "audio_device_missing": "audio",
+        "audio_device_failed": "audio",
+        "audio_startup_timeout": "audio",
+        "audio_device_lost": "audio",
+        "audio_playback_failed": "audio",
+        # WebSocket 连接失败 / 重连 / 鉴权失败 / 翻译服务超时断开
+        "websocket_connect_failed": "network",
+        "websocket_reconnecting": "network",
+        "auth_failed": "network",
+        "realtime_connect_timeout": "network",
+        "realtime_protocol_error": "network",
+        "asr_error": "network",
+        "translation_timeout": "network",
+        "translation_disconnected": "network",
+        "translation_failed": "network",
+        # 配置非法
+        "realtime_output_mismatch": "configuration",
+        "realtime_voice_clone_unsupported": "configuration",
+    }
+
+    def test_the_scenario_table_maps_codes_to_services(self) -> None:
+        for code, service in self.SCENARIOS.items():
+            with self.subTest(code=code):
+                self.assertEqual(bridge.error_service_for("translation", code), service)
+
+    def test_scopes_are_the_fallback_for_codes_outside_the_table(self) -> None:
+        for scope, service in [
+            ("audio", "audio"),
+            ("network", "network"),
+            ("configuration", "configuration"),
+            ("system", "system"),
+            ("something-new", "system"),
+        ]:
+            with self.subTest(scope=scope):
+                self.assertEqual(bridge.error_service_for(scope, "brand-new-code"), service)
+
+    def test_translation_failures_are_classified_by_exception(self) -> None:
+        self.assertEqual(
+            bridge.translation_failure_classification(httpx.ConnectTimeout("timed out")),
+            ("translation_timeout", "network"),
+        )
+        self.assertEqual(
+            bridge.translation_failure_classification(httpx.ConnectError("refused")),
+            ("translation_disconnected", "network"),
+        )
+        self.assertEqual(
+            bridge.translation_failure_classification(ConnectionResetError("reset")),
+            ("translation_disconnected", "network"),
+        )
+        self.assertEqual(
+            bridge.translation_failure_classification(RuntimeError("rejected")),
+            ("translation_failed", "network"),
+        )
+
+    def test_audio_startup_timeout_is_tagged_as_an_audio_error(self) -> None:
+        stdout = io.StringIO()
+        server = bridge.BridgeServer(io.StringIO(), stdout)
+        session = _ContractSession("session-tag")
+        with server._session_lock:
+            server._current_session = session
+
+        server.on_audio_startup_timeout(session)
+
+        error = _error_events(stdout)[0]
+        self.assertEqual(error["data"]["scope"], "audio")
+        self.assertEqual(error["data"]["service"], "audio")
+        self.assertEqual(error["data"]["code"], "audio_startup_timeout")
+        self.assertTrue(error["data"]["recoverable"])
+
+    def test_asr_failures_are_tagged_as_network_errors(self) -> None:
+        stdout = io.StringIO()
+        server = bridge.BridgeServer(io.StringIO(), stdout)
+        session = _ContractSession("session-asr")
+        with server._session_lock:
+            server._current_session = session
+
+        server.on_asr_ended(session, "complete")
+
+        error = _error_events(stdout)[0]
+        self.assertEqual(error["data"]["scope"], "asr")
+        self.assertEqual(error["data"]["service"], "network")
+        self.assertEqual(error["data"]["code"], "asr_complete")
+
+    def test_a_lost_audio_device_is_reported_as_audio_health(self) -> None:
+        server = _RecordingServer()
+        _session, channel = _realtime_contract_session(server)
+        recorder = MagicMock()
+        recorder.record = MagicMock(side_effect=RuntimeError("device unplugged"))
+        websocket = MagicMock()
+        websocket.send = AsyncMock()
+
+        _drive_capture(channel, recorder, websocket)
+
+        self.assertEqual(server.errors, [("audio_device_lost", "audio", True)])
+        self.assertEqual(server.statuses[0][:3], ("audio.status", "failed", "listen"))
+        self.assertIn("已断开", server.statuses[0][3])
+        websocket.send.assert_not_awaited()
+
+    def test_a_rejected_credential_uses_the_auth_code_and_is_not_recoverable(self) -> None:
+        server = _RecordingServer()
+        _session, channel = _realtime_contract_session(server)
+
+        channel._handle_event(  # type: ignore[attr-defined]
+            {"type": "error", "error": {"code": "InvalidApiKey", "message": "401 Unauthorized"}},
+            None,
+        )
+
+        self.assertEqual(server.errors, [("auth_failed", "network", False)])
+        self.assertEqual(
+            [status for status, *_rest in server.statuses if status == "network.status"],
+            ["network.status"],
+        )
+
+    def test_a_generic_protocol_rejection_keeps_its_existing_code(self) -> None:
+        server = _RecordingServer()
+        _session, channel = _realtime_contract_session(server)
+
+        channel._handle_event(  # type: ignore[attr-defined]
+            {"type": "error", "error": {"code": "InvalidParameter", "message": "frequency is bad"}},
+            None,
+        )
+
+        self.assertEqual(server.errors, [("realtime_protocol_error", "network", True)])
+
+    def test_a_configuration_rejection_is_tagged_and_not_recoverable(self) -> None:
+        server = _RecordingServer()
+        _session, channel = _realtime_contract_session(server, play_audio=True, voice_mode="clone")
+
+        channel._handle_event(  # type: ignore[attr-defined]
+            {"type": "session.updated", "session": {"output_modalities": ["text", "audio"]}},
+            None,
+        )
+
+        self.assertEqual(server.errors, [("realtime_voice_clone_unsupported", "configuration", False)])
+
+    def test_a_failed_handshake_uses_the_websocket_connect_code(self) -> None:
+        server = _RecordingServer()
+        session, channel = _realtime_contract_session(server)
+        connector = MagicMock()
+        connector.__aenter__ = AsyncMock(side_effect=OSError("connection refused"))
+        connector.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(channel, "_prepare_input", return_value=(MagicMock(), {})), \
+             patch.object(session, "mark_channel_ready"), \
+             patch.object(livetranslate, "_build_connector", return_value=connector):
+            asyncio.run(channel._main())  # type: ignore[attr-defined]
+
+        self.assertEqual(server.errors, [("websocket_connect_failed", "network", True)])
+
+    def test_a_device_that_never_opens_still_reports_the_existing_code(self) -> None:
+        server = _RecordingServer()
+        session, channel = _realtime_contract_session(server)
+
+        with patch.object(channel, "_prepare_input", side_effect=TimeoutError):
+            asyncio.run(channel._main())  # type: ignore[attr-defined]
+
+        self.assertEqual(server.errors, [("audio_startup_timeout", "audio", True)])
+        self.assertEqual(session.runtime.speak_muted(), False)
+
+
+class HealthStatusEventTests(unittest.TestCase):
+    """Contract 4.3: network.status and audio.status are edge driven."""
+
+    def _bridge(self) -> tuple["bridge.BridgeServer", io.StringIO, object]:
+        stdout = io.StringIO()
+        server = bridge.BridgeServer(io.StringIO(), stdout)
+        config = bridge.RuntimeConfig.from_start_params(
+            {
+                "engine": "realtime",
+                "realtime": {"model": "qwen3.8-livetranslate-flash-realtime"},
+                "audio": {"listen": {"enabled": True}, "speak": {"enabled": True}},
+                "secrets": {"realtimeApiKey": REALTIME_SECRET},
+            }
+        )
+        session = bridge.create_session(server, CONTRACT_SESSION_ID, config)
+        with server._session_lock:
+            server._current_session = session
+        return server, stdout, session
+
+    @staticmethod
+    def _events(stdout: io.StringIO, name: str) -> list[dict]:
+        return [
+            payload
+            for payload in (json.loads(line) for line in stdout.getvalue().splitlines())
+            if payload.get("event") == name
+        ]
+
+    def test_audio_status_is_sent_only_when_it_changes(self) -> None:
+        server, stdout, session = self._bridge()
+
+        self.assertTrue(server.emit_session_status(session, "audio.status", "ready", channel="listen"))
+        self.assertFalse(
+            server.emit_session_status(
+                session, "audio.status", "ready", channel="listen", detail="same status, new detail"
+            )
+        )
+        self.assertTrue(
+            server.emit_session_status(
+                session, "audio.status", "failed", channel="listen", detail="音频设备已断开"
+            )
+        )
+
+        events = self._events(stdout, "audio.status")
+        self.assertEqual([event["data"]["status"] for event in events], ["ready", "failed"])
+        self.assertEqual(events[0]["data"]["channel"], "listen")
+        self.assertEqual(events[0]["data"]["detail"], "")
+        self.assertEqual(events[1]["data"]["detail"], "音频设备已断开")
+        self.assertEqual([event["session_id"] for event in events], [CONTRACT_SESSION_ID] * 2)
+
+    def test_network_status_degrades_then_fails_with_its_channels(self) -> None:
+        server, stdout, session = self._bridge()
+
+        session.set_channel_network("listen", "failed", "WebSocket 已断开")
+        self.assertEqual(
+            self._events(stdout, "network.status")[-1]["data"]["status"], "degraded"
+        )
+        session.set_channel_network("speak", "failed", "WebSocket 已断开")
+        self.assertEqual(self._events(stdout, "network.status")[-1]["data"]["status"], "failed")
+
+    def test_network_status_becomes_ready_when_every_channel_connects(self) -> None:
+        server, stdout, session = self._bridge()
+
+        session.set_channel_network("listen", "ready")
+        session.set_channel_network("speak", "ready")
+
+        statuses = [event["data"]["status"] for event in self._events(stdout, "network.status")]
+        self.assertEqual(statuses[-1], "ready")
+        self.assertIn("connecting", statuses)
+
+    def test_status_is_never_emitted_for_a_stopped_session(self) -> None:
+        server, stdout, session = self._bridge()
+        server.handle_request({"id": "stop-1", "command": "stop", "params": {}})
+
+        self.assertFalse(server.emit_session_status(session, "network.status", "failed"))
+        self.assertFalse(
+            server.emit_session_status(session, "audio.status", "failed", channel="listen")
+        )
+        self.assertEqual(self._events(stdout, "network.status"), [])
+        self.assertEqual(self._events(stdout, "audio.status"), [])
+
+    def test_a_secret_in_a_status_detail_is_redacted(self) -> None:
+        server, stdout, session = self._bridge()
+
+        server.emit_session_status(
+            session, "network.status", "failed", detail=f"Authorization failed for {REALTIME_SECRET}"
+        )
+
+        self.assertNotIn(REALTIME_SECRET, stdout.getvalue())
 
 
 if __name__ == "__main__":

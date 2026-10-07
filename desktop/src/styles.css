@@ -2982,3 +2982,655 @@ body {
     padding: 8px;
   }
 }
+
+/* ==========================================================================
+   Runtime state — tray status, runtime channels, mute, shortcut failures
+   Contract: docs/tray-shortcuts-contract.md §3 (status text) and §5 (actions).
+   Every state carries an icon, a text label and a colour; colour alone never
+   carries the meaning.
+   ========================================================================== */
+.runtime-bar {
+  position: sticky;
+  top: -16px;
+  z-index: 6;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: -16px 0 14px;
+  padding: 14px 0 10px;
+  background: #ffffff;
+}
+
+.runtime-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 0 12px;
+  color: var(--text-muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-tile);
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.runtime-pill svg {
+  flex: 0 0 auto;
+}
+
+.runtime-pill--not_started {
+  color: #56677a;
+  border-color: #e2e9f0;
+  background: #f2f5f8;
+}
+
+.runtime-pill--connecting {
+  color: #2b62b0;
+  border-color: #d3e2fb;
+  background: #eef4ff;
+}
+
+.runtime-pill--connecting svg {
+  color: var(--info);
+}
+
+.runtime-pill--translating {
+  color: #08796f;
+  border-color: #bfe9df;
+  background: #e9faf5;
+}
+
+.runtime-pill--translating svg {
+  color: #0f9e86;
+}
+
+/* Audio problems are recoverable warnings; network problems are hard failures. */
+.runtime-pill--audio_error {
+  color: #8a5a10;
+  border-color: #f2ddb4;
+  background: #fff6e6;
+}
+
+.runtime-pill--audio_error svg {
+  color: var(--warn);
+}
+
+.runtime-pill--network_error {
+  color: #a1354e;
+  border-color: #f0ccd3;
+  background: #fff0f3;
+}
+
+.runtime-pill--network_error svg {
+  color: var(--danger);
+}
+
+.runtime-pill--unavailable {
+  color: var(--text-faint);
+  border-style: dashed;
+  background: #f5f8fb;
+}
+
+.runtime-switches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.runtime-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 11px;
+  color: var(--text-muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background 150ms var(--ease),
+    border-color 150ms var(--ease),
+    color 150ms var(--ease);
+}
+
+.runtime-switch em {
+  color: var(--text-faint);
+  font-style: normal;
+  font-weight: 700;
+}
+
+.runtime-switch:hover:not(:disabled) {
+  color: var(--text-strong);
+  border-color: var(--line-strong);
+  background: var(--surface-hover);
+}
+
+.runtime-switch:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.runtime-switch.is-on {
+  color: #08796f;
+  border-color: #bfe9df;
+  background: #e9faf5;
+}
+
+.runtime-switch.is-on em {
+  color: #08796f;
+}
+
+.runtime-switch.is-muted {
+  color: #8a5a10;
+  border-color: #f2ddb4;
+  background: #fff6e6;
+}
+
+.runtime-switch.is-muted em {
+  color: #8a5a10;
+}
+
+.runtime-switch:focus-visible,
+.runtime-notice button:focus-visible,
+.runtime-error button:focus-visible,
+.subtitle-window__button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.runtime-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  color: #8a5a10;
+  border: 1px solid #f2ddb4;
+  border-radius: var(--radius-lg);
+  background: #fff8ec;
+}
+
+.runtime-notice > svg {
+  flex: 0 0 auto;
+  color: var(--warn);
+}
+
+.runtime-notice__copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.runtime-notice__copy strong {
+  color: #7a4d0c;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.runtime-notice__copy span {
+  overflow-wrap: anywhere;
+  color: #8a6a33;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.runtime-notice button {
+  margin-left: auto;
+}
+
+.runtime-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border-radius: var(--radius-lg);
+}
+
+.runtime-error > svg {
+  flex: 0 0 auto;
+}
+
+.runtime-error__copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.runtime-error__copy strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.runtime-error__copy span {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 17px;
+  opacity: 0.86;
+}
+
+.runtime-error__actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-left: auto;
+}
+
+.runtime-error--audio {
+  color: #8a5a10;
+  border: 1px solid #f2ddb4;
+  background: #fff8ec;
+}
+
+.runtime-error--audio .runtime-error__copy strong {
+  color: #7a4d0c;
+}
+
+.runtime-error--network {
+  color: #a1354e;
+  border: 1px solid #f0ccd3;
+  background: #fff3f4;
+}
+
+.runtime-error--network .runtime-error__copy strong {
+  color: #9f3049;
+}
+
+.runtime-error--configuration,
+.runtime-error--system {
+  color: #2b62b0;
+  border: 1px solid #d3e2fb;
+  background: #f2f7ff;
+}
+
+.runtime-error--configuration .runtime-error__copy strong,
+.runtime-error--system .runtime-error__copy strong {
+  color: #2456a0;
+}
+
+/* Degraded = still working, needs attention; never styled like a failure. */
+.runtime-error--warning {
+  border-style: dashed;
+}
+
+.runtime-error--warning .runtime-error__copy strong::after {
+  content: "（降级）";
+  font-weight: 500;
+  opacity: 0.72;
+}
+
+/* ==========================================================================
+   Subtitle overlay window — index.html?window=subtitle
+   Contract: docs/subtitle-window.md §5 (structure) and §6 (styles).
+   The native window is transparent, undecorated and always on top; this
+   stylesheet only paints the card itself.
+   ========================================================================== */
+html.subtitle-root,
+body.subtitle-root,
+html.subtitle-root body,
+html.subtitle-root #root {
+  background: transparent;
+}
+
+html.subtitle-root,
+body.subtitle-root,
+html.subtitle-root body {
+  min-width: 0;
+}
+
+body.subtitle-root {
+  overflow: hidden;
+}
+
+.subtitle-window {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 6px;
+  height: 100%;
+  min-height: 0;
+  padding: 8px 10px 10px;
+  overflow: hidden;
+  color: #e6eef7;
+  border: 1px solid rgba(148, 197, 214, 0.24);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.82);
+  box-shadow: 0 10px 30px rgba(2, 8, 20, 0.32);
+  font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+}
+
+.subtitle-window__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid rgba(148, 197, 214, 0.16);
+  cursor: move;
+  user-select: none;
+}
+
+.subtitle-window__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.subtitle-window__dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--subtitle-dot, #94a3b8);
+  box-shadow: 0 0 8px var(--subtitle-dot-glow, transparent);
+}
+
+.subtitle-window__status--not_started {
+  --subtitle-dot: #94a3b8;
+  color: #cbd5e1;
+}
+
+.subtitle-window__status--connecting {
+  --subtitle-dot: #60a5fa;
+  --subtitle-dot-glow: rgba(96, 165, 250, 0.45);
+  color: #93c5fd;
+}
+
+.subtitle-window__status--translating {
+  --subtitle-dot: #34d399;
+  --subtitle-dot-glow: rgba(52, 211, 153, 0.45);
+  color: #6ee7b7;
+}
+
+.subtitle-window__status--audio_error {
+  --subtitle-dot: #fbbf24;
+  --subtitle-dot-glow: rgba(251, 191, 36, 0.45);
+  color: #fcd34d;
+}
+
+.subtitle-window__status--network_error {
+  --subtitle-dot: #f87171;
+  --subtitle-dot-glow: rgba(248, 113, 113, 0.45);
+  color: #fca5a5;
+}
+
+.subtitle-window__status--unavailable {
+  --subtitle-dot: #64748b;
+  color: #94a3b8;
+}
+
+.subtitle-window__flags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.subtitle-window__flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  color: #cfe3f2;
+  border: 1px solid rgba(148, 197, 214, 0.28);
+  border-radius: 999px;
+  background: rgba(148, 197, 214, 0.12);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.subtitle-window__flag--muted {
+  color: #fcd34d;
+  border-color: rgba(252, 211, 77, 0.4);
+  background: rgba(252, 211, 77, 0.14);
+}
+
+.subtitle-window__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.subtitle-window__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: #9fb6cc;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: rgba(148, 197, 214, 0.1);
+  cursor: pointer;
+}
+
+.subtitle-window__button:hover {
+  color: #f1f7fd;
+  background: rgba(148, 197, 214, 0.22);
+}
+
+.subtitle-window__button[aria-pressed="true"] {
+  color: #7dd3fc;
+}
+
+.subtitle-window__button--close:hover {
+  color: #ffe4e6;
+  background: rgba(248, 113, 113, 0.28);
+}
+
+.subtitle-window__stage {
+  display: grid;
+  align-content: center;
+  gap: 6px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.subtitle-window__source {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: #a9c1d6;
+  font-size: 13px;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.subtitle-window__translation {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: #ffffff;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.subtitle-window__translation.is-placeholder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #8aa2b8;
+  font-weight: 500;
+}
+
+.subtitle-window__history {
+  display: grid;
+  gap: 4px;
+  min-height: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 6px 0 0;
+  border-top: 1px solid rgba(148, 197, 214, 0.16);
+  list-style: none;
+}
+
+.subtitle-window__line {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 8px;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.subtitle-window__line-meta {
+  color: #7f9ab3;
+  white-space: nowrap;
+}
+
+.subtitle-window__line-source {
+  overflow: hidden;
+  color: #a9c1d6;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitle-window__line-translation {
+  grid-column: 2;
+  overflow: hidden;
+  color: #dbeafe;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitle-window__error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 11.5px;
+}
+
+.subtitle-window__error > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.subtitle-window__error strong {
+  font-size: 11.5px;
+}
+
+.subtitle-window__error em {
+  overflow-wrap: anywhere;
+  font-style: normal;
+  opacity: 0.88;
+}
+
+.subtitle-window__error--audio {
+  color: #fcd34d;
+  border: 1px solid rgba(252, 211, 77, 0.32);
+  background: rgba(252, 211, 77, 0.14);
+}
+
+.subtitle-window__error--network {
+  color: #fca5a5;
+  border: 1px solid rgba(248, 113, 113, 0.34);
+  background: rgba(248, 113, 113, 0.16);
+}
+
+.subtitle-window__error--system {
+  color: #93c5fd;
+  border: 1px solid rgba(96, 165, 250, 0.32);
+  background: rgba(96, 165, 250, 0.16);
+}
+
+.subtitle-window__error.is-warning {
+  border-style: dashed;
+  opacity: 0.92;
+}
+
+.subtitle-window__error .subtitle-window__button {
+  margin-left: auto;
+}
+
+.subtitle-window__hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 4px;
+  color: #8aa2b8;
+  font-size: 11px;
+}
+
+/* Browser-demo placeholder: the overlay has no native window to hide. */
+.subtitle-window--hidden .subtitle-window__stage {
+  align-content: center;
+  justify-items: center;
+}
+
+.subtitle-window__restore {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 10px;
+  color: #cfe3f2;
+  border: 1px solid rgba(148, 197, 214, 0.3);
+  border-radius: 999px;
+  background: rgba(148, 197, 214, 0.14);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.subtitle-window__restore:hover {
+  color: #f1f7fd;
+  background: rgba(148, 197, 214, 0.26);
+}
+
+/* Minimum window size is 420x120: keep the stage readable and drop the
+   optional rows instead of overlapping them. */
+@media (max-height: 152px) {
+  .subtitle-window {
+    gap: 4px;
+    padding: 6px 9px 8px;
+  }
+
+  .subtitle-window__bar {
+    padding-bottom: 3px;
+  }
+
+  .subtitle-window__history {
+    display: none;
+  }
+
+  .subtitle-window__source {
+    -webkit-line-clamp: 1;
+  }
+
+  .subtitle-window__translation {
+    -webkit-line-clamp: 2;
+  }
+}
+
+@media (max-width: 470px) {
+  /* Keep the mute badge; the channel badges are the first to give way. */
+  .subtitle-window__flag:not(.subtitle-window__flag--muted) {
+    display: none;
+  }
+}

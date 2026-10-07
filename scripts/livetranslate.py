@@ -50,6 +50,118 @@ CHANNEL_IDS = ("listen", "speak")
 INPUT_KINDS = ("system", "loopback", "microphone")
 VOICE_CLONE_FREQUENCIES = ("never", "once", "always")
 
+# ---------------------------------------------------------------------------
+# Runtime channel control (contract: docs/runtime-channel-control.md).
+#
+# Three states stay strictly apart:
+#   * configuration state - ``ChannelSpec.enabled``, built from settings.json and
+#     never written back by anything in this module;
+#   * runtime channel state - ``RuntimeChannelState``, memory only, one object
+#     per session, reset to the configuration defaults by the next session;
+#   * speak mute - ``RuntimeChannelState``, memory only.
+#
+# The capture loop consults the runtime state before every send, so closing a
+# channel drops frames *before* they reach the engine without touching the
+# recorder, the WebSocket or the sibling channel.
+# ---------------------------------------------------------------------------
+STATUS_CONNECTING = "connecting"
+STATUS_READY = "ready"
+STATUS_DEGRADED = "degraded"
+STATUS_FAILED = "failed"
+STATUS_VALUES = (STATUS_CONNECTING, STATUS_READY, STATUS_DEGRADED, STATUS_FAILED)
+
+SERVICE_AUDIO = "audio"
+SERVICE_NETWORK = "network"
+SERVICE_CONFIGURATION = "configuration"
+SERVICE_SYSTEM = "system"
+ERROR_SERVICES = (SERVICE_AUDIO, SERVICE_NETWORK, SERVICE_CONFIGURATION, SERVICE_SYSTEM)
+
+NETWORK_STATUS_EVENT = "network.status"
+AUDIO_STATUS_EVENT = "audio.status"
+
+# Contract 4.4 codes this module emits for scenarios that had no dedicated code
+# before.  ``tauri_bridge`` owns the JSONL protocol surface and mirrors these
+# literals; ``test_runtime_channels.py`` asserts the two modules never drift.
+ERROR_CODE_AUDIO_DEVICE_LOST = "audio_device_lost"
+ERROR_CODE_WEBSOCKET_CONNECT_FAILED = "websocket_connect_failed"
+ERROR_CODE_AUTH_FAILED = "auth_failed"
+ENGINE_CONTRACT_ERROR_CODES = (
+    ERROR_CODE_AUDIO_DEVICE_LOST,
+    ERROR_CODE_WEBSOCKET_CONNECT_FAILED,
+    ERROR_CODE_AUTH_FAILED,
+)
+
+# Contract 4.4: engine error code -> service, and the recoverable override for
+# the scenarios the table pins down.  Unknown codes stay ``system``/recoverable.
+ERROR_CODE_SERVICES = {
+    "audio_device_missing": SERVICE_AUDIO,
+    "audio_device_failed": SERVICE_AUDIO,
+    "audio_startup_timeout": SERVICE_AUDIO,
+    "audio_start_failed": SERVICE_AUDIO,
+    "audio_device_lost": SERVICE_AUDIO,
+    "audio_playback_failed": SERVICE_AUDIO,
+    "audio_or_asr_failed": SERVICE_AUDIO,
+    "realtime_connect_timeout": SERVICE_NETWORK,
+    "realtime_connection_closed": SERVICE_NETWORK,
+    "realtime_receive_failed": SERVICE_NETWORK,
+    "realtime_send_failed": SERVICE_NETWORK,
+    "realtime_protocol_error": SERVICE_NETWORK,
+    "realtime_configuration_timeout": SERVICE_NETWORK,
+    "realtime_stream_timeout": SERVICE_NETWORK,
+    "websocket_connect_failed": SERVICE_NETWORK,
+    "websocket_reconnecting": SERVICE_NETWORK,
+    "auth_failed": SERVICE_NETWORK,
+    "translation_timeout": SERVICE_NETWORK,
+    "translation_disconnected": SERVICE_NETWORK,
+    "realtime_output_mismatch": SERVICE_CONFIGURATION,
+    "realtime_voice_clone_unsupported": SERVICE_CONFIGURATION,
+}
+ERROR_CODE_RECOVERABLE = {
+    "audio_device_missing": False,
+    "audio_device_failed": False,
+    "audio_start_failed": False,
+    "realtime_output_mismatch": False,
+    "realtime_voice_clone_unsupported": False,
+    "auth_failed": False,
+    "audio_device_lost": True,
+    "websocket_connect_failed": True,
+    "websocket_reconnecting": True,
+    "translation_timeout": True,
+    "translation_disconnected": True,
+}
+
+# Strings that mark a service rejection as an authentication failure rather than
+# a generic protocol error.  DashScope reports the reason inside the payload.
+_AUTH_FAILURE_HINTS = (
+    "401",
+    "403",
+    "unauthorized",
+    "invalidapikey",
+    "invalid_api_key",
+    "invalid api key",
+    "authentication",
+    "apikey",
+    "api key",
+    "鉴权",
+    "认证",
+    "密钥",
+)
+
+
+def error_service(code: str, default: str = SERVICE_SYSTEM) -> str:
+    """Classify one engine error code into contract 4.4's ``service`` field."""
+
+    return ERROR_CODE_SERVICES.get(code, default)
+
+
+def error_recoverable(code: str, default: bool = True) -> bool:
+    return ERROR_CODE_RECOVERABLE.get(code, default)
+
+
+def looks_like_auth_failure(detail: str) -> bool:
+    text = detail.lower()
+    return any(hint in text for hint in _AUTH_FAILURE_HINTS)
+
 # Encodings are fixed by the service: PCM16 mono, 16 kHz up / 24 kHz down.
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
@@ -182,6 +294,180 @@ def parse_channel_specs(
 
 def enabled_channels(specs: tuple[ChannelSpec, ...]) -> tuple[ChannelSpec, ...]:
     return tuple(spec for spec in specs if spec.enabled)
+
+
+class RuntimeChannelState:
+    """Per-session runtime channel switches and the speak-mute flag.
+
+    Configuration state lives in :class:`ChannelSpec`; this object only holds
+    what a shortcut, tray item or toolbar button changed while the session runs.
+    Nothing here is ever written to a settings file, and a new session builds a
+    fresh object, which is exactly how the contract restores the configured
+    defaults on restart.
+    """
+
+    def __init__(self, configured: Any = None) -> None:
+        table = dict(configured) if isinstance(configured, dict) else {}
+        self._lock = threading.Lock()
+        self._configured = {channel: bool(table.get(channel, False)) for channel in CHANNEL_IDS}
+        # Runtime defaults equal the configuration, so a rebuilt session needs no
+        # explicit reset step: it simply starts from the configured values again.
+        self._enabled = dict(self._configured)
+        self._speak_muted = False
+
+    # --------------------------------------------------------- audio hot path
+    def should_capture(self, channel: str) -> bool:
+        """Whether this channel's frames may be forwarded to the engine.
+
+        Deliberately lock free: it is called once per captured frame from the
+        audio path, where the contract forbids blocking work.  Reading a ``bool``
+        out of a dict that only ever receives whole-value assignments is atomic
+        under the GIL, and the worst case is one extra frame in flight while a
+        switch flips.
+        """
+
+        if not self._enabled.get(channel, False):
+            return False
+        if channel == "speak" and self._speak_muted:
+            return False
+        return True
+
+    # -------------------------------------------------------------- queries
+    def configured(self, channel: str) -> bool:
+        """Configuration state: whether settings.json enabled this channel."""
+
+        return bool(self._configured.get(channel, False))
+
+    def effective_enabled(self, channel: str) -> bool:
+        """Runtime state that is actually in force (configuration wins)."""
+
+        with self._lock:
+            return self._effective(channel)
+
+    def speak_muted(self) -> bool:
+        with self._lock:
+            return self._speak_muted
+
+    # ------------------------------------------------------------- mutators
+    def set_channel(self, channel: str, enabled: bool) -> bool:
+        """Apply one runtime switch, returning whether the effective value moved."""
+
+        with self._lock:
+            before = self._effective(channel)
+            self._enabled[channel] = bool(enabled)
+            return self._effective(channel) != before
+
+    def set_speak_muted(self, muted: bool) -> bool:
+        with self._lock:
+            before = self._speak_muted
+            self._speak_muted = bool(muted)
+            return self._speak_muted != before
+
+    def _effective(self, channel: str) -> bool:
+        # A channel the settings disabled can never be switched on at runtime;
+        # the command layer rejects that case with ``channel_not_configured``.
+        return bool(self._enabled.get(channel, False)) and self.configured(channel)
+
+
+class HealthStatusTracker:
+    """Remembers the last published health status per event/channel pair.
+
+    Contract 4.3 allows ``network.status`` and ``audio.status`` to be sent only
+    when the status actually changes, so every publisher asks this object first.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: dict[tuple[str, str], str] = {}
+
+    def changed(self, event: str, status: str, channel: str = "") -> bool:
+        with self._lock:
+            key = (event, channel or "")
+            if self._last.get(key) == status:
+                return False
+            self._last[key] = status
+            return True
+
+    def current(self, event: str, channel: str = "") -> str | None:
+        with self._lock:
+            return self._last.get((event, channel or ""))
+
+
+def channel_audio_enabled(session: Any, channel: str) -> bool:
+    """Runtime gate the capture loop consults before sending one frame.
+
+    Duck-typed sessions without a runtime state keep the pre-existing behaviour
+    of always forwarding audio, which is what the lighter test doubles rely on.
+    """
+
+    runtime = getattr(session, "runtime", None)
+    if runtime is None:
+        return True
+    return bool(runtime.should_capture(channel))
+
+
+def report_status(
+    server: Any,
+    session: Any,
+    event: str,
+    status: str,
+    *,
+    channel: str = "",
+    detail: str = "",
+) -> None:
+    """Publish one health status, tolerating servers without health reporting."""
+
+    reporter = getattr(server, "emit_session_status", None)
+    if reporter is None:
+        return
+    reporter(session, event, status, channel=channel, detail=detail)
+
+
+def report_channel_network(session: Any, channel: str, status: str, detail: str = "") -> None:
+    """Record one channel's connection health on the session that aggregates it."""
+
+    recorder = getattr(session, "set_channel_network", None)
+    if recorder is None:
+        return
+    recorder(channel, status, detail)
+
+
+def report_error(
+    server: Any,
+    session: Any,
+    *,
+    scope: str,
+    code: str,
+    message: str,
+    recoverable: bool = True,
+    service: str | None = None,
+) -> None:
+    """Report an engine error with its contract 4.4 service classification.
+
+    The ``TypeError`` fallback keeps embedding test servers that still implement
+    the pre-4.4 signature working, mirroring ``RealtimeSession._emit_session_event``.
+    """
+
+    resolved = service or error_service(code)
+    try:
+        server.emit_session_error(
+            session,
+            scope=scope,
+            code=code,
+            message=message,
+            recoverable=recoverable,
+            service=resolved,
+        )
+    except TypeError as error:
+        if "service" not in str(error):
+            raise
+        server.emit_session_error(
+            session,
+            scope=scope,
+            code=code,
+            message=message,
+            recoverable=recoverable,
+        )
 
 
 def list_audio_devices() -> dict[str, Any]:
@@ -344,6 +630,9 @@ class LiveTranslateChannel(threading.Thread):
         self._source_deltas: dict[str, str] = {}
         self._translation_deltas: dict[str, str] = {}
         self._completed_responses: dict[str, None] = {}
+        # Frames the runtime switch discarded before they reached the engine.
+        # Diagnostics only; the audio thread owns the increment.
+        self._dropped_frames = 0
 
     # ------------------------------------------------------------------ thread
 
@@ -377,11 +666,15 @@ class LiveTranslateChannel(threading.Thread):
 
     async def _main(self) -> None:
         self._loop = asyncio.get_running_loop()
+        channel = self._spec.channel
         pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"livetranslate-capture-{self._spec.channel}"
         )
         recorder = None
         stage = "audio"
+        report_status(
+            self._server, self._session, AUDIO_STATUS_EVENT, STATUS_CONNECTING, channel=channel
+        )
         try:
             device = await asyncio.wait_for(
                 self._loop.run_in_executor(pool, self._prepare_input),
@@ -394,6 +687,11 @@ class LiveTranslateChannel(threading.Thread):
                 return
             recorder, device_info = device
             self._session.mark_channel_ready(self._spec.channel)
+            # The device is open, so the audio link itself is healthy from here on
+            # even if the WebSocket handshake later fails.
+            report_status(
+                self._server, self._session, AUDIO_STATUS_EVENT, STATUS_READY, channel=channel
+            )
             self._server.on_realtime_channel(self._session, self._spec.channel, "connecting", device=device_info)
             stage = "connect"
             ws_url = f"{self._base_url}?model={self._model}"
@@ -405,6 +703,7 @@ class LiveTranslateChannel(threading.Thread):
                     await asyncio.wait_for(self._configuration_ready.wait(), CONNECT_TIMEOUT_S)
                     if self._failed or self._session.stop_event.is_set():
                         return
+                    report_channel_network(self._session, channel, STATUS_READY)
                     if self._spec.play_audio:
                         self._player = _PcmPlayer(self._spec.output_device, self._spec.channel, self._on_playback_error)
                         self._player.start()
@@ -429,6 +728,15 @@ class LiveTranslateChannel(threading.Thread):
         except Exception as exc:
             if stage == "audio":
                 self._report_failure("audio_device_failed", f"{self._spec.label}通道音频设备打开失败：{exc}")
+            elif stage == "connect":
+                # The handshake itself failed (refused, TLS, 4xx upgrade).  The
+                # generic ``realtime_channel_failed`` catch-all stays in place for
+                # every other unexpected error; this scenario now carries the code
+                # contract 4.4 names explicitly.
+                self._report_failure(
+                    ERROR_CODE_WEBSOCKET_CONNECT_FAILED,
+                    f"{self._spec.label}通道连接同传接口失败：{exc}",
+                )
             else:
                 raise
         finally:
@@ -507,12 +815,32 @@ class LiveTranslateChannel(threading.Thread):
     async def _capture_loop(self, websocket: Any, pool: ThreadPoolExecutor, recorder: Any) -> None:
         import numpy as np
 
+        channel = self._spec.channel
         loop = asyncio.get_running_loop()
         counter = 0
         while not self._session.stop_event.is_set() and not self._failed:
-            audio = await loop.run_in_executor(pool, recorder.record, FRAME_SAMPLES)
+            try:
+                audio = await loop.run_in_executor(pool, recorder.record, FRAME_SAMPLES)
+            except Exception as exc:  # noqa: BLE001 - the device itself failed
+                # A recorder that raises mid-stream is an unplugged or reconfigured
+                # device, not a protocol problem, so _report_failure publishes it as
+                # audio health with contract 4.4's dedicated code.
+                if not self._session.stop_event.is_set():
+                    self._report_failure(
+                        ERROR_CODE_AUDIO_DEVICE_LOST,
+                        f"{self._spec.label}通道音频设备已断开：{exc}",
+                    )
+                return
             if self._session.stop_event.is_set():
                 break
+            if not channel_audio_enabled(self._session, channel):
+                # Runtime channel switch (contract section 6).  The frame is
+                # dropped here, before it is encoded or sent: the recorder keeps
+                # draining the device, the realtime connection stays open and the
+                # sibling channel keeps streaming.  Re-enabling resumes on the
+                # next frame without rebuilding anything.
+                self._dropped_frames += 1
+                continue
             frames = np.asarray(audio, dtype="float32")
             mono = frames if frames.ndim == 1 else frames.mean(axis=1)
             pcm = np.clip(mono, -1.0, 1.0)
@@ -675,6 +1003,15 @@ class LiveTranslateChannel(threading.Thread):
 
     def _handle_protocol_error(self, event: dict[str, Any], websocket: Any) -> None:
         detail = _event_error_message(event)
+        if looks_like_auth_failure(detail):
+            # Contract 4.4 names this scenario separately because it is not
+            # recoverable: retrying with the same credential cannot succeed.
+            self._report_failure(
+                ERROR_CODE_AUTH_FAILED,
+                f"{self._spec.label}通道服务端鉴权失败：{detail}",
+                recoverable=False,
+            )
+            return
         self._report_failure("realtime_protocol_error", f"{self._spec.label}通道被模型拒绝：{detail}")
 
     @staticmethod
@@ -751,18 +1088,29 @@ class LiveTranslateChannel(threading.Thread):
 
     # ------------------------------------------------------------------ errors
 
-    def _report_failure(self, code: str, message: str) -> None:
+    def _report_failure(self, code: str, message: str, *, recoverable: bool | None = None) -> None:
         if self._failed:
             return
         self._failed = True
         self._configuration_ready.set()
-        self._server.on_realtime_channel(self._session, self._spec.channel, "failed", detail=message)
-        self._server.emit_session_error(
+        channel = self._spec.channel
+        self._server.on_realtime_channel(self._session, channel, "failed", detail=message)
+        if error_service(code) == SERVICE_AUDIO:
+            report_status(
+                self._server, self._session, AUDIO_STATUS_EVENT, STATUS_FAILED,
+                channel=channel, detail=message,
+            )
+        # Session-level network health is aggregated by the session, so a channel
+        # that dies while its sibling still streams degrades instead of failing.
+        report_channel_network(self._session, channel, STATUS_FAILED, message)
+        report_error(
+            self._server,
             self._session,
             scope="audio" if code.startswith("audio_") else "translation",
             code=code,
             message=message,
-            recoverable=True,
+            recoverable=error_recoverable(code) if recoverable is None else recoverable,
+            service=error_service(code),
         )
 
 
@@ -850,6 +1198,14 @@ class RealtimeSession:
         self.state = "starting"
         self.specs = specs
         self.startup_timeout_s = startup_timeout_s
+        # Runtime switches for exactly this session.  Rebuilding the session
+        # builds a new object, which restores the configured defaults and
+        # ``speak_muted = False`` without any explicit reset (contract section 1).
+        self.runtime = RuntimeChannelState({spec.channel: spec.enabled for spec in specs})
+        self.status_tracker = HealthStatusTracker()
+        self._channel_network: dict[str, tuple[str, str]] = {
+            spec.channel: (STATUS_CONNECTING, "") for spec in specs
+        }
         self._lock = threading.Lock()
         self._audio_ready = False
         self._audio_startup_settled = threading.Event()
@@ -902,6 +1258,39 @@ class RealtimeSession:
 
     def mark_audio_startup_settled(self) -> None:
         self._audio_startup_settled.set()
+
+    # ---------------------------------------------------------- network health
+
+    def set_channel_network(self, channel: str, status: str, detail: str = "") -> None:
+        """Record one channel's connection health and publish the session view.
+
+        ``network.status`` is session scoped (contract 4.3), so the per-channel
+        states are aggregated: one dead channel next to a live one is
+        ``degraded``, every channel dead is ``failed``.
+        """
+
+        with self._lock:
+            self._channel_network[channel] = (status, detail)
+            aggregate, aggregate_detail = self._aggregate_network()
+        report_status(self.server, self, NETWORK_STATUS_EVENT, aggregate, detail=aggregate_detail)
+
+    def _aggregate_network(self) -> tuple[str, str]:
+        """Combine per-channel states; the caller holds ``self._lock``."""
+
+        states = list(self._channel_network.values())
+        if not states:
+            return STATUS_CONNECTING, ""
+        failed = [state for state in states if state[0] == STATUS_FAILED]
+        if failed and len(failed) == len(states):
+            return STATUS_FAILED, failed[0][1]
+        if failed:
+            return STATUS_DEGRADED, failed[0][1]
+        degraded = [state for state in states if state[0] == STATUS_DEGRADED]
+        if degraded:
+            return STATUS_DEGRADED, degraded[0][1]
+        if any(state[0] == STATUS_CONNECTING for state in states):
+            return STATUS_CONNECTING, ""
+        return STATUS_READY, ""
 
     def on_channel_exit(self, channel: str) -> None:
         """Retire the session once every channel has stopped.
