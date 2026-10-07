@@ -74,14 +74,53 @@ npm run desktop:dev
 
 也可从项目根目录运行 `scripts/run-tauri.ps1`。开发模式由 Rust 主进程启动 `scripts/tauri_bridge.py`；实时客户端使用 `websockets`，已包含在项目依赖和打包配置中。
 
-## 打包
+## 安装与打包
+
+只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_x64-setup.exe`，不需要编译源码。
+
+### 程序由两部分组成，缺一不可
+
+| 组成 | 来源 | 发行版中的位置 |
+| --- | --- | --- |
+| Tauri 主程序 | Rust，前端产物内嵌其中 | `simultaneous-translator.exe` |
+| Python 翻译引擎 | PyInstaller 打包 `scripts/tauri_bridge.py` | `translator-bridge.exe`，必须与主程序同目录 |
+
+**引擎不是仓库里的文件。** `desktop/src-tauri/binaries/*.exe` 已被 `.gitignore` 排除，`build.rs` 也只调用 `tauri_build::build()`。因此 `cargo build`、`npx tauri build`、`npm run build` 都不会生成它。跳过这一步直接打包，程序能启动，但一开始同传就报“已打包的翻译引擎缺失。请重新安装应用。”，设置里的音频设备列表同样读不出来（设备枚举也要启动引擎）。
+
+### 正确顺序（在项目根目录执行）
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install.ps1   # 1. 建 .venv，安装 requirements.txt
 cd desktop
-npm run desktop:build
+npm install                                                    # 2. 安装前端依赖与 Tauri CLI
+npm run desktop:build                                          # 3. 先生成 sidecar，再构建前端，最后 tauri build
 ```
 
-构建先生成 Python sidecar，再生成 Windows NSIS 安装程序，输出位于 `desktop/src-tauri/target/release/bundle/nsis`。
+`npm run desktop:build` 内部依次执行 `scripts/build-tauri-sidecar.ps1`（PyInstaller 6.22.2）与 `npx tauri build`；`tauri.conf.json` 的 `beforeBuildCommand` 负责前端 `npm run build`。请始终从这个命令入手，不要单独运行 `npx tauri build` 或 `cargo build`。
+
+产物：
+
+| 路径 | 用途 |
+| --- | --- |
+| `desktop/src-tauri/binaries/translator-bridge-x86_64-pc-windows-msvc.exe` | 打包用的中间产物，`externalBin` 会把它复制为安装目录下的 `translator-bridge.exe`，不要单独分发 |
+| `desktop/src-tauri/target/release/bundle/nsis/同传翻译_<版本>_x64-setup.exe` | 可安装、可分发的安装包 |
+
+改动 `scripts/*.py`（翻译引擎）之后必须重新运行 `npm run desktop:build`，否则安装包里的引擎仍是旧版本。
+
+### 常见错误
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 程序能打开，但开始同传、或在设置里读取音频设备时报“已打包的翻译引擎缺失。请重新安装应用。” | 发行版要求 `translator-bridge.exe` 与主程序同目录；直接运行 `target/release` 下的 exe，或只复制主程序，都会缺 | 使用 `npm run desktop:build` 产出的 NSIS 安装包；手工做免安装版时把 `simultaneous-translator.exe` 与 `translator-bridge.exe` 放在同一目录 |
+| 开发模式报“未找到开发用 Python 引擎。请先运行 scripts\install.ps1。” | 缺 `.venv` 或 `scripts/tauri_bridge.py` | 先执行 `scripts\install.ps1` |
+| `tauri build` 报找不到 external binary `translator-bridge-x86_64-pc-windows-msvc.exe` | 跳过了 sidecar 生成步骤 | 改用 `npm run desktop:build` |
+| sidecar 生成成功，但启动后立刻退出并提示缺少 `dashscope`、`soundcard` 或 `websockets` | `.venv` 依赖不完整 | 重跑 `scripts\install.ps1` |
+
+### 运行环境
+
+- Windows 11 x64；进程级系统声音采集要求 Windows build 20348 及以上。
+- WebView2 运行时，Windows 11 已内置。
+- 从源码构建另需：Node.js 22.12 或更高版本、Rust stable MSVC 工具链，以及本机可用的 `python`（`scripts/install.ps1` 用它创建 `.venv`）。
 
 ## 测试
 
