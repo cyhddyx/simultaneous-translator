@@ -30,8 +30,6 @@ import {
   type TranslatorEvent,
 } from "./types";
 
-const HISTORY_LIMIT = 3;
-
 /**
  * Subtitle overlay body (window label `subtitle`, docs/subtitle-window.md §5).
  *
@@ -141,7 +139,7 @@ export default function SubtitleWindow() {
     };
   }, [applyRuntimeEvent]);
 
-  const view = selectSubtitleView(snapshot, HISTORY_LIMIT);
+  const view = selectSubtitleView(snapshot);
   const size = snapshot.settings.subtitleSize;
   const trayStatus = runtime?.trayStatus ?? null;
   const statusText = trayStatus ? trayStatusLabel(trayStatus) : "状态不可用";
@@ -316,29 +314,6 @@ export default function SubtitleWindow() {
           )}
         </p>
       </section>
-
-      {view.lines.length > 0 && (
-        <ol className="subtitle-window__history" aria-label="最近字幕">
-          {view.lines.map((line) => (
-            <li key={line.id} className="subtitle-window__line">
-              <span className="subtitle-window__line-meta">
-                {line.channel === "speak"
-                  ? "我说"
-                  : line.channel === "listen"
-                    ? "对方"
-                    : "字幕"}
-                {line.pending && ` · ${line.statusLabel}`}
-              </span>
-              <span className="subtitle-window__line-source">
-                {line.sourceText}
-              </span>
-              <span className="subtitle-window__line-translation">
-                {line.translationText || line.statusLabel}
-              </span>
-            </li>
-          ))}
-        </ol>
-      )}
 
       {errorRows.map((row) => (
         <div

@@ -34,17 +34,15 @@ use serde_json::{json, Value};
 use tauri::{
     image::Image,
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    tray::{TrayIcon, TrayIconBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
 };
-use tauri_plugin_global_shortcut::{
-    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState,
-};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 use uuid::Uuid;
 
 use crate::{
     active_session_blocking, cleanup_engine, load_public_settings, request_engine_blocking,
-    start_translation_blocking, stop_translation_blocking, EngineManager,
+    start_translation_blocking, stop_translation_blocking, EngineManager, ShortcutSettings,
 };
 
 /// 运行时状态广播事件名（契约第 6 节，`app.emit` 广播到所有窗口）。
@@ -608,48 +606,26 @@ fn reduce_runtime_response(
 // 纯逻辑：全局快捷键表与去抖
 // --------------------------------------------------------------------------- //
 
-/// 一条全局快捷键绑定（契约第 8 节）。
-struct ShortcutBinding {
-    accelerator: &'static str,
-    action: RuntimeAction,
-    modifiers: Modifiers,
-    code: Code,
-}
-
-/// 契约第 8 节的五个快捷键。顺序与契约表格一致。
-fn shortcut_bindings() -> [ShortcutBinding; 5] {
-    let modifiers = Modifiers::CONTROL | Modifiers::SHIFT;
+/// Five configurable global shortcuts in stable action order.
+fn shortcut_bindings(settings: &ShortcutSettings) -> [(&str, RuntimeAction); 5] {
     [
-        ShortcutBinding {
-            accelerator: "Ctrl+Shift+Space",
-            action: RuntimeAction::StartOrStopSession,
-            modifiers,
-            code: Code::Space,
-        },
-        ShortcutBinding {
-            accelerator: "Ctrl+Shift+M",
-            action: RuntimeAction::ToggleSpeakMute,
-            modifiers,
-            code: Code::KeyM,
-        },
-        ShortcutBinding {
-            accelerator: "Ctrl+Shift+O",
-            action: RuntimeAction::ToggleSubtitleWindow,
-            modifiers,
-            code: Code::KeyO,
-        },
-        ShortcutBinding {
-            accelerator: "Ctrl+Shift+L",
-            action: RuntimeAction::ToggleListenChannel,
-            modifiers,
-            code: Code::KeyL,
-        },
-        ShortcutBinding {
-            accelerator: "Ctrl+Shift+S",
-            action: RuntimeAction::ToggleSpeakChannel,
-            modifiers,
-            code: Code::KeyS,
-        },
+        (
+            &settings.start_or_stop_session,
+            RuntimeAction::StartOrStopSession,
+        ),
+        (&settings.toggle_speak_mute, RuntimeAction::ToggleSpeakMute),
+        (
+            &settings.toggle_subtitle_window,
+            RuntimeAction::ToggleSubtitleWindow,
+        ),
+        (
+            &settings.toggle_listen_channel,
+            RuntimeAction::ToggleListenChannel,
+        ),
+        (
+            &settings.toggle_speak_channel,
+            RuntimeAction::ToggleSpeakChannel,
+        ),
     ]
 }
 
@@ -717,6 +693,8 @@ pub struct RuntimeHub {
     session_gate: Arc<Mutex<()>>,
     /// 每个 action 的 `last_fired`，250ms 内的重复触发被吞掉。
     debounce: Arc<Mutex<HashMap<RuntimeAction, Instant>>>,
+    /// Actions for the hotkeys that are currently registered with the OS.
+    shortcut_actions: Arc<Mutex<HashMap<u32, RuntimeAction>>>,
     tray: Arc<Mutex<Option<TrayHandle>>>,
 }
 
@@ -727,6 +705,7 @@ impl Default for RuntimeHub {
             quitting: Arc::new(AtomicBool::new(false)),
             session_gate: Arc::new(Mutex::new(())),
             debounce: Arc::new(Mutex::new(HashMap::new())),
+            shortcut_actions: Arc::new(Mutex::new(HashMap::new())),
             tray: Arc::new(Mutex::new(None)),
         }
     }
@@ -907,9 +886,25 @@ pub(crate) fn init(app: &AppHandle) -> Result<(), String> {
 
     let tray = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
+        .show_menu_on_left_click(false)
         .icon(icon)
         .tooltip(format!("{TRAY_TOOLTIP_PREFIX} · {status_label}"))
         .on_menu_event(|app, event| on_tray_menu_event(app, event))
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                let app = tray.app_handle().clone();
+                thread::spawn(move || {
+                    let _ = dispatch_action(&app, RuntimeAction::ShowMainWindow);
+                });
+            }
+        })
         .build(app)
         .map_err(|error| format!("无法创建系统托盘：{error}"))?;
 
@@ -928,20 +923,38 @@ pub(crate) fn init(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 逐个注册五个全局快捷键：单项失败不影响其他项，失败项写入 `shortcutFailures`。
-pub(crate) fn register_global_shortcuts(app: &AppHandle) {
+/// Replaces the registered shortcuts; one unavailable shortcut does not block the others.
+pub(crate) fn register_global_shortcuts(app: &AppHandle, settings: &ShortcutSettings) {
     let hub = hub(app);
+    lock_or_recover(&hub.shortcut_actions).clear();
+    let _ = app.global_shortcut().unregister_all();
+
     let mut failures = Vec::new();
-    for binding in shortcut_bindings() {
-        let shortcut = Shortcut::new(Some(binding.modifiers), binding.code);
-        if let Err(error) = app.global_shortcut().register(shortcut) {
-            failures.push(ShortcutFailure {
-                accelerator: binding.accelerator.to_string(),
-                action: binding.action,
+    let mut actions = HashMap::new();
+    for (accelerator, action) in shortcut_bindings(settings) {
+        let shortcut: Shortcut = match accelerator.parse() {
+            Ok(shortcut) => shortcut,
+            Err(error) => {
+                failures.push(ShortcutFailure {
+                    accelerator: accelerator.to_string(),
+                    action,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        match app.global_shortcut().register(shortcut) {
+            Ok(()) => {
+                actions.insert(shortcut.id(), action);
+            }
+            Err(error) => failures.push(ShortcutFailure {
+                accelerator: accelerator.to_string(),
+                action,
                 reason: error.to_string(),
-            });
+            }),
         }
     }
+    *lock_or_recover(&hub.shortcut_actions) = actions;
     hub.update(app, |state| {
         state.shortcut_failures = failures;
     });
@@ -953,14 +966,12 @@ pub(crate) fn on_global_shortcut(app: &AppHandle, shortcut: &Shortcut, event: Sh
         return;
     }
     let id = shortcut.id();
-    let Some(binding) = shortcut_bindings()
-        .into_iter()
-        .find(|binding| Shortcut::new(Some(binding.modifiers), binding.code).id() == id)
-    else {
+    let runtime = hub(app);
+    let action = lock_or_recover(&runtime.shortcut_actions).get(&id).copied();
+    let Some(action) = action else {
         return;
     };
     let app = app.clone();
-    let action = binding.action;
     // 回调本身必须立刻返回：动作执行（可能启动/停止会话）放到后台线程。
     thread::spawn(move || {
         let _ = dispatch_action(&app, action);
@@ -1817,12 +1828,10 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_table_matches_the_frozen_accelerators() {
-        let bindings = shortcut_bindings();
-        let table: Vec<(&str, RuntimeAction)> = bindings
-            .iter()
-            .map(|binding| (binding.accelerator, binding.action))
-            .collect();
+    fn default_shortcut_table_matches_the_action_order() {
+        let settings = ShortcutSettings::default();
+        let bindings = shortcut_bindings(&settings);
+        let table: Vec<(&str, RuntimeAction)> = bindings.to_vec();
         assert_eq!(
             table,
             vec![
@@ -1834,20 +1843,30 @@ mod tests {
             ]
         );
 
-        // 每个绑定都必须解析出唯一 hotkey id，否则按下时无法映射回动作。
+        // Each configured accelerator must resolve to a unique id for dispatch.
         let ids: Vec<u32> = bindings
             .iter()
-            .map(|binding| Shortcut::new(Some(binding.modifiers), binding.code).id())
+            .map(|(accelerator, _)| {
+                accelerator
+                    .parse::<Shortcut>()
+                    .expect("default accelerator must parse")
+                    .id()
+            })
             .collect();
         let mut unique = ids.clone();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), ids.len());
+    }
 
-        for binding in &bindings {
-            assert!(binding.modifiers.contains(Modifiers::CONTROL));
-            assert!(binding.modifiers.contains(Modifiers::SHIFT));
-        }
+    #[test]
+    fn shortcut_action_mapping_uses_saved_accelerators() {
+        let mut settings = ShortcutSettings::default();
+        settings.toggle_subtitle_window = "Alt+F8".into();
+        assert_eq!(
+            shortcut_bindings(&settings)[2],
+            ("Alt+F8", RuntimeAction::ToggleSubtitleWindow)
+        );
     }
 
     #[test]

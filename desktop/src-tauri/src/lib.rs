@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
 use url::Url;
 use uuid::Uuid;
 
@@ -46,7 +47,7 @@ const KEYRING_SERVICE: &str = "SimultaneousTranslatorProduction";
 const SETTINGS_FILE: &str = "settings.json";
 #[cfg(not(debug_assertions))]
 const SETTINGS_FILE: &str = "settings.production.json";
-const SETTINGS_SCHEMA_VERSION: u32 = 8;
+const SETTINGS_SCHEMA_VERSION: u32 = 9;
 const SECRET_ENVELOPE_VERSION: u32 = 2;
 const LEGACY_SECRET_ENVELOPE_VERSION: u32 = 1;
 const DEFAULT_TRANSLATION_PROVIDER_ID: &str = "gemini-default";
@@ -222,6 +223,28 @@ impl Default for AudioSettings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+struct ShortcutSettings {
+    start_or_stop_session: String,
+    toggle_speak_mute: String,
+    toggle_subtitle_window: String,
+    toggle_listen_channel: String,
+    toggle_speak_channel: String,
+}
+
+impl Default for ShortcutSettings {
+    fn default() -> Self {
+        Self {
+            start_or_stop_session: "Ctrl+Shift+Space".into(),
+            toggle_speak_mute: "Ctrl+Shift+M".into(),
+            toggle_subtitle_window: "Ctrl+Shift+O".into(),
+            toggle_listen_channel: "Ctrl+Shift+L".into(),
+            toggle_speak_channel: "Ctrl+Shift+S".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PublicSettings {
@@ -241,6 +264,8 @@ struct PublicSettings {
     realtime: RealtimeSettings,
     #[serde(default)]
     audio: AudioSettings,
+    #[serde(default)]
+    shortcuts: ShortcutSettings,
 }
 
 fn default_engine() -> String {
@@ -261,6 +286,7 @@ impl Default for PublicSettings {
             engine: default_engine(),
             realtime: RealtimeSettings::default(),
             audio: AudioSettings::default(),
+            shortcuts: ShortcutSettings::default(),
         }
     }
 }
@@ -300,6 +326,7 @@ impl From<LegacyPublicSettings> for PublicSettings {
             engine: default_engine(),
             realtime: RealtimeSettings::default(),
             audio: AudioSettings::default(),
+            shortcuts: ShortcutSettings::default(),
         }
     }
 }
@@ -388,6 +415,8 @@ struct SettingsInput {
     realtime: Option<RealtimeInput>,
     #[serde(default)]
     audio: Option<AudioSettingsInput>,
+    #[serde(default)]
+    shortcuts: Option<ShortcutSettings>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +551,7 @@ struct SettingsSnapshot {
     active_translation_provider_id: String,
     keep_on_top: bool,
     caption_scale: String,
+    shortcuts: ShortcutSettings,
 }
 
 #[derive(Serialize)]
@@ -687,7 +717,7 @@ fn decode_public_settings_versioned(
                 .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?;
             PublicSettings::from(legacy)
         }
-        2 | 3 | 4 | 5 | 6 | 7 | 8 => serde_json::from_value::<PublicSettings>(value)
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 => serde_json::from_value::<PublicSettings>(value)
             .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?,
         version => return Err(SettingsDecodeError::UnsupportedVersion(version)),
     };
@@ -952,6 +982,7 @@ fn normalize_public_settings(settings: PublicSettings) -> Result<PublicSettings,
     let engine = normalize_engine(&settings.engine)?;
     let realtime = normalize_realtime(settings.realtime)?;
     let audio = normalize_audio_settings(settings.audio, &target_language)?;
+    let shortcuts = normalize_shortcut_settings(settings.shortcuts)?;
     if engine == ENGINE_REALTIME && !audio.listen.enabled && !audio.speak.enabled {
         return Err("实时同传至少需要启用一个翻译通道".into());
     }
@@ -968,7 +999,39 @@ fn normalize_public_settings(settings: PublicSettings) -> Result<PublicSettings,
         engine,
         realtime,
         audio,
+        shortcuts,
     })
+}
+
+fn normalize_shortcut_settings(mut settings: ShortcutSettings) -> Result<ShortcutSettings, String> {
+    let mut ids = HashSet::new();
+    let bindings = [
+        ("开始 / 停止同传", &mut settings.start_or_stop_session),
+        ("静音发言", &mut settings.toggle_speak_mute),
+        ("字幕悬浮窗", &mut settings.toggle_subtitle_window),
+        ("收听通道", &mut settings.toggle_listen_channel),
+        ("发言通道", &mut settings.toggle_speak_channel),
+    ];
+    for (label, accelerator) in bindings {
+        let value = accelerator.trim();
+        if value.is_empty() || value.len() > 128 {
+            return Err(format!("{label}快捷键不能为空且不能过长"));
+        }
+        let shortcut: Shortcut = value
+            .parse()
+            .map_err(|error| format!("{label}快捷键无效：{error}"))?;
+        if !shortcut
+            .mods
+            .intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER)
+        {
+            return Err(format!("{label}快捷键请至少包含 Ctrl、Alt 或 Win"));
+        }
+        if !ids.insert(shortcut.id()) {
+            return Err(format!("快捷键“{value}”已分配给其他操作"));
+        }
+        *accelerator = value.to_string();
+    }
+    Ok(settings)
 }
 
 fn normalize_settings(input: &SettingsInput) -> Result<PublicSettings, String> {
@@ -1021,6 +1084,7 @@ fn normalize_settings(input: &SettingsInput) -> Result<PublicSettings, String> {
                 speak: channel_from_input(audio.speak.clone()),
             })
             .unwrap_or_default(),
+        shortcuts: input.shortcuts.clone().unwrap_or_default(),
     })
 }
 
@@ -1663,6 +1727,7 @@ fn snapshot_from_settings(settings: PublicSettings) -> SettingsSnapshot {
         active_translation_provider_id: settings.active_translation_provider_id,
         keep_on_top: settings.keep_on_top,
         caption_scale: settings.caption_scale,
+        shortcuts: settings.shortcuts,
     }
 }
 
@@ -2511,6 +2576,7 @@ fn save_settings_blocking(
     }
 
     commit_settings_and_secrets(app, &normalized, &planned_secrets)?;
+    tray::register_global_shortcuts(app, &normalized.shortcuts);
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_always_on_top(normalized.keep_on_top);
@@ -2740,10 +2806,16 @@ pub fn run() {
             if let Err(error) = tray::init(&handle) {
                 eprintln!("system tray unavailable: {error}");
             }
-            tray::register_global_shortcuts(&handle);
-            if let Ok(settings) = load_public_settings(&handle) {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_always_on_top(settings.keep_on_top);
+            match load_public_settings(&handle) {
+                Ok(settings) => {
+                    tray::register_global_shortcuts(&handle, &settings.shortcuts);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.set_always_on_top(settings.keep_on_top);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("settings unavailable during startup: {error}");
+                    tray::register_global_shortcuts(&handle, &ShortcutSettings::default());
                 }
             }
             Ok(())
@@ -2880,6 +2952,48 @@ mod tests {
         assert_eq!(provider.models, vec!["custom-gemini-model"]);
         assert!(migrated.keep_on_top);
         assert_eq!(migrated.caption_scale, "large");
+    }
+
+    #[test]
+    fn schema_eight_settings_receive_default_shortcuts() {
+        let mut value = serde_json::to_value(PublicSettings::default())
+            .expect("default settings should serialize");
+        value["schemaVersion"] = json!(8);
+        value
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .remove("shortcuts");
+
+        let (settings, source_version) = decode_public_settings_versioned(
+            &serde_json::to_string(&value).expect("schema 8 fixture should serialize"),
+        )
+        .expect("schema 8 settings should remain readable");
+
+        assert_eq!(source_version, 8);
+        assert_eq!(settings.shortcuts, ShortcutSettings::default());
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn custom_shortcuts_are_normalized_and_duplicates_are_rejected() {
+        let mut settings = ShortcutSettings::default();
+        settings.toggle_subtitle_window = "  Alt+F8  ".into();
+        let normalized = normalize_shortcut_settings(settings)
+            .expect("a valid custom shortcut should be accepted");
+        assert_eq!(normalized.toggle_subtitle_window, "Alt+F8");
+
+        let mut duplicate = ShortcutSettings::default();
+        duplicate.toggle_speak_mute = duplicate.start_or_stop_session.clone();
+        assert!(normalize_shortcut_settings(duplicate)
+            .expect_err("duplicate shortcuts should be rejected")
+            .contains("已分配给其他操作"));
+
+        assert!(normalize_shortcut_settings(ShortcutSettings {
+            start_or_stop_session: "Space".into(),
+            ..ShortcutSettings::default()
+        })
+        .expect_err("a shortcut without a control modifier should be rejected")
+        .contains("Ctrl、Alt 或 Win"));
     }
 
     #[test]
@@ -3194,6 +3308,7 @@ mod tests {
                 listen: channel_input(audio.listen),
                 speak: channel_input(audio.speak),
             }),
+            shortcuts: None,
         }
     }
 

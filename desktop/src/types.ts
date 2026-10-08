@@ -161,6 +161,15 @@ export interface PublicSettings {
   activeTranslationProviderId: string;
   alwaysOnTop: boolean;
   subtitleSize: "small" | "medium" | "large";
+  shortcuts: ShortcutSettings;
+}
+
+export interface ShortcutSettings {
+  startOrStopSession: string;
+  toggleSpeakMute: string;
+  toggleSubtitleWindow: string;
+  toggleListenChannel: string;
+  toggleSpeakChannel: string;
 }
 
 export interface RecognitionServiceDraft extends Omit<
@@ -306,6 +315,13 @@ export const DEFAULT_SETTINGS: PublicSettings = {
   activeTranslationProviderId: "gemini-default",
   alwaysOnTop: false,
   subtitleSize: "medium",
+  shortcuts: {
+    startOrStopSession: "Ctrl+Shift+Space",
+    toggleSpeakMute: "Ctrl+Shift+M",
+    toggleSubtitleWindow: "Ctrl+Shift+O",
+    toggleListenChannel: "Ctrl+Shift+L",
+    toggleSpeakChannel: "Ctrl+Shift+S",
+  },
 };
 
 export function cloneAudioChannel(
@@ -319,6 +335,7 @@ export function cloneSettings(settings: PublicSettings): PublicSettings {
     ...settings,
     recognition: { ...settings.recognition },
     realtime: { ...settings.realtime },
+    shortcuts: { ...settings.shortcuts },
     audio: {
       listen: cloneAudioChannel(settings.audio.listen),
       speak: cloneAudioChannel(settings.audio.speak),

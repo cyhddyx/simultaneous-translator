@@ -210,7 +210,7 @@ export function AmbientVisualizer({
       // 3. Floating Notes and Sparkles
       // -------------------------------------------------------------
       notes.forEach((n) => {
-        if (!reducedMotion) {
+        if (active && !reducedMotion) {
           n.y -= n.speedY * (active ? 1.6 : 1);
           n.x += Math.sin(time * 1.5 + n.y * 10) * n.speedX;
           n.rot += n.rotSpeed;
@@ -756,7 +756,15 @@ export function AmbientVisualizer({
     };
 
     const schedule = () => {
-      if (disposed || reducedMotion || animFrame !== 0) return;
+      // The inactive mascot is a still frame. Do not keep a render loop alive
+      // after the native runtime reports that the session has stopped.
+      if (
+        disposed ||
+        reducedMotion ||
+        !stateRef.current.active ||
+        animFrame !== 0
+      )
+        return;
       animFrame = window.requestAnimationFrame(tick);
     };
 

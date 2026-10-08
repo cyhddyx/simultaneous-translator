@@ -4,10 +4,12 @@ import {
   Eye,
   EyeOff,
   Headphones,
+  Keyboard,
   KeyRound,
   Mic,
   Radio,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   SlidersHorizontal,
   Trash2,
@@ -25,11 +27,12 @@ import {
   type ChannelId,
   type PublicSettings,
   type SecretStatus,
+  type ShortcutSettings,
   type SettingsDraft,
   type SettingsValidation,
 } from "./types";
 
-type SettingsSection = "general" | "audio" | "services" | "privacy";
+type SettingsSection = "general" | "audio" | "shortcuts" | "services" | "privacy";
 interface SettingsDialogProps {
   settings: PublicSettings;
   onClose: () => void;
@@ -51,9 +54,43 @@ const sectionLabels: Array<{
 }> = [
   { id: "general", label: "常规", icon: SlidersHorizontal },
   { id: "audio", label: "音频", icon: Volume2 },
+  { id: "shortcuts", label: "快捷键", icon: Keyboard },
   { id: "services", label: "同传模型", icon: Radio },
   { id: "privacy", label: "隐私与安全", icon: ShieldCheck },
 ];
+const SHORTCUT_ACTIONS: Array<{
+  id: keyof ShortcutSettings;
+  label: string;
+}> = [
+  { id: "startOrStopSession", label: "开始 / 停止同传" },
+  { id: "toggleSpeakMute", label: "静音 / 取消静音发言" },
+  { id: "toggleSubtitleWindow", label: "显示 / 隐藏字幕悬浮窗" },
+  { id: "toggleListenChannel", label: "开启 / 关闭收听通道" },
+  { id: "toggleSpeakChannel", label: "开启 / 关闭发言通道" },
+];
+
+function shortcutKeyFromCode(code: string): string | null {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  if (/^Numpad(?:[0-9]|Add|Decimal|Divide|Enter|Equal|Multiply|Subtract)$/.test(code))
+    return code;
+  const punctuation = new Set([
+    "Backquote", "Backslash", "BracketLeft", "BracketRight", "Comma", "Equal",
+    "Minus", "Period", "Quote", "Semicolon", "Slash",
+  ]);
+  if (punctuation.has(code)) return code;
+  const supported = new Set([
+    "Space", "Enter", "Tab", "Escape", "Backspace", "Delete", "End", "Home",
+    "Insert", "PageDown", "PageUp", "PrintScreen", "ScrollLock", "ArrowDown",
+    "ArrowLeft", "ArrowRight", "ArrowUp",
+  ]);
+  return supported.has(code) ? code : null;
+}
+
+function displayShortcut(value: string): string {
+  return value.replace(/\bSuper\b/g, "Win");
+}
 
 // Preserve legacy fields only for settings-file compatibility; no legacy model is used.
 const toDraft = (settings: PublicSettings): SettingsDraft => ({
@@ -83,6 +120,7 @@ const toDraft = (settings: PublicSettings): SettingsDraft => ({
     listen: { ...settings.audio.listen },
     speak: { ...settings.audio.speak },
   },
+  shortcuts: { ...settings.shortcuts },
 });
 function fingerprint(draft: SettingsDraft) {
   return JSON.stringify({
@@ -466,6 +504,7 @@ export function SettingsDialog({
 }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>("general");
   const [draft, setDraft] = useState(() => toDraft(settings));
+  const [recordingShortcut, setRecordingShortcut] = useState<keyof ShortcutSettings | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -588,11 +627,13 @@ export function SettingsDialog({
         setFieldErrors(validation.fieldErrors);
         const first = Object.keys(validation.fieldErrors)[0] ?? "";
         setSection(
-          first.startsWith("realtime")
-            ? "services"
-            : first.startsWith("audio")
-              ? "audio"
-              : "general",
+          first.startsWith("shortcuts.")
+            ? "shortcuts"
+            : first.startsWith("realtime")
+              ? "services"
+              : first.startsWith("audio")
+                ? "audio"
+                : "general",
         );
         return;
       }
@@ -662,7 +703,10 @@ export function SettingsDialog({
                 type="button"
                 className={`settings-nav__item ${section === id ? "is-active" : ""}`}
                 aria-current={section === id ? "page" : undefined}
-                onClick={() => setSection(id)}
+                onClick={() => {
+                  setSection(id);
+                  setRecordingShortcut(null);
+                }}
               >
                 <Icon size={16} />
                 {label}
@@ -765,6 +809,93 @@ export function SettingsDialog({
                     setDraft((current) => ({ ...current, alwaysOnTop }))
                   }
                 />
+              </section>
+            )}
+            {section === "shortcuts" && (
+              <section className="settings-section">
+                <div className="settings-section__heading">
+                  <Keyboard size={18} />
+                  <div>
+                    <h3>全局快捷键</h3>
+                    <p>点击按键框后录制组合键；组合键需要包含 Ctrl、Alt 或 Win。</p>
+                  </div>
+                </div>
+                <div className="shortcut-list">
+                  {SHORTCUT_ACTIONS.map(({ id, label }) => {
+                    const field = `shortcuts.${id}`;
+                    const recording = recordingShortcut === id;
+                    return (
+                      <div className="shortcut-row" key={id}>
+                        <span className="shortcut-row__label">{label}</span>
+                        <button
+                          className={`shortcut-recorder${recording ? " is-recording" : ""}`}
+                          type="button"
+                          aria-label={`${label}快捷键`}
+                          aria-pressed={recording}
+                          title={recording ? "按 Esc 取消录制" : "点击录制快捷键"}
+                          onClick={() => {
+                            setRecordingShortcut(id);
+                            setFieldErrors({});
+                          }}
+                          onKeyDown={(event) => {
+                            if (!recording) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            if (event.code === "Escape") {
+                              setRecordingShortcut(null);
+                              return;
+                            }
+                            const key = shortcutKeyFromCode(event.code);
+                            if (!key) return;
+                            const modifiers = [
+                              event.ctrlKey ? "Ctrl" : "",
+                              event.altKey ? "Alt" : "",
+                              event.shiftKey ? "Shift" : "",
+                              event.metaKey ? "Super" : "",
+                            ].filter(Boolean);
+                            if (!modifiers.some((modifier) => modifier !== "Shift")) {
+                              setFieldErrors({
+                                [field]: "请至少按住 Ctrl、Alt 或 Win。",
+                              });
+                              return;
+                            }
+                            setDraft((current) => ({
+                              ...current,
+                              shortcuts: {
+                                ...current.shortcuts,
+                                [id]: [...modifiers, key].join("+"),
+                              },
+                            }));
+                            setFieldErrors({});
+                            setRecordingShortcut(null);
+                          }}
+                        >
+                          {recording ? "请按组合键…" : displayShortcut(draft.shortcuts[id])}
+                        </button>
+                        {fieldErrors[field] && (
+                          <span className="field-error" role="alert">
+                            {fieldErrors[field]}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  className="button button--secondary shortcut-reset"
+                  type="button"
+                  onClick={() => {
+                    setDraft((current) => ({
+                      ...current,
+                      shortcuts: { ...DEFAULT_SETTINGS.shortcuts },
+                    }));
+                    setRecordingShortcut(null);
+                    setFieldErrors({});
+                  }}
+                >
+                  <RotateCcw size={15} />
+                  恢复默认快捷键
+                </button>
               </section>
             )}
             {section === "audio" && (

@@ -621,7 +621,7 @@ export default function App() {
             </div>
           </header>
           <AmbientVisualizer
-            active={session.phase === "listening"}
+            active={phase === "listening"}
             strength={session.partialTranscript ? 0.9 : 0.36}
           />
           <div className="ambient-footer">
@@ -916,7 +916,7 @@ export default function App() {
                 </div>
                 <div className="waveform-wrap">
                   <WaveformCanvas
-                    active={session.phase === "listening"}
+                    active={phase === "listening"}
                     strength={session.partialTranscript ? 0.9 : 0.36}
                   />
                 </div>
@@ -932,7 +932,7 @@ export default function App() {
                 <div className="partial-line__body">
                   <p>
                     {session.partialTranscript ||
-                      (session.phase === "listening"
+                      (phase === "listening"
                         ? "正在聆听…"
                         : "等待会话开始")}
                   </p>

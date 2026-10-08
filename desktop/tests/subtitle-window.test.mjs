@@ -53,11 +53,10 @@ test("a fresh subtitle window renders the waiting state", () => {
   assert.equal(view.source, "");
   assert.equal(view.translation, "");
   assert.equal(view.current, null);
-  assert.deepEqual(view.lines, []);
   assert.deepEqual(SUBTITLE_FONT_PX, { small: 15, medium: 19, large: 24 });
 });
 
-test("live lines and the three newest captions come from the shared reducer", () => {
+test("the overlay exposes only the newest caption from the shared reducer", () => {
   let snapshot = createInitialSnapshot();
   snapshot = applyTranslatorEvent(
     snapshot,
@@ -83,19 +82,8 @@ test("live lines and the three newest captions come from the shared reducer", ()
   assert.equal(view.sessionId, "s1");
   assert.equal(view.source, "Hello everyone");
   assert.equal(view.translation, "各位好");
-  assert.deepEqual(
-    view.lines.map((line) => line.id),
-    ["c4", "c3", "c2"],
-  );
-  assert.equal(view.lines[0].channel, "speak");
-  assert.equal(view.lines[0].translationText, "译文 4");
-  assert.equal(view.lines[0].pending, false);
   assert.equal(view.current.id, "c4");
   assert.equal(view.current.sourceText, "source 4");
-
-  // The limit is a parameter, and the live caption stays the newest one.
-  assert.equal(selectSubtitleView(snapshot, 1).lines.length, 1);
-  assert.deepEqual(selectSubtitleView(snapshot, 0).lines, []);
 });
 
 test("an in-flight caption is marked as pending, not as translated", () => {
@@ -121,7 +109,56 @@ test("an in-flight caption is marked as pending, not as translated", () => {
   assert.equal(view.current.pending, true);
   assert.equal(view.current.translationText, "");
   assert.equal(view.current.statusLabel, "正在翻译");
-  assert.equal(view.lines[0].pending, true);
+});
+
+test("captions from an earlier session never become the overlay's current line", () => {
+  let snapshot = createInitialSnapshot();
+  snapshot = applyTranslatorEvent(
+    snapshot,
+    sessionEvent(1, "old-session", { phase: "starting", sessionId: "old-session" }),
+  );
+  snapshot = applyTranslatorEvent(
+    snapshot,
+    captionEvent(2, "old-session", caption(1, "listen", "旧译文")),
+  );
+  snapshot = applyTranslatorEvent(
+    snapshot,
+    sessionEvent(3, "old-session", {
+      phase: "idle",
+      sessionId: null,
+      partialTranscript: "",
+      partialTranslation: "",
+    }),
+  );
+  snapshot = applyTranslatorEvent(
+    snapshot,
+    sessionEvent(4, "new-session", { phase: "starting", sessionId: "new-session" }),
+  );
+  snapshot = applyTranslatorEvent(
+    snapshot,
+    captionEvent(5, "new-session", {
+      ...caption(1, "listen", "新译文"),
+      id: "new-caption",
+      sessionId: "new-session",
+      sourceText: "new source",
+    }),
+  );
+
+  const view = selectSubtitleView(snapshot);
+  assert.equal(view.current.id, "new-caption");
+  assert.equal(view.current.sourceText, "new source");
+  assert.equal(view.current.translationText, "新译文");
+});
+
+test("an active phase without a session id cannot fall back to persisted history", () => {
+  const snapshot = createInitialSnapshot();
+  snapshot.captions = [caption(1, "listen", "旧译文")];
+  snapshot.session.phase = "starting";
+  snapshot.session.sessionId = null;
+
+  const view = selectSubtitleView(snapshot);
+  assert.equal(view.active, true);
+  assert.equal(view.current, null);
 });
 
 test("stale revisions and other sessions never reach the overlay", () => {

@@ -1218,6 +1218,58 @@ button:disabled {
   line-height: 18px;
 }
 
+.shortcut-list {
+  display: grid;
+}
+
+.shortcut-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px 14px;
+  min-width: 0;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line-faint);
+}
+
+.shortcut-row__label {
+  min-width: 0;
+  color: var(--text-body);
+  font-size: 13px;
+  line-height: 19px;
+}
+
+.shortcut-recorder {
+  min-width: 178px;
+  min-height: 36px;
+  padding: 0 12px;
+  color: var(--text-strong);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  text-align: center;
+}
+
+.shortcut-recorder:hover,
+.shortcut-recorder.is-recording {
+  border-color: var(--accent-line);
+  background: var(--accent-tint);
+}
+
+.shortcut-recorder.is-recording {
+  color: var(--text-strong);
+}
+
+.shortcut-row .field-error {
+  grid-column: 1 / -1;
+}
+
+.shortcut-reset {
+  margin-top: 16px;
+}
+
 .service-tabs {
   display: inline-grid;
   grid-template-columns: repeat(3, minmax(112px, 1fr));
@@ -2034,7 +2086,7 @@ select:focus {
 
   .settings-nav {
     grid-auto-flow: column;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(76px, 1fr));
     padding: 8px;
     overflow-x: auto;
     border-bottom: 1px solid var(--line-faint);
@@ -2952,7 +3004,7 @@ body {
     padding: 12px;
   }
   .settings-nav {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(76px, 1fr));
   }
   .settings-nav__item {
     min-width: 0;
@@ -3476,45 +3528,6 @@ body.subtitle-root {
   font-weight: 500;
 }
 
-.subtitle-window__history {
-  display: grid;
-  gap: 4px;
-  min-height: 0;
-  overflow: hidden;
-  margin: 0;
-  padding: 6px 0 0;
-  border-top: 1px solid rgba(148, 197, 214, 0.16);
-  list-style: none;
-}
-
-.subtitle-window__line {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 2px 8px;
-  font-size: 11.5px;
-  line-height: 1.35;
-}
-
-.subtitle-window__line-meta {
-  color: #7f9ab3;
-  white-space: nowrap;
-}
-
-.subtitle-window__line-source {
-  overflow: hidden;
-  color: #a9c1d6;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.subtitle-window__line-translation {
-  grid-column: 2;
-  overflow: hidden;
-  color: #dbeafe;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .subtitle-window__error {
   display: flex;
   align-items: center;
@@ -3603,8 +3616,7 @@ body.subtitle-root {
   background: rgba(148, 197, 214, 0.26);
 }
 
-/* Minimum window size is 420x120: keep the stage readable and drop the
-   optional rows instead of overlapping them. */
+/* Minimum window size is 420x120: keep the stage readable without overlap. */
 @media (max-height: 152px) {
   .subtitle-window {
     gap: 4px;
@@ -3613,10 +3625,6 @@ body.subtitle-root {
 
   .subtitle-window__bar {
     padding-bottom: 3px;
-  }
-
-  .subtitle-window__history {
-    display: none;
   }
 
   .subtitle-window__source {

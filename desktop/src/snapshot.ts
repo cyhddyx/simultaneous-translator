@@ -217,10 +217,10 @@ export function applyTranslatorEvent(
   return { ...snapshot, revision, settings: event.data.payload };
 }
 
-/** Captions of the live session, or the whole history when none is live. */
+/** Captions belonging to the currently attached session only. */
 export function sessionCaptions(snapshot: AppSnapshot): CaptionSegment[] {
   const sessionId = snapshot.session.sessionId;
-  if (!sessionId) return snapshot.captions;
+  if (!sessionId) return [];
   return snapshot.captions.filter((caption) => caption.sessionId === sessionId);
 }
 
@@ -229,8 +229,16 @@ export function latestSessionCaption(
 ): CaptionSegment | null {
   return sessionCaptions(snapshot).reduce<CaptionSegment | null>(
     (latest, caption) =>
-      !latest || caption.createdAt > latest.createdAt ? caption : latest,
+      !latest || compareCaptions(caption, latest) > 0 ? caption : latest,
     null,
+  );
+}
+
+function compareCaptions(left: CaptionSegment, right: CaptionSegment): number {
+  return (
+    left.createdAt.localeCompare(right.createdAt) ||
+    left.sequence - right.sequence ||
+    left.id.localeCompare(right.id)
   );
 }
 
@@ -253,9 +261,8 @@ export interface SubtitleView {
   source: string;
   /** Live (partial) translation line. */
   translation: string;
+  /** The newest completed or in-flight caption in the active session. */
   current: SubtitleLine | null;
-  /** Most recent captions, newest first, capped at `historyLimit`. */
-  lines: SubtitleLine[];
 }
 
 export function toSubtitleLine(caption: CaptionSegment): SubtitleLine {
@@ -272,16 +279,13 @@ export function toSubtitleLine(caption: CaptionSegment): SubtitleLine {
 }
 
 /**
- * Single selector for the subtitle overlay: the live lines plus the newest
- * captions of the current session (docs/subtitle-window.md §5).
+ * Single selector for the subtitle overlay. The overlay is intentionally
+ * single-sentence: it exposes the live line and the newest caption only, so
+ * persisted captions or earlier turns cannot become visible subtitle rows.
  */
-export function selectSubtitleView(
-  snapshot: AppSnapshot,
-  historyLimit = 3,
-): SubtitleView {
+export function selectSubtitleView(snapshot: AppSnapshot): SubtitleView {
   const session = snapshot.session;
   const active = isSessionActive(session.phase);
-  const scoped = sessionCaptions(snapshot);
   const current = active ? latestSessionCaption(snapshot) : null;
   return {
     sessionId: session.sessionId,
@@ -289,9 +293,5 @@ export function selectSubtitleView(
     source: session.partialTranscript,
     translation: session.partialTranslation,
     current: current ? toSubtitleLine(current) : null,
-    lines:
-      historyLimit > 0
-        ? scoped.slice(-historyLimit).reverse().map(toSubtitleLine)
-        : [],
   };
 }

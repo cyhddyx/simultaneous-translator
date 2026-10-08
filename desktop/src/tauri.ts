@@ -27,6 +27,7 @@ import {
   type RealtimeServiceSettings,
   type RuntimeAction,
   type RuntimeState,
+  type ShortcutSettings,
   type SettingsDraft,
   type SettingsValidation,
   type TranslationProviderDraft,
@@ -331,6 +332,7 @@ class MockTranslator {
       activeTranslationProviderId: draft.activeTranslationProviderId,
       alwaysOnTop: draft.alwaysOnTop,
       subtitleSize: draft.subtitleSize,
+      shortcuts: { ...draft.shortcuts },
     };
     this.bump();
     this.emit(
@@ -497,7 +499,74 @@ function validateDraft(draft: SettingsDraft): SettingsValidation {
   if (!draft.targetLanguage.trim())
     fieldErrors.targetLanguage = "请选择目标语言。";
 
+  const shortcutGroups = new Map<string, string[]>();
+  const shortcutFields: Array<[keyof ShortcutSettings, string]> = [
+    ["startOrStopSession", "shortcuts.startOrStopSession"],
+    ["toggleSpeakMute", "shortcuts.toggleSpeakMute"],
+    ["toggleSubtitleWindow", "shortcuts.toggleSubtitleWindow"],
+    ["toggleListenChannel", "shortcuts.toggleListenChannel"],
+    ["toggleSpeakChannel", "shortcuts.toggleSpeakChannel"],
+  ];
+  for (const [id, field] of shortcutFields) {
+    const identity = shortcutIdentity(draft.shortcuts[id]);
+    if (!identity) {
+      fieldErrors[field] = "请使用 Ctrl、Alt 或 Win 与一个按键组成快捷键。";
+      continue;
+    }
+    const fields = shortcutGroups.get(identity) ?? [];
+    fields.push(field);
+    shortcutGroups.set(identity, fields);
+  }
+  for (const fields of shortcutGroups.values()) {
+    if (fields.length > 1) {
+      fields.forEach((field) => {
+        fieldErrors[field] = "此快捷键已分配给其他操作。";
+      });
+    }
+  }
+
   return { valid: Object.keys(fieldErrors).length === 0, fieldErrors };
+}
+
+function shortcutIdentity(value: string): string | null {
+  const tokens = value.split("+").map((token) => token.trim());
+  if (tokens.length < 2 || tokens.some((token) => !token)) return null;
+
+  const modifierAliases: Record<string, string> = {
+    ctrl: "Ctrl",
+    control: "Ctrl",
+    alt: "Alt",
+    option: "Alt",
+    shift: "Shift",
+    super: "Super",
+    win: "Super",
+    windows: "Super",
+    meta: "Super",
+    command: "Super",
+    cmd: "Super",
+  };
+  const modifiers = tokens.slice(0, -1).map((token) =>
+    modifierAliases[token.toLowerCase()],
+  );
+  if (
+    modifiers.some((modifier) => !modifier) ||
+    new Set(modifiers).size !== modifiers.length ||
+    !modifiers.some((modifier) => modifier === "Ctrl" || modifier === "Alt" || modifier === "Super")
+  ) {
+    return null;
+  }
+
+  let key = tokens.at(-1)!.toUpperCase();
+  if (/^KEY[A-Z]$/.test(key)) key = key.slice(3);
+  if (/^DIGIT[0-9]$/.test(key)) key = key.slice(5);
+  const supportedKey =
+    /^[A-Z0-9]$/.test(key) ||
+    /^F(?:[1-9]|1[0-9]|2[0-4])$/.test(key) ||
+    /^(BACKQUOTE|BACKSLASH|BRACKETLEFT|BRACKETRIGHT|COMMA|EQUAL|MINUS|PERIOD|QUOTE|SEMICOLON|SLASH)$/.test(key) ||
+    /^(SPACE|ENTER|TAB|ESCAPE|BACKSPACE|DELETE|END|HOME|INSERT|PAGEDOWN|PAGEUP|PRINTSCREEN|SCROLLLOCK|ARROWDOWN|ARROWLEFT|ARROWRIGHT|ARROWUP|NUMPAD(?:[0-9]|ADD|DECIMAL|DIVIDE|ENTER|EQUAL|MULTIPLY|SUBTRACT))$/.test(key);
+  if (!supportedKey) return null;
+
+  return `${[...modifiers].sort().join("+")}|${key}`;
 }
 
 function emitTauri<T>(
@@ -543,6 +612,7 @@ interface BackendSettingsSnapshot {
   activeTranslationProviderId: string;
   keepOnTop: boolean;
   captionScale: "small" | "medium" | "large";
+  shortcuts: ShortcutSettings;
 }
 
 export interface ProviderModelsResult {
@@ -684,6 +754,7 @@ function toPublicSettings(raw: BackendSettingsSnapshot): PublicSettings {
     activeTranslationProviderId: raw.activeTranslationProviderId,
     alwaysOnTop: raw.keepOnTop,
     subtitleSize,
+    shortcuts: { ...raw.shortcuts },
   };
 }
 
@@ -749,6 +820,7 @@ function toBackendSettings(draft: SettingsDraft) {
     activeTranslationProviderId: draft.activeTranslationProviderId,
     keepOnTop: draft.alwaysOnTop,
     captionScale: draft.subtitleSize,
+    shortcuts: { ...draft.shortcuts },
   };
 }
 
