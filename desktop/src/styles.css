@@ -1433,11 +1433,14 @@ button:disabled {
   background: rgba(240, 180, 41, 0.08);
 }
 
-.audio-test-result--error,
-.audio-test-result--error strong {
+.audio-test-result--error {
   color: var(--danger);
   border-color: rgba(196, 80, 96, 0.24);
   background: rgba(196, 80, 96, 0.07);
+}
+
+.audio-test-result--error strong {
+  color: var(--danger);
 }
 
 .audio-test-result__heading,

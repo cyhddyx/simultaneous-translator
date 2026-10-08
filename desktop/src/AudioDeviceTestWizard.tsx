@@ -191,7 +191,6 @@ export function AudioDeviceTestWizard({
                 key={optionKind}
                 className={`audio-test-option${kind === optionKind ? " is-selected" : ""}`}
                 type="button"
-                role="listitem"
                 aria-pressed={kind === optionKind}
                 disabled={running}
                 onClick={() => selectKind(optionKind)}
