@@ -80,18 +80,18 @@ SubtitleWindow
 ├── 拖拽条（data-tauri-drag-region，显示状态点 + 运行状态文案 + 固定/关闭按钮）
 ├── 当前原文（partialTranscript）
 ├── 当前译文（partialTranslation，突出显示）
-├── 最近字幕（最多 3 条，倒序，含原文/译文/通道标签）
 └── 错误提示（audio / network 区分文案，可关闭）
 ```
 
 要求：
 
 - **只显示字幕**：不出现设置入口、主控制栏、历史管理、会话控制按钮。
+- 字幕窗口只显示当前会话的实时句子；历史会话和之前已完成的句子不在悬浮窗重复展示。
 - 背景透明/半透明（默认 `rgba(15, 23, 42, 0.82)`），文字必须带足够对比度。
 - 拖拽区使用 `data-tauri-drag-region`（依赖 capability `core:window:allow-start-dragging`）。
 - 静音或通道关闭时用**图标 + 文字**体现，不允许只靠颜色。
 - `subtitleSize` 映射：`small → 15px / medium → 19px / large → 24px`（译文行）。
-- 小尺寸（420×120）下不得出现元素重叠；必要时隐藏历史条与拖拽条副标题。
+- 小尺寸（420×120）下不得出现元素重叠；必要时隐藏拖拽条副标题。
 - 无边框窗口需要可拖拽 + 可缩放；缩放依赖 `core:window:allow-start-resize-dragging`。
 
 ---

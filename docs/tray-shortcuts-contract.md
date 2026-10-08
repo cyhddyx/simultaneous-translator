@@ -1,8 +1,8 @@
 # 托盘 / 全局快捷键 / 运行时状态契约（接口冻结 v1）
 
-> 状态：**已冻结**。本文件由 Agent 0（技术负责人）维护。
+> 状态：**已冻结 v2**。本文件由 Agent 0（技术负责人）维护。
 > 任何跨模块字段变更必须先改本文件，再通知 Rust / Python / 前端 / QA 四个执行方。
-> 冻结日期：2026-10-07。
+> 冻结日期：2026-10-08。
 
 ---
 
@@ -213,7 +213,7 @@ fn dispatch_action(app: &AppHandle, action: RuntimeAction) -> Result<RuntimeStat
 
 ## 8. 全局快捷键
 
-| 快捷键 | action | 说明 |
+| 出厂默认快捷键（可在设置页修改） | action | 说明 |
 |---|---|---|
 | `Ctrl+Shift+Space` | `start_or_stop_session` | 开始 / 停止同传 |
 | `Ctrl+Shift+M` | `toggle_speak_mute` | 临时静音 / 取消静音发言通道 |
@@ -231,13 +231,15 @@ fn dispatch_action(app: &AppHandle, action: RuntimeAction) -> Result<RuntimeStat
 5. 快捷键回调**只做一件事**：调用 `dispatch_action`。不在回调里写业务逻辑。
 6. 主窗口隐藏、最小化、失焦时快捷键必须仍然生效（全局快捷键天然满足，需人工验证）。
 7. 应用退出前 `unregister_all`；`quit_application` 路径必须成对注销。
-8. 快捷键文本常量（用于 UI 展示与失败提示）：`Ctrl+Shift+Space`、`Ctrl+Shift+M`、`Ctrl+Shift+O`、`Ctrl+Shift+L`、`Ctrl+Shift+S`。
+8. 出厂默认值为上表组合键；用户可在“设置 → 快捷键”录制组合键。设置写入 schema 9，保存后原生层注销旧绑定并重新注册；重启后从设置文件恢复。
+9. 组合键至少包含 Ctrl、Alt 或 Win，并且不能与其他动作重复。解析或注册失败时不得让其他动作的快捷键失效。
 
 ---
 
 ## 9. 系统托盘
 
 - 托盘 id：`main-tray`；tooltip：`同传翻译 · <状态文案>`。
+- 左键单击显示、还原并聚焦主窗口；右键单击打开托盘菜单。
 - 图标：复用既有 `icons/32x32.png`（`include_bytes!`），**不新增打包资源**。
   五种状态通过 tooltip + 菜单首项文本 + 菜单勾选体现（计划允许此简化，避免图标资源缺失风险）。
 - 菜单 item id（稳定，不得随意改名）：
@@ -296,9 +298,8 @@ fn dispatch_action(app: &AppHandle, action: RuntimeAction) -> Result<RuntimeStat
 
 - 既有 `default.json`（`windows: ["main"]`）保持不变，仅在其权限内按需补充
   `core:window:allow-hide` / `core:window:allow-show` **仅当**前端真的调用；否则不加。
-- **刻意决策（偏离原计划，已批准）**：**不**把 `global-shortcut:*` 权限授予任何 WebView。
-  五个快捷键全部在 Rust 侧注册，前端无注册能力，避免 WebView 劫持/注销快捷键。
-  若后续确需前端管理快捷键，必须回到本文件重新评审。
+- **刻意决策**：不把 `global-shortcut:*` 权限授予任何 WebView。
+  设置页可以录制并通过既有 `save_settings` 命令保存组合键，但按键捕获、解析、注销和注册全部由 Rust 原生层管理。
 
 ---
 
