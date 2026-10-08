@@ -52,6 +52,20 @@ VB-CABLE 是 VB-Audio 的 Donationware（捐赠软件），专业或组织使用
 
 默认收听来源为“系统声音（排除本软件）”：使用 Windows 进程回环接口，采集其他应用在所有播放设备上的声音，并排除翻译引擎进程及其子进程的输出，双方译音都不会被本机再次送入模型。该功能需要 Windows build 20348 及以上版本（包含 Windows 11），无需附加驱动。采集组件不支持或启动失败时明确报错，不回退到会回采的设备模式。原来的“指定播放设备（回环采集）”仍可选，但禁止与任一译文输出使用同一设备。其他软件转播的回声及扬声器传入实体麦克风的声音不属于进程排除范围。
 
+## 音频设备测试向导
+
+“设置 → 音频”提供独立的设备测试向导，用来在开始同传前确认播放、麦克风和回环链路是否可用。测试全部在本机完成：不调用翻译模型、不需要 API Key、不保存录音，也不修改已保存的音频设置或 Windows 默认设备。
+
+| 测试 | 使用的设备 | 判定依据 |
+| --- | --- | --- |
+| 播放测试音 | 选定的播放设备 | 播放约 1 秒 440 Hz 测试音，播放过程无错误即为成功 |
+| 麦克风测试 | 选定的麦克风 | 以 16 kHz 单声道录制约 3 秒，只在内存中计算峰值与均方根，达到阈值才算检测到信号 |
+| 回环测试 | 选定播放设备对应的 WASAPI loopback | 边播测试音边录约 1 秒，检测到超过阈值的信号才算成功 |
+
+设备列表复用“设置 → 音频”已有的枚举结果，默认选中系统默认设备；回环输入由选定扬声器自动映射。同一时刻只允许运行一个测试，测试期间选择器和其他入口都会锁定；关闭向导会作废当前请求，过期结果不会覆盖下一次测试。
+
+麦克风或回环录不到明显信号时按“未检测到信号”处理，与设备打开失败等底层错误分开显示。正在同传时向导的开始按钮不可用，需要先停止同传，避免临时探测进程与实时引擎争用音频设备。
+
 ## 托盘、快捷键与运行时控制
 
 关闭主窗口不会结束程序：翻译继续运行，程序收起到系统托盘。托盘 tooltip 与菜单首项显示当前状态（未启动 / 正在连接 / 正常翻译 / 音频异常 / 网络异常）。
@@ -154,12 +168,14 @@ npm run desktop:build                                          # 3. 先生成 si
 .venv\Scripts\python.exe scripts\test_tauri_bridge.py
 .venv\Scripts\python.exe scripts\test_audio_isolation.py
 .venv\Scripts\python.exe scripts\test_runtime_channels.py
+.venv\Scripts\python.exe scripts\test_audio_device_tests.py
 .venv\Scripts\python.exe scripts\test_runtime_integration.py
 cd desktop\src-tauri
 cargo test
 cd ..
 npm run build
 npm run test:audio
+npm run test:devices
 npm run test:languages
 npm run test:runtime
 npm run test:subtitle
