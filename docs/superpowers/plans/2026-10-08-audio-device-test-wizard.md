@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-08-audio-device-test-wizard-design.md`
 
+## Execution Status
+
+- [x] Pure audio-test contracts and signal helpers
+- [x] Python sidecar probes and JSONL routing
+- [x] Rust command and frontend API
+- [x] React device-test wizard and responsive styles
+- [x] Automated Python, Rust, TypeScript, and frontend build verification
+- [ ] Windows hardware verification with real speakers, microphones, and loopback endpoints
+
 ## Global Constraints
 
 - 测试不联网、不调用翻译模型、不需要 API Key，不保存录音，不修改音频设置。
