@@ -1,0 +1,588 @@
+{
+  "bridge": "E:\\Project\\translation\\simultaneous-translator\\scripts\\tauri_bridge.py",
+  "python": "E:\\Project\\translation\\simultaneous-translator\\.venv\\Scripts\\python.exe",
+  "tier": "all",
+  "elapsed_s": 16.59,
+  "pass": 96,
+  "fail": 0,
+  "blocked": 0,
+  "harness_unsupported": false,
+  "checks": [
+    {
+      "tier": "A/真实引擎",
+      "name": "ready 事件 v==1",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"event\", \"event\": \"ready\", \"sequence\": 1, \"session_id\": null, \"data\": {\"protocol_version\": 1, \"commands\": [\"ping\", \"start\", \"stop\", \"shutdown\", \"probe.models\", \"probe.connect\", \"devic"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "ready 保留全部既有命令",
+      "status": "PASS",
+      "detail": "commands=['ping', 'start', 'stop', 'shutdown', 'probe.models', 'probe.connect', 'devices', 'set_runtime_channel', 'set_speak_muted']"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "ready 广告新增命令 set_runtime_channel / set_speak_muted",
+      "status": "PASS",
+      "detail": "缺失 []（契约 runtime-channel-control.md §2）"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "ping ok 且 protocol_version==1",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"ping-1\", \"ok\": true, \"result\": {\"protocol_version\": 1, \"state\": \"idle\", \"session_id\": null}, \"_mark\": 1, \"_request_id\": \"ping-1\"}"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "ping 无 session 时 state==idle 且 session_id==null",
+      "status": "PASS",
+      "detail": "{\"protocol_version\": 1, \"state\": \"idle\", \"session_id\": null}"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "未知命令返回 unknown_command",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"definitely_not_a_command-2\", \"ok\": false, \"error\": {\"code\": \"unknown_command\", \"message\": \"Unsupported command: definitely_not_a_command\"}, \"_mark\": 2, \"_request_id"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "非法 JSON 返回 invalid_json 且进程存活",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": null, \"ok\": false, \"error\": {\"code\": \"invalid_json\", \"message\": \"Invalid JSON: Expecting property name enclosed in double quotes\"}}"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "无 session 时 set_runtime_channel 拒绝",
+      "status": "PASS",
+      "detail": "code=no_active_session"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "无 session 时 set_speak_muted 拒绝",
+      "status": "PASS",
+      "detail": "code=no_active_session"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "channel 非法 → invalid_channel",
+      "status": "PASS",
+      "detail": "code=invalid_channel（契约 §2.1 要求 invalid_channel；无 session 时优先级见 known-issues）"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "enabled 非布尔 → invalid_params",
+      "status": "PASS",
+      "detail": "code=invalid_params"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "muted 非布尔 → invalid_params",
+      "status": "PASS",
+      "detail": "code=invalid_params"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "缺 session_id → 被拒绝",
+      "status": "PASS",
+      "detail": "code=invalid_params"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "缺少 realtime_api_key 的 start 返回 invalid_start_config",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-9\", \"ok\": false, \"error\": {\"code\": \"invalid_start_config\", \"message\": \"realtime_api_key is required\"}, \"_mark\": 10, \"_request_id\": \"start-9\"}"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "无 session 时 stop 幂等成功",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"stop-10\", \"ok\": true, \"result\": {\"already_stopped\": true}, \"_mark\": 11, \"_request_id\": \"stop-10\"}"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "devices 命令可用（真实硬件枚举）",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "shutdown 返回 ok",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"shutdown-12\", \"ok\": true, \"result\": {\"state\": \"shutting_down\"}, \"_mark\": 13, \"_request_id\": \"shutdown-12\"}"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "shutdown 后进程自行退出且 exit code==0",
+      "status": "PASS",
+      "detail": "exit=0"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "stdout 全部为合法 JSON（协议未被污染）",
+      "status": "PASS",
+      "detail": "非 JSON 行 0 条：[]"
+    },
+    {
+      "tier": "A/真实引擎",
+      "name": "收到了响应/事件流量",
+      "status": "PASS",
+      "detail": "14 行"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "start 返回 ok（f4c65aea）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-1\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"state\": \"starting\"}, \"_mark\": 1, \"_request_id\": \"start-1\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "start 后进入 listening（活跃 session）",
+      "status": "PASS",
+      "detail": "f4c65aea-5228-4eee-bc7a-09ee0020d55d"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "关闭收听通道 → ok/changed:true",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_runtime_channel-2\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"channel\": \"listen\", \"enabled\": false, \"changed\": true}, \"_mark\": 3, \"_request_id\": \"set_runtime_channel-2\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "结果回显生效后的 channel/enabled/session_id",
+      "status": "PASS",
+      "detail": "{\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"channel\": \"listen\", \"enabled\": false, \"changed\": true}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "发出 runtime.channel 事件且字段符合契约 §4.2",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"event\", \"event\": \"runtime.channel\", \"sequence\": 11, \"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"data\": {\"channel\": \"listen\", \"enabled\": false, \"configured\": true}}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "重放同一值 → ok:true 且 changed:false（幂等）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_runtime_channel-3\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"channel\": \"listen\", \"enabled\": false, \"changed\": false}, \"_mark\": 13, \"_request_id\": \"set_runtime_channel-3\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "幂等重放不重复发 runtime.channel（契约 §4.2）",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "恢复收听通道 → changed:true",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_runtime_channel-4\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"channel\": \"listen\", \"enabled\": true, \"changed\": true}, \"_mark\": 14, \"_request_id\": \"set_runtime_channel-4\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "通道开关不会停止整个 session（契约 §1.4）",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "静音 → ok:true muted:true changed:true",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-5\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"muted\": true, \"changed\": true}, \"_mark\": 16, \"_request_id\": \"set_speak_muted-5\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "发出 runtime.mute 事件且 muted:true",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"event\", \"event\": \"runtime.mute\", \"sequence\": 13, \"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"data\": {\"muted\": true}}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "重复静音 → changed:false（幂等）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-6\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"muted\": true, \"changed\": false}, \"_mark\": 18, \"_request_id\": \"set_speak_muted-6\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "重复静音不重复发 runtime.mute",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "取消静音 → changed:true 且通道仍在（无 stopped 事件）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-7\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"muted\": false, \"changed\": true}, \"_mark\": 19, \"_request_id\": \"set_speak_muted-7\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "stop 返回 ok 且回显 session_id",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"stop-8\", \"ok\": true, \"result\": {\"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"state\": \"stopping\"}, \"_mark\": 21, \"_request_id\": \"stop-8\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "stop 后发出 state 事件（stopping/stopped）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"event\", \"event\": \"state\", \"sequence\": 15, \"session_id\": \"f4c65aea-5228-4eee-bc7a-09ee0020d55d\", \"data\": {\"state\": \"stopping\"}}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "停止后旧 session_id 被拒绝",
+      "status": "PASS",
+      "detail": "code=no_active_session"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "start 返回 ok（976378f5）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-10\", \"ok\": true, \"result\": {\"session_id\": \"976378f5-b4d6-43e6-b8c1-c4efa5d7c58a\", \"state\": \"starting\"}, \"_mark\": 26, \"_request_id\": \"start-10\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "第二次 start 进入 listening（新 session）",
+      "status": "PASS",
+      "detail": "976378f5-b4d6-43e6-b8c1-c4efa5d7c58a"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "重启后运行时通道复位为配置默认值（changed:true）",
+      "status": "PASS",
+      "detail": "契约 §1.2；实测 {\"v\": 1, \"type\": \"response\", \"id\": \"set_runtime_channel-11\", \"ok\": true, \"result\": {\"session_id\": \"976378f5-b4d6-43e6-b8c1-c4efa5d7c58a\", \"channel\": \"listen\", \"enabled\": false, \"changed\": true}, \"_mark\": 28, \"_request_id\": \"set_runtime_chan"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "重启后 speak_muted 复位为 false（changed:false）",
+      "status": "PASS",
+      "detail": "契约 §1.2；实测 {\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-12\", \"ok\": true, \"result\": {\"session_id\": \"976378f5-b4d6-43e6-b8c1-c4efa5d7c58a\", \"muted\": false, \"changed\": false}, \"_mark\": 38, \"_request_id\": \"set_speak_muted-12\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "旧 session id → session_mismatch",
+      "status": "PASS",
+      "detail": "code=session_mismatch（契约 §2.1/§3.2）"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "旧 session id（静音）→ session_mismatch",
+      "status": "PASS",
+      "detail": "code=session_mismatch"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "被拒绝的旧 session 调用不改变任何状态（无事件泄漏）",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "第二次 stop 成功",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"stop-15\", \"ok\": true, \"result\": {\"session_id\": \"976378f5-b4d6-43e6-b8c1-c4efa5d7c58a\", \"state\": \"stopping\"}, \"_mark\": 41, \"_request_id\": \"stop-15\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "仅启用收听通道的 start 成功",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-16\", \"ok\": true, \"result\": {\"session_id\": \"ab9149ef-d41a-4988-95e6-081e7502d269\", \"state\": \"starting\"}, \"_mark\": 45, \"_request_id\": \"start-16\"}"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "未配置的发言通道静音 → channel_not_configured",
+      "status": "PASS",
+      "detail": "code=channel_not_configured（契约 §2.2）"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "未配置通道开启 → channel_not_configured（不得伪造已开启）",
+      "status": "PASS",
+      "detail": "code=channel_not_configured（契约 §1.3）"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "第三个 session 停止成功",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "Tier B 全程 stdout 全部为合法 JSON",
+      "status": "PASS",
+      "detail": "非 JSON 行 0 条：[]"
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "shutdown 返回 ok",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "tier": "B/离线引擎",
+      "name": "shutdown 后进程自行退出且 exit code==0",
+      "status": "PASS",
+      "detail": "exit=0"
+    },
+    {
+      "tier": "C1/真实引擎音频失败",
+      "name": "真实引擎 start 被接受（失败发生在运行期而不是配置校验）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-1\", \"ok\": true, \"result\": {\"session_id\": \"24888fd8-a08b-42eb-8085-c89bedf82a2e\", \"state\": \"starting\"}, \"_mark\": 1, \"_request_id\": \"start-1\"}"
+    },
+    {
+      "tier": "C1/真实引擎音频失败",
+      "name": "音频失败以 service=audio 上报（D1 判据）",
+      "status": "PASS",
+      "detail": "service='audio' code='audio_device_failed' message='发言通道音频设备打开失败：no device with id qa-no-such-device-0000'"
+    },
+    {
+      "tier": "C1/真实引擎音频失败",
+      "name": "没有发出 audio_start_failed（D1 偏差真实存在，不是猜测）",
+      "status": "PASS",
+      "detail": "code='audio_device_failed'"
+    },
+    {
+      "tier": "C1/真实引擎音频失败",
+      "name": "发出的 code 是既有音频 code",
+      "status": "PASS",
+      "detail": "code='audio_device_failed'"
+    },
+    {
+      "tier": "C1/真实引擎音频失败",
+      "name": "没有发出 websocket_reconnecting（D2 偏差）",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "C1/真实引擎音频失败",
+      "name": "音频失败时发出 audio.status",
+      "status": "PASS",
+      "detail": "[{\"v\": 1, \"type\": \"event\", \"event\": \"audio.status\", \"sequence\": 5, \"session_id\": \"24888fd8-a08b-42eb-8085-c89bedf82a2e\", \"data\": {\"status\": \"failed\", \"channel\": \"speak\", \"detail\": \"发言通道音频设备打开失败：no device with id qa-no-such-device-0000\"}}]"
+    },
+    {
+      "tier": "C2/部分通道故障",
+      "name": "双通道 start 成功",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-1\", \"ok\": true, \"result\": {\"session_id\": \"2b75c62f-d185-44b9-b72c-026fe54b34d0\", \"state\": \"starting\"}, \"_mark\": 1, \"_request_id\": \"start-1\"}"
+    },
+    {
+      "tier": "C2/部分通道故障",
+      "name": "部分通道故障 → network.status=degraded（D2 替代判据）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"event\", \"event\": \"network.status\", \"sequence\": 9, \"session_id\": \"2b75c62f-d185-44b9-b72c-026fe54b34d0\", \"data\": {\"status\": \"degraded\", \"detail\": \"QA 注入：发言通道连接失败\"}}"
+    },
+    {
+      "tier": "C2/部分通道故障",
+      "name": "没有发出 websocket_reconnecting（D2：引擎无重连逻辑）",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "C2/部分通道故障",
+      "name": "sibling 存活时不得上报 network.status=failed",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "C2/部分通道故障",
+      "name": "单通道故障不终止整个 session（sibling 继续）",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "C3/音频故障分类",
+      "name": "双通道 start 成功",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-1\", \"ok\": true, \"result\": {\"session_id\": \"223571a6-6d7d-4f0a-b430-c92aea74e979\", \"state\": \"starting\"}, \"_mark\": 1, \"_request_id\": \"start-1\"}"
+    },
+    {
+      "tier": "C3/音频故障分类",
+      "name": "音频失败 → error.service == \"audio\"",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"event\", \"event\": \"error\", \"sequence\": 6, \"session_id\": \"223571a6-6d7d-4f0a-b430-c92aea74e979\", \"data\": {\"scope\": \"audio\", \"service\": \"audio\", \"code\": \"audio_device_missing\", \"message\": \"QA 注入：未找到可用的输入设备\", \"recoverable\": false}}"
+    },
+    {
+      "tier": "C3/音频故障分类",
+      "name": "音频失败没有使用 audio_start_failed",
+      "status": "PASS",
+      "detail": "code='audio_device_missing'"
+    },
+    {
+      "tier": "C3/音频故障分类",
+      "name": "发出 audio.status=failed 且带 channel",
+      "status": "PASS",
+      "detail": "[{\"v\": 1, \"type\": \"event\", \"event\": \"audio.status\", \"sequence\": 4, \"session_id\": \"223571a6-6d7d-4f0a-b430-c92aea74e979\", \"data\": {\"status\": \"failed\", \"channel\": \"listen\", \"detail\": \"QA 注入：未找到可用的输入设备\"}}]"
+    },
+    {
+      "tier": "C3/音频故障分类",
+      "name": "没有发出 websocket_reconnecting",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "start 返回 ok（b6d245af）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-1\", \"ok\": true, \"result\": {\"session_id\": \"b6d245af-f4b7-482a-80f7-347d3992be91\", \"state\": \"starting\"}, \"_mark\": 1, \"_request_id\": \"start-1\"}"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "channel=both 有活跃 session → invalid_channel",
+      "status": "PASS",
+      "detail": "code=invalid_channel（允许 ['invalid_channel']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "channel 缺失 → invalid_channel 或 invalid_params",
+      "status": "PASS",
+      "detail": "code=invalid_params（允许 ['invalid_channel', 'invalid_params']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "enabled 为字符串 → invalid_params",
+      "status": "PASS",
+      "detail": "code=invalid_params（允许 ['invalid_params']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "enabled 为数字 → invalid_params",
+      "status": "PASS",
+      "detail": "code=invalid_params（允许 ['invalid_params']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "muted 为字符串 → invalid_params",
+      "status": "PASS",
+      "detail": "code=invalid_params（允许 ['invalid_params']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "会话活跃但 session_id 非 UUID → session_mismatch",
+      "status": "PASS",
+      "detail": "code=session_mismatch（允许 ['session_mismatch']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "会话活跃但 session_id 缺失 → 被拒绝",
+      "status": "PASS",
+      "detail": "code=invalid_params（允许 ['invalid_params', 'session_mismatch']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "会话活跃但 session_id 为随机 UUID → session_mismatch",
+      "status": "PASS",
+      "detail": "code=session_mismatch（允许 ['session_mismatch']）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "8 次非法调用后运行时状态未被污染（仍为默认开启）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_runtime_channel-10\", \"ok\": true, \"result\": {\"session_id\": \"b6d245af-f4b7-482a-80f7-347d3992be91\", \"channel\": \"listen\", \"enabled\": true, \"changed\": false}, \"_mark\": 19, \"_request_id\": \"set_runtime_channel-10\"}"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "连发 6 个交错请求全部得到响应（id 一一对应）",
+      "status": "PASS",
+      "detail": "[\"race0-11\", \"race1-12\", \"race2-13\", \"race3-14\", \"race4-15\", \"race5-16\"]"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "交错请求按顺序生效（交替翻转 → 每次 changed:true）",
+      "status": "PASS",
+      "detail": "changed=true 次数=6，期望=6；实测值序列=[True, False, True, False, True, False]"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "同值连发只有第一次 changed:true（其余幂等）",
+      "status": "PASS",
+      "detail": "changed=true 次数=1，期望=1"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "同值连发只发一次 runtime.mute 事件（无事件风暴）",
+      "status": "PASS",
+      "detail": "runtime.mute 事件数=7，期望=7（6 次翻转 + 1 次置 true）"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "并发后状态机未损坏（仍可正常设置）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-23\", \"ok\": true, \"result\": {\"session_id\": \"b6d245af-f4b7-482a-80f7-347d3992be91\", \"muted\": false, \"changed\": true}, \"_mark\": 39, \"_request_id\": \"set"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "重复 stop 幂等（第二次 already_stopped）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"stop-25\", \"ok\": true, \"result\": {\"already_stopped\": true}, \"_mark\": 42, \"_request_id\": \"stop-25\"}"
+    },
+    {
+      "tier": "D/严格校验与竞态",
+      "name": "全程 stdout 纯 JSON",
+      "status": "PASS",
+      "detail": "[]"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "start 返回 ok（d5f99dd2）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"start-1\", \"ok\": true, \"result\": {\"session_id\": \"d5f99dd2-7fe9-4028-9d85-6eae081a0edf\", \"state\": \"starting\"}, \"_mark\": 1, \"_request_id\": \"start-1\"}"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5 前置：静音成功（changed:true）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-2\", \"ok\": true, \"result\": {\"session_id\": \"d5f99dd2-7fe9-4028-9d85-6eae081a0edf\", \"muted\": true, \"changed\": true}, \"_mark\": 3, \"_request_id\": \"set_speak_muted-2\"}"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5 关闭已静音的发言通道 → 成功",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_runtime_channel-3\", \"ok\": true, \"result\": {\"session_id\": \"d5f99dd2-7fe9-4028-9d85-6eae081a0edf\", \"channel\": \"speak\", \"enabled\": false, \"changed\": true}, \"_mark\": 13, \"_request_id\": \"set_runtime_channe"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5 事件顺序：先 runtime.mute{false} 后 runtime.channel{false}",
+      "status": "PASS",
+      "detail": "[[\"runtime.mute\", false], [\"runtime.channel:speak\", false]]"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5 静音确实被清除（再置 false → changed:false）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-4\", \"ok\": true, \"result\": {\"session_id\": \"d5f99dd2-7fe9-4028-9d85-6eae081a0edf\", \"muted\": false, \"changed\": false}, \"_mark\": 16, \"_request_id\": \"set_speak_muted-4\"}"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5 反向：重新启用通道不得改变 speak_muted（仍为 true）",
+      "status": "PASS",
+      "detail": "enable.changed=False mute.changed=False"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5.1 运行时已关闭的发言通道：set_speak_muted 仍返回成功（设计如此）",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-10\", \"ok\": true, \"result\": {\"session_id\": \"d5f99dd2-7fe9-4028-9d85-6eae081a0edf\", \"muted\": true, \"changed\": true}, \"_mark\": 26, \"_request_id\": \"set_speak_muted-10\"}"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5.1 确认绕过 Rust 时能瞬时构造 speakEnabled=false && speakMuted=true",
+      "status": "PASS",
+      "detail": "mute 响应={\"session_id\": \"d5f99dd2-7fe9-4028-9d85-6eae081a0edf\", \"muted\": true, \"changed\": true}"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5.0 幂等关闭（changed:false）也清掉幽灵静音，且只补发 runtime.mute{false}",
+      "status": "PASS",
+      "detail": "changed=False，事件=[[\"runtime.mute\", false]]（channel 值未变化故不补发 channel 事件，符合 §4.2）"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "§1.5.1 结论：绕过 Rust 也无法留下**持久**幽灵态",
+      "status": "PASS",
+      "detail": "{\"v\": 1, \"type\": \"response\", \"id\": \"set_speak_muted-12\", \"ok\": true, \"result\": {\"session_id\": \"d5f99dd2-7fe9-4028-9d85-6eae081a0edf\", \"muted\": false, \"changed\": false}, \"_mark\": 30, \"_request_id\": \"set_speak_muted-12\"}"
+    },
+    {
+      "tier": "E/幽灵态与事件顺序",
+      "name": "全程 stdout 纯 JSON",
+      "status": "PASS",
+      "detail": "[]"
+    }
+  ]
+}
