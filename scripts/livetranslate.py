@@ -34,6 +34,7 @@ import json
 import queue
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -520,6 +521,160 @@ def list_audio_devices() -> dict[str, Any]:
         "speakers": describe(sc.all_speakers(), default_speaker_id, True),
         "microphones": describe(sc.all_microphones(), default_microphone_id, False),
     }
+
+
+def _audio_test_device_name(device: Any, fallback: str) -> str:
+    return str(getattr(device, "name", "") or fallback)
+
+
+def _audio_test_result(
+    kind: str,
+    device: Any,
+    started: float,
+    *,
+    peak: float = 0.0,
+    rms: float = 0.0,
+    detected: bool,
+    detail: str,
+) -> dict[str, Any]:
+    device_id = str(getattr(device, "id", "") or "")
+    return {
+        "ok": True,
+        "kind": kind,
+        "device_id": device_id,
+        "device_name": _audio_test_device_name(device, device_id or "默认设备"),
+        "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+        "peak": float(peak),
+        "rms": float(rms),
+        "detected": bool(detected),
+        "detail": detail,
+    }
+
+
+def _audio_test_speaker(soundcard: Any, device_id: str) -> Any:
+    speaker = soundcard.get_speaker(id=device_id) if device_id else soundcard.default_speaker()
+    if speaker is None:
+        raise RuntimeError("未找到可用的播放设备")
+    return speaker
+
+
+def _audio_test_microphone(soundcard: Any, device_id: str, *, loopback: bool = False) -> Any:
+    if loopback:
+        microphone = soundcard.get_microphone(id=device_id, include_loopback=True)
+    else:
+        microphone = (
+            soundcard.get_microphone(id=device_id)
+            if device_id
+            else soundcard.default_microphone()
+        )
+    if microphone is None:
+        raise RuntimeError("未找到可用的麦克风")
+    return microphone
+
+
+def _audio_test_channels(device: Any) -> int:
+    channels = int(getattr(device, "channels", 0) or 1)
+    return max(1, channels)
+
+
+def run_audio_test(kind: str, device_id: str = "") -> dict[str, Any]:
+    """Run one local audio probe without contacting the translation service."""
+
+    kind, device_id = validate_audio_test_request(kind, device_id)
+    _ensure_com_initialized()
+    import soundcard as sc
+
+    started = time.monotonic()
+    if kind == "playback":
+        speaker = _audio_test_speaker(sc, device_id)
+        try:
+            with speaker.player(samplerate=AUDIO_TEST_SAMPLE_RATE, channels=1) as player:
+                player.play(build_test_tone())
+        except Exception as exc:  # noqa: BLE001 - converted to a probe error by the bridge
+            raise RuntimeError(f"播放测试音失败：{exc}") from exc
+        return _audio_test_result(
+            kind,
+            speaker,
+            started,
+            detected=True,
+            detail="播放测试音成功",
+        )
+
+    if kind == "microphone":
+        microphone = _audio_test_microphone(sc, device_id)
+        channels = _audio_test_channels(microphone)
+        try:
+            with microphone.recorder(
+                samplerate=AUDIO_TEST_SAMPLE_RATE,
+                channels=channels,
+            ) as recorder:
+                samples = recorder.record(AUDIO_TEST_SAMPLE_RATE * 3)
+        except Exception as exc:  # noqa: BLE001 - converted to a probe error by the bridge
+            raise RuntimeError(f"麦克风录音失败：{exc}") from exc
+        peak, rms = audio_metrics(samples)
+        detected = signal_detected(peak)
+        return _audio_test_result(
+            kind,
+            microphone,
+            started,
+            peak=peak,
+            rms=rms,
+            detected=detected,
+            detail="检测到麦克风声音" if detected else "未检测到明显麦克风声音",
+        )
+
+    speaker = _audio_test_speaker(sc, device_id)
+    speaker_id = str(getattr(speaker, "id", "") or device_id)
+    if not speaker_id:
+        raise RuntimeError("所选播放设备没有可用的回环端点")
+    loopback = _audio_test_microphone(sc, speaker_id, loopback=True)
+    channels = _audio_test_channels(loopback)
+    tone = build_test_tone()
+    try:
+        with speaker.player(samplerate=AUDIO_TEST_SAMPLE_RATE, channels=1) as player:
+            with loopback.recorder(
+                samplerate=AUDIO_TEST_SAMPLE_RATE,
+                channels=channels,
+            ) as recorder:
+                captured: list[Any] = []
+                playback_errors: list[BaseException] = []
+
+                def play() -> None:
+                    _ensure_com_initialized()
+                    try:
+                        player.play(tone)
+                    except BaseException as exc:  # noqa: BLE001 - forwarded after joining
+                        playback_errors.append(exc)
+
+                playback = threading.Thread(
+                    target=play,
+                    name="audio-test-playback",
+                    daemon=True,
+                )
+                playback.start()
+                try:
+                    captured.append(recorder.record(AUDIO_TEST_SAMPLE_RATE))
+                finally:
+                    playback.join(timeout=2.0)
+                if playback.is_alive():
+                    raise RuntimeError("回环测试播放超时")
+                if playback_errors:
+                    raise RuntimeError(f"回环测试播放失败：{playback_errors[0]}")
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - converted to a probe error by the bridge
+        raise RuntimeError(f"回环测试失败：{exc}") from exc
+    peak, rms = audio_metrics(captured[0] if captured else [])
+    detected = signal_detected(peak)
+    return _audio_test_result(
+        kind,
+        speaker,
+        started,
+        peak=peak,
+        rms=rms,
+        detected=detected,
+        detail="回环测试成功" if detected else "未检测到播放回环信号",
+    )
 
 
 _COM_INIT_LOCK = threading.Lock()

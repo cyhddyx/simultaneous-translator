@@ -14,6 +14,7 @@ Requests
 ``{"id": "...", "command": "shutdown", "params": {}}``
 ``{"id": "...", "command": "probe.models", "params": {"kind": ..., "provider": {...}, "secrets": {...}}}``
 ``{"id": "...", "command": "probe.connect", "params": {"kind": ..., "provider": {...}, "secrets": {...}}}``
+``{"id": "...", "command": "audio_test", "params": {"kind": "playback|microphone|loopback", "device_id": "..."}}``
 ``{"id": "...", "command": "set_runtime_channel", "params": {"session_id": "...", "channel": "listen|speak", "enabled": true}}``
 ``{"id": "...", "command": "set_speak_muted", "params": {"session_id": "...", "muted": true}}``
 
@@ -2048,6 +2049,30 @@ class BridgeServer:
             return
         self.writer.response(request_id, ok=True, result=devices)
 
+    def _audio_test(self, request_id: Any, params: dict[str, Any]) -> None:
+        try:
+            kind = _config_value(params, "kind", "")
+            device_id = _config_value(params, "device_id", "")
+            kind, device_id = livetranslate.validate_audio_test_request(kind, device_id)
+        except (ProtocolError, ValueError) as exc:
+            self.writer.response(
+                request_id,
+                ok=False,
+                error={"code": "invalid_audio_test_request", "message": str(exc)[:500]},
+            )
+            return
+
+        try:
+            result = livetranslate.run_audio_test(kind, device_id)
+        except Exception as exc:  # noqa: BLE001 - hardware errors are user-facing probe failures
+            self.writer.response(
+                request_id,
+                ok=False,
+                error={"code": "audio_test_failed", "message": str(exc)[:500]},
+            )
+            return
+        self.writer.response(request_id, ok=True, result=result)
+
     def _ping(self, request_id: Any) -> None:
         with self._session_lock:
             session = self._current_session
@@ -2295,6 +2320,8 @@ class BridgeServer:
             self._probe_connect(request_id, params)
         elif command == "devices":
             self._list_devices(request_id)
+        elif command == "audio_test":
+            self._audio_test(request_id, params)
         elif command == COMMAND_SET_RUNTIME_CHANNEL:
             self._set_runtime_channel(request_id, params)
         elif command == COMMAND_SET_SPEAK_MUTED:
@@ -2347,6 +2374,7 @@ class BridgeServer:
                     "probe.models",
                     "probe.connect",
                     "devices",
+                    "audio_test",
                     COMMAND_SET_RUNTIME_CHANNEL,
                     COMMAND_SET_SPEAK_MUTED,
                 ],

@@ -43,6 +43,8 @@ def audio_metrics(samples: Any) -> tuple[float, float]:
     values = np.asarray(samples, dtype=np.float32)
     if values.size == 0:
         return 0.0, 0.0
+    if values.ndim > 1:
+        values = values.mean(axis=1)
     values = values.reshape(-1)
     finite = values[np.isfinite(values)]
     if finite.size == 0:
