@@ -435,6 +435,14 @@ struct ProviderProbeInput {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioTestInput {
+    kind: String,
+    #[serde(default)]
+    device_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SecretSource {
@@ -2362,6 +2370,37 @@ async fn list_audio_devices(manager: State<'_, ProbeManager>) -> Result<Value, S
     .await
 }
 
+fn normalize_audio_test_input(input: AudioTestInput) -> Result<(String, String), String> {
+    let kind = input.kind.trim().to_string();
+    if !matches!(kind.as_str(), "playback" | "microphone" | "loopback") {
+        return Err("不支持的音频测试类型".into());
+    }
+    let device_id = input.device_id.trim().to_string();
+    if device_id.len() > MAX_AUDIO_DEVICE_BYTES {
+        return Err("音频设备标识过长".into());
+    }
+    Ok((kind, device_id))
+}
+
+#[tauri::command]
+async fn run_audio_test(
+    manager: State<'_, ProbeManager>,
+    input: AudioTestInput,
+) -> Result<Value, String> {
+    let (kind, device_id) = normalize_audio_test_input(input)?;
+    let gate = manager.audio_gate.clone();
+    spawn_command(move || {
+        let _guard = gate
+            .lock()
+            .map_err(|_| "音频设备测试状态异常，请重启应用".to_string())?;
+        run_probe_request(
+            "audio_test",
+            json!({"kind": kind, "device_id": device_id}),
+        )
+    })
+    .await
+}
+
 #[tauri::command]
 async fn save_settings(app: AppHandle, input: SettingsInput) -> Result<SettingsSnapshot, String> {
     spawn_command(move || save_settings_blocking(&app, input)).await
@@ -2826,6 +2865,7 @@ pub fn run() {
             fetch_provider_models,
             test_provider_connection,
             list_audio_devices,
+            run_audio_test,
             virtual_microphone::install_virtual_microphone,
             virtual_microphone::open_virtual_microphone_link,
             save_settings,
@@ -2863,6 +2903,29 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_test_input_reads_camel_case_device_id() {
+        let input: AudioTestInput = serde_json::from_value(json!({
+            "kind": "loopback",
+            "deviceId": "speaker-1"
+        }))
+        .expect("audio test input should deserialize");
+
+        assert_eq!(input.kind, "loopback");
+        assert_eq!(input.device_id, "speaker-1");
+    }
+
+    #[test]
+    fn audio_test_kind_validation_rejects_unknown_values() {
+        let error = normalize_audio_test_input(AudioTestInput {
+            kind: "invalid".into(),
+            device_id: String::new(),
+        })
+        .expect_err("unknown audio test kinds must be rejected");
+
+        assert!(error.contains("不支持的音频测试类型"));
+    }
 
     #[test]
     fn unsupported_legacy_speech_target_is_readable_but_cannot_start() {

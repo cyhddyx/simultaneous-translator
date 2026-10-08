@@ -9,6 +9,12 @@ import {
   type MockRuntimeOptions,
 } from "./runtime";
 import { engineErrorTitle, errorServiceFromEvent } from "./snapshot";
+import {
+  mockAudioTestResult,
+  normalizeAudioTestResult,
+  type AudioTestRequest,
+  type AudioTestResult,
+} from "./audioDeviceTest";
 
 import {
   DEFAULT_SETTINGS,
@@ -1055,6 +1061,20 @@ export const translatorApi = {
       speakers: toDevices(raw.speakers),
       microphones: toDevices(raw.microphones),
     };
+  },
+
+  async runAudioTest(request: AudioTestRequest): Promise<AudioTestResult> {
+    if (!isTauriRuntime()) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return mockAudioTestResult(request);
+    }
+    const raw = await invoke<unknown>("run_audio_test", {
+      input: {
+        kind: request.kind,
+        deviceId: request.deviceId,
+      },
+    });
+    return normalizeAudioTestResult(raw, request.kind);
   },
 
   async copyText(text: string): Promise<void> {
