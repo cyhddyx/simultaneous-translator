@@ -85,6 +85,7 @@ export function AudioDeviceTestWizard({
   const [result, setResult] = useState<AudioTestResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const requestGate = useRef(createAudioTestRequestGate());
+  const closeAfterRun = useRef(false);
 
   const options = useMemo(() => devicesForAudioTest(devices, kind), [devices, kind]);
   const SelectedIcon = TESTS.find((item) => item.kind === kind)?.icon ?? Volume2;
@@ -118,11 +119,22 @@ export function AudioDeviceTestWizard({
       if (!requestGate.current.isCurrent(request)) return;
       setRunError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      if (requestGate.current.isCurrent(request)) setRunning(false);
+      if (requestGate.current.isCurrent(request)) {
+        setRunning(false);
+        if (closeAfterRun.current) {
+          closeAfterRun.current = false;
+          requestGate.current.invalidate();
+          onClose();
+        }
+      }
     }
   };
 
   const close = () => {
+    if (running) {
+      closeAfterRun.current = true;
+      return;
+    }
     requestGate.current.invalidate();
     onClose();
   };
