@@ -100,3 +100,12 @@ export function mockAudioTestResult(request: AudioTestRequest): AudioTestResult 
   };
 }
 
+export function createAudioTestRequestGate() {
+  let current = 0;
+  return {
+    begin: () => ++current,
+    isCurrent: (request: number) => request === current,
+    invalidate: () => ++current,
+  };
+}
+

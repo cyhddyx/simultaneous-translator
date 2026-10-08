@@ -1034,7 +1034,26 @@ export const translatorApi = {
 
   async listAudioDevices(): Promise<AudioDeviceList> {
     if (!isTauriRuntime()) {
-      return { speakers: [], microphones: [] };
+      return {
+        speakers: [
+          {
+            id: "demo-speaker",
+            name: "演示播放设备",
+            channels: 2,
+            isDefault: true,
+            loopback: true,
+          },
+        ],
+        microphones: [
+          {
+            id: "demo-microphone",
+            name: "演示麦克风",
+            channels: 1,
+            isDefault: true,
+            loopback: false,
+          },
+        ],
+      };
     }
     if (!audioDevicesRequest) {
       audioDevicesRequest = invoke<unknown>("list_audio_devices").finally(

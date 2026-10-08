@@ -43,10 +43,7 @@ from typing import Any, Callable
 # Load the resampler's native dependencies before capture workers start.
 from system_capture import SystemCapture
 from audio_test_helpers import (
-    AUDIO_TEST_KINDS,
     AUDIO_TEST_SAMPLE_RATE,
-    AUDIO_TEST_SIGNAL_THRESHOLD,
-    AUDIO_TEST_TONE_HZ,
     ProtocolError,
     audio_metrics,
     build_test_tone,

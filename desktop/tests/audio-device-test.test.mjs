@@ -4,6 +4,7 @@ import {
   audioTestDeviceKind,
   audioTestLabel,
   classifyAudioTestResult,
+  createAudioTestRequestGate,
   mockAudioTestResult,
   normalizeAudioTestResult,
 } from "../src/audioDeviceTest.ts";
@@ -65,4 +66,15 @@ test("browser audio test result is deterministic and identifies the selected dev
   assert.equal(result.deviceId, "demo-mic");
   assert.equal(result.detected, true);
   assert.equal(result.deviceName, "演示麦克风");
+});
+
+test("stale audio test results are ignored after a retry or close", () => {
+  const gate = createAudioTestRequestGate();
+  const first = gate.begin();
+  const second = gate.begin();
+
+  assert.equal(gate.isCurrent(first), false);
+  assert.equal(gate.isCurrent(second), true);
+  gate.invalidate();
+  assert.equal(gate.isCurrent(second), false);
 });

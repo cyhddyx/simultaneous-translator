@@ -1137,6 +1137,7 @@ export default function App() {
       {settingsOpen && (
         <SettingsDialog
           settings={snapshot.settings}
+          sessionActive={active}
           onClose={() => setSettingsOpen(false)}
           onSave={handleSaveSettings}
           onValidate={(draft) => translatorApi.validateSettings(draft)}

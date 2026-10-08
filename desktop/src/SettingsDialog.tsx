@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { translatorApi } from "./tauri";
+import { AudioDeviceTestWizard } from "./AudioDeviceTestWizard";
 import { VirtualMicrophoneSection } from "./VirtualMicrophoneSection";
 import { findTranslationLanguage, outputLanguageError, outputLanguages } from "./translationLanguages";
 import {
@@ -35,6 +36,7 @@ import {
 type SettingsSection = "general" | "audio" | "shortcuts" | "services" | "privacy";
 interface SettingsDialogProps {
   settings: PublicSettings;
+  sessionActive: boolean;
   onClose: () => void;
   onSave: (draft: SettingsDraft) => Promise<void>;
   onValidate: (draft: SettingsDraft) => Promise<SettingsValidation>;
@@ -498,6 +500,7 @@ function AudioChannelCard({
 
 export function SettingsDialog({
   settings,
+  sessionActive,
   onClose,
   onSave,
   onValidate,
@@ -511,6 +514,7 @@ export function SettingsDialog({
   const [devices, setDevices] = useState<AudioDeviceList | null>(null);
   const [devicesBusy, setDevicesBusy] = useState(false);
   const [devicesError, setDevicesError] = useState<string | null>(null);
+  const [audioTestOpen, setAudioTestOpen] = useState(false);
   const dialogRef = useRef<HTMLElement>(null);
   const savingRef = useRef(false);
   const deviceRequestRef = useRef(0);
@@ -915,6 +919,21 @@ export function SettingsDialog({
                     setFieldErrors({});
                   }}
                 />
+                <div className="audio-test-launch">
+                  <div>
+                    <strong>设备测试向导</strong>
+                    <span>依次检查播放音、麦克风输入和播放设备回环。</span>
+                  </div>
+                  <button
+                    className="button button--secondary"
+                    type="button"
+                    onClick={() => setAudioTestOpen(true)}
+                    disabled={saving}
+                  >
+                    <Volume2 size={15} />
+                    打开向导
+                  </button>
+                </div>
                 {CHANNEL_META.map((meta) => (
                   <AudioChannelCard
                     key={meta.id}
@@ -999,6 +1018,16 @@ export function SettingsDialog({
             )}
           </div>
         </div>
+        {audioTestOpen && (
+          <AudioDeviceTestWizard
+            devices={devices}
+            busy={devicesBusy}
+            error={devicesError}
+            sessionActive={sessionActive}
+            onReload={() => void loadDevices()}
+            onClose={() => setAudioTestOpen(false)}
+          />
+        )}
         <footer className="settings-dialog__footer">
           <span
             className="settings-save-state"
