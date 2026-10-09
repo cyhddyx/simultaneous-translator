@@ -1,5 +1,5 @@
 import { useEffect, useState, type MouseEvent } from "react";
-import { Copy, Minus, Square, X } from "lucide-react";
+import { Copy, Minus, Square, X } from "./PixelIcons";
 
 import { windowControls, type ResizeEdge } from "./window";
 

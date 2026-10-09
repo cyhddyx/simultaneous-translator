@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import App from "./App";
 import SubtitleWindow from "./SubtitleWindow";
 import "./styles.css";
+import "./pixel-theme.css";
 
 /**
  * The native layer creates the overlay with

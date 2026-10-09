@@ -15,7 +15,7 @@ import {
   Trash2,
   Volume2,
   X,
-} from "lucide-react";
+} from "./PixelIcons";
 import { translatorApi } from "./tauri";
 import { AudioDeviceTestWizard } from "./AudioDeviceTestWizard";
 import { VirtualMicrophoneSection } from "./VirtualMicrophoneSection";
@@ -706,6 +706,8 @@ export function SettingsDialog({
                 key={id}
                 type="button"
                 className={`settings-nav__item ${section === id ? "is-active" : ""}`}
+                data-section={id}
+                aria-label={label}
                 aria-current={section === id ? "page" : undefined}
                 onClick={() => {
                   setSection(id);
@@ -713,309 +715,320 @@ export function SettingsDialog({
                 }}
               >
                 <Icon size={16} />
-                {label}
+                <span className="settings-nav__label">{label}</span>
+                {id === "privacy" && (
+                  <span className="settings-nav__compact-label" aria-hidden="true">隐私</span>
+                )}
               </button>
             ))}
           </nav>
-          <div className="settings-panel">
-            {section === "general" && (
-              <section className="settings-section">
-                <div className="settings-section__heading">
-                  <SlidersHorizontal size={18} />
-                  <h3>实时同传</h3>
-                </div>
-                <fieldset className="segmented-field">
-                  <legend>对话方向</legend>
-                  <div className="segmented-control" role="group" aria-label="对话方向">
-                    {(["both", "listen", "speak"] as const).map((mode) => (
-                      <button key={mode} type="button" aria-pressed={conversationMode === mode}
-                        className={conversationMode === mode ? "is-active" : ""}
-                        onClick={() => setDraft((current) => ({ ...current, audio: {
-                          listen: { ...current.audio.listen, enabled: mode !== "speak" },
-                          speak: { ...current.audio.speak, enabled: mode !== "listen" },
-                        } }))}>
-                        {mode === "both" ? "双向对话" : mode === "listen" ? "只收听" : "只发言"}
+          <div className="settings-scroll-frame">
+            <div
+              key={section}
+              className="settings-panel"
+              data-section={section}
+              tabIndex={0}
+              aria-label={`${sectionLabels.find((item) => item.id === section)?.label}设置内容`}
+            >
+              {section === "general" && (
+                <section className="settings-section">
+                  <div className="settings-section__heading">
+                    <SlidersHorizontal size={18} />
+                    <h3>实时同传</h3>
+                  </div>
+                  <fieldset className="segmented-field">
+                    <legend>对话方向</legend>
+                    <div className="segmented-control" role="group" aria-label="对话方向">
+                      {(["both", "listen", "speak"] as const).map((mode) => (
+                        <button key={mode} type="button" aria-pressed={conversationMode === mode}
+                          className={conversationMode === mode ? "is-active" : ""}
+                          onClick={() => setDraft((current) => ({ ...current, audio: {
+                            listen: { ...current.audio.listen, enabled: mode !== "speak" },
+                            speak: { ...current.audio.speak, enabled: mode !== "listen" },
+                          } }))}>
+                          {mode === "both" ? "双向对话" : mode === "listen" ? "只收听" : "只发言"}
+                        </button>
+                      ))}
+                    </div>
+                  </fieldset>
+                  <fieldset className="segmented-field">
+                    <legend>输出模式</legend>
+                    <div
+                      className="segmented-control"
+                      role="group"
+                      aria-label="输出模式"
+                    >
+                      <button
+                        type="button"
+                        className={allText ? "is-active" : ""}
+                        aria-pressed={allText}
+                        onClick={() => setMode(false)}
+                      >
+                        语音转文字
                       </button>
+                      <button
+                        type="button"
+                        className={allAudio ? "is-active" : ""}
+                        aria-pressed={allAudio}
+                        onClick={() => setMode(true)}
+                      >
+                        语音转语音
+                      </button>
+                    </div>
+                  </fieldset>
+                  <div className="field-grid voice-settings-grid">
+                    {(["speak", "listen"] as const).map((id) => (
+                      <VoiceModeControl key={id} id={id} value={draft.audio[id].voiceMode}
+                        onChange={(voiceMode) => updateAudioChannel(id, { voiceMode })} />
                     ))}
                   </div>
-                </fieldset>
-                <fieldset className="segmented-field">
-                  <legend>输出模式</legend>
-                  <div
-                    className="segmented-control"
-                    role="group"
-                    aria-label="输出模式"
-                  >
-                    <button
-                      type="button"
-                      className={allText ? "is-active" : ""}
-                      aria-pressed={allText}
-                      onClick={() => setMode(false)}
+                  <div className="field-grid field-grid--output-languages">
+                    {(["listen", "speak"] as const).map((id) => (
+                      <OutputLanguageField key={id} id={id} channel={draft.audio[id]}
+                        onChange={(patch) => updateAudioChannel(id, patch)} />
+                    ))}
+                  </div>
+                  <fieldset className="segmented-field">
+                    <legend>字幕尺寸</legend>
+                    <div
+                      className="segmented-control"
+                      role="group"
+                      aria-label="字幕尺寸"
                     >
-                      语音转文字
-                    </button>
-                    <button
-                      type="button"
-                      className={allAudio ? "is-active" : ""}
-                      aria-pressed={allAudio}
-                      onClick={() => setMode(true)}
-                    >
-                      语音转语音
-                    </button>
+                      {(["small", "medium", "large"] as const).map(
+                        (size, index) => (
+                          <button
+                            key={size}
+                            type="button"
+                            className={
+                              draft.subtitleSize === size ? "is-active" : ""
+                            }
+                            aria-pressed={draft.subtitleSize === size}
+                            onClick={() =>
+                              setDraft((current) => ({
+                                ...current,
+                                subtitleSize: size,
+                              }))
+                            }
+                          >
+                            {["紧凑", "标准", "大字幕"][index]}
+                          </button>
+                        ),
+                      )}
+                    </div>
+                  </fieldset>
+                  <ToggleRow
+                    label="窗口始终置顶"
+                    description=""
+                    checked={draft.alwaysOnTop}
+                    onChange={(alwaysOnTop) =>
+                      setDraft((current) => ({ ...current, alwaysOnTop }))
+                    }
+                  />
+                </section>
+              )}
+              {section === "shortcuts" && (
+                <section className="settings-section">
+                  <div className="settings-section__heading">
+                    <Keyboard size={18} />
+                    <div>
+                      <h3>全局快捷键</h3>
+                      <p>点击按键框后录制组合键；组合键需要包含 Ctrl、Alt 或 Win。</p>
+                    </div>
                   </div>
-                </fieldset>
-                <div className="field-grid voice-settings-grid">
-                  {(["speak", "listen"] as const).map((id) => (
-                    <VoiceModeControl key={id} id={id} value={draft.audio[id].voiceMode}
-                      onChange={(voiceMode) => updateAudioChannel(id, { voiceMode })} />
-                  ))}
-                </div>
-                <div className="field-grid field-grid--output-languages">
-                  {(["listen", "speak"] as const).map((id) => (
-                    <OutputLanguageField key={id} id={id} channel={draft.audio[id]}
-                      onChange={(patch) => updateAudioChannel(id, patch)} />
-                  ))}
-                </div>
-                <fieldset className="segmented-field">
-                  <legend>字幕尺寸</legend>
-                  <div
-                    className="segmented-control"
-                    role="group"
-                    aria-label="字幕尺寸"
-                  >
-                    {(["small", "medium", "large"] as const).map(
-                      (size, index) => (
-                        <button
-                          key={size}
-                          type="button"
-                          className={
-                            draft.subtitleSize === size ? "is-active" : ""
-                          }
-                          aria-pressed={draft.subtitleSize === size}
-                          onClick={() =>
-                            setDraft((current) => ({
-                              ...current,
-                              subtitleSize: size,
-                            }))
-                          }
-                        >
-                          {["紧凑", "标准", "大字幕"][index]}
-                        </button>
-                      ),
-                    )}
-                  </div>
-                </fieldset>
-                <ToggleRow
-                  label="窗口始终置顶"
-                  description=""
-                  checked={draft.alwaysOnTop}
-                  onChange={(alwaysOnTop) =>
-                    setDraft((current) => ({ ...current, alwaysOnTop }))
-                  }
-                />
-              </section>
-            )}
-            {section === "shortcuts" && (
-              <section className="settings-section">
-                <div className="settings-section__heading">
-                  <Keyboard size={18} />
-                  <div>
-                    <h3>全局快捷键</h3>
-                    <p>点击按键框后录制组合键；组合键需要包含 Ctrl、Alt 或 Win。</p>
-                  </div>
-                </div>
-                <div className="shortcut-list">
-                  {SHORTCUT_ACTIONS.map(({ id, label }) => {
-                    const field = `shortcuts.${id}`;
-                    const recording = recordingShortcut === id;
-                    return (
-                      <div className="shortcut-row" key={id}>
-                        <span className="shortcut-row__label">{label}</span>
-                        <button
-                          className={`shortcut-recorder${recording ? " is-recording" : ""}`}
-                          type="button"
-                          aria-label={`${label}快捷键`}
-                          aria-pressed={recording}
-                          title={recording ? "按 Esc 取消录制" : "点击录制快捷键"}
-                          onClick={() => {
-                            setRecordingShortcut(id);
-                            setFieldErrors({});
-                          }}
-                          onKeyDown={(event) => {
-                            if (!recording) return;
-                            event.preventDefault();
-                            event.stopPropagation();
-                            if (event.code === "Escape") {
+                  <div className="shortcut-list">
+                    {SHORTCUT_ACTIONS.map(({ id, label }) => {
+                      const field = `shortcuts.${id}`;
+                      const recording = recordingShortcut === id;
+                      return (
+                        <div className="shortcut-row" key={id}>
+                          <span className="shortcut-row__label">{label}</span>
+                          <button
+                            className={`shortcut-recorder${recording ? " is-recording" : ""}`}
+                            type="button"
+                            aria-label={`${label}快捷键`}
+                            aria-pressed={recording}
+                            title={recording ? "按 Esc 取消录制" : "点击录制快捷键"}
+                            onClick={() => {
+                              setRecordingShortcut(id);
+                              setFieldErrors({});
+                            }}
+                            onKeyDown={(event) => {
+                              if (!recording) return;
+                              event.preventDefault();
+                              event.stopPropagation();
+                              if (event.code === "Escape") {
+                                setRecordingShortcut(null);
+                                return;
+                              }
+                              const key = shortcutKeyFromCode(event.code);
+                              if (!key) return;
+                              const modifiers = [
+                                event.ctrlKey ? "Ctrl" : "",
+                                event.altKey ? "Alt" : "",
+                                event.shiftKey ? "Shift" : "",
+                                event.metaKey ? "Super" : "",
+                              ].filter(Boolean);
+                              if (!modifiers.some((modifier) => modifier !== "Shift")) {
+                                setFieldErrors({
+                                  [field]: "请至少按住 Ctrl、Alt 或 Win。",
+                                });
+                                return;
+                              }
+                              setDraft((current) => ({
+                                ...current,
+                                shortcuts: {
+                                  ...current.shortcuts,
+                                  [id]: [...modifiers, key].join("+"),
+                                },
+                              }));
+                              setFieldErrors({});
                               setRecordingShortcut(null);
-                              return;
-                            }
-                            const key = shortcutKeyFromCode(event.code);
-                            if (!key) return;
-                            const modifiers = [
-                              event.ctrlKey ? "Ctrl" : "",
-                              event.altKey ? "Alt" : "",
-                              event.shiftKey ? "Shift" : "",
-                              event.metaKey ? "Super" : "",
-                            ].filter(Boolean);
-                            if (!modifiers.some((modifier) => modifier !== "Shift")) {
-                              setFieldErrors({
-                                [field]: "请至少按住 Ctrl、Alt 或 Win。",
-                              });
-                              return;
-                            }
-                            setDraft((current) => ({
-                              ...current,
-                              shortcuts: {
-                                ...current.shortcuts,
-                                [id]: [...modifiers, key].join("+"),
-                              },
-                            }));
-                            setFieldErrors({});
-                            setRecordingShortcut(null);
-                          }}
-                        >
-                          {recording ? "请按组合键…" : displayShortcut(draft.shortcuts[id])}
-                        </button>
-                        {fieldErrors[field] && (
-                          <span className="field-error" role="alert">
-                            {fieldErrors[field]}
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-                <button
-                  className="button button--secondary shortcut-reset"
-                  type="button"
-                  onClick={() => {
-                    setDraft((current) => ({
-                      ...current,
-                      shortcuts: { ...DEFAULT_SETTINGS.shortcuts },
-                    }));
-                    setRecordingShortcut(null);
-                    setFieldErrors({});
-                  }}
-                >
-                  <RotateCcw size={15} />
-                  恢复默认快捷键
-                </button>
-              </section>
-            )}
-            {section === "audio" && (
-              <section className="settings-section">
-                <div className="settings-section__heading">
-                  <Volume2 size={18} />
-                  <h3>音频通道</h3>
-                </div>
-                <VirtualMicrophoneSection
-                  audio={draft.audio}
-                  devices={devices}
-                  devicesBusy={devicesBusy}
-                  devicesError={devicesError}
-                  onReload={loadDevices}
-                  onChange={(audio) => {
-                    setDraft((current) => ({ ...current, audio }));
-                    setFieldErrors({});
-                  }}
-                />
-                <div className="audio-test-launch">
-                  <div>
-                    <strong>设备测试向导</strong>
-                    <span>依次检查播放音、麦克风输入和播放设备回环。</span>
+                            }}
+                          >
+                            {recording ? "请按组合键…" : displayShortcut(draft.shortcuts[id])}
+                          </button>
+                          {fieldErrors[field] && (
+                            <span className="field-error" role="alert">
+                              {fieldErrors[field]}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                   <button
-                    className="button button--secondary"
+                    className="button button--secondary shortcut-reset"
                     type="button"
-                    onClick={() => setAudioTestOpen(true)}
-                    disabled={saving}
+                    onClick={() => {
+                      setDraft((current) => ({
+                        ...current,
+                        shortcuts: { ...DEFAULT_SETTINGS.shortcuts },
+                      }));
+                      setRecordingShortcut(null);
+                      setFieldErrors({});
+                    }}
                   >
-                    <Volume2 size={15} />
-                    打开向导
+                    <RotateCcw size={15} />
+                    恢复默认快捷键
                   </button>
-                </div>
-                {CHANNEL_META.map((meta) => (
-                  <AudioChannelCard
-                    key={meta.id}
-                    meta={meta}
-                    channel={draft.audio[meta.id]}
+                </section>
+              )}
+              {section === "audio" && (
+                <section className="settings-section">
+                  <div className="settings-section__heading">
+                    <Volume2 size={18} />
+                    <h3>音频通道</h3>
+                  </div>
+                  <VirtualMicrophoneSection
+                    audio={draft.audio}
                     devices={devices}
-                    busy={devicesBusy}
-                    error={devicesError}
-                    onReload={() => void loadDevices()}
-                    onChange={(patch) => updateAudioChannel(meta.id, patch)}
+                    devicesBusy={devicesBusy}
+                    devicesError={devicesError}
+                    onReload={loadDevices}
+                    onChange={(audio) => {
+                      setDraft((current) => ({ ...current, audio }));
+                      setFieldErrors({});
+                    }}
                   />
-                ))}
-                {fieldErrors.audio && (
-                  <p className="field-error" role="alert">
-                    {fieldErrors.audio}
-                  </p>
-                )}
-              </section>
-            )}
-            {section === "services" && (
-              <section className="settings-section">
-                <div className="settings-section__heading">
-                  <Radio size={18} />
-                  <h3>实时同传模型</h3>
-                </div>
-                <label className="field-group">
-                  <span className="field-label">模型</span>
-                  <input
-                    value={draft.realtime.model}
-                    readOnly
-                    spellCheck={false}
-                  />
-                </label>
-                <label className="field-group">
-                  <span className="field-label">WebSocket 接口地址</span>
-                  <input
-                    value={draft.realtime.baseUrl}
-                    onChange={(event) =>
-                      updateRealtime({ baseUrl: event.target.value })
-                    }
-                    spellCheck={false}
-                  />
-                  {fieldErrors["realtime.baseUrl"] && (
-                    <span className="field-error">
-                      {fieldErrors["realtime.baseUrl"]}
-                    </span>
+                  <div className="audio-test-launch">
+                    <div>
+                      <strong>设备测试向导</strong>
+                      <span>依次检查播放音、麦克风输入和播放设备回环。</span>
+                    </div>
+                    <button
+                      className="button button--secondary"
+                      type="button"
+                      onClick={() => setAudioTestOpen(true)}
+                      disabled={saving}
+                    >
+                      <Volume2 size={15} />
+                      打开向导
+                    </button>
+                  </div>
+                  {CHANNEL_META.map((meta) => (
+                    <AudioChannelCard
+                      key={meta.id}
+                      meta={meta}
+                      channel={draft.audio[meta.id]}
+                      devices={devices}
+                      busy={devicesBusy}
+                      error={devicesError}
+                      onReload={() => void loadDevices()}
+                      onChange={(patch) => updateAudioChannel(meta.id, patch)}
+                    />
+                  ))}
+                  {fieldErrors.audio && (
+                    <p className="field-error" role="alert">
+                      {fieldErrors.audio}
+                    </p>
                   )}
-                </label>
-                <SecretField
-                  label="DashScope API Key"
-                  status={realtimeStatus}
-                  value={draft.realtime.apiKey}
-                  onChange={(apiKey) => updateRealtime({ apiKey })}
-                  clearRequested={Boolean(draft.realtime.clearApiKey)}
-                  onClearChange={(clearApiKey) =>
-                    updateRealtime({ clearApiKey })
-                  }
-                  canClearStored={
-                    realtimeTargetChanged &&
-                    settings.realtime.apiKeyStatus === "secure_store"
-                  }
-                />
-                {fieldErrors["realtime.model"] && (
-                  <p className="field-error">{fieldErrors["realtime.model"]}</p>
-                )}
-              </section>
-            )}
-            {section === "privacy" && (
-              <section className="settings-section">
-                <div className="settings-section__heading">
-                  <ShieldCheck size={18} />
-                  <h3>隐私与安全</h3>
-                </div>
-                <div className="security-note">
-                  <Check size={16} />
-                  <span>
-                    音频发送至配置的同传接口，不保存在本地；字幕仅保留在当前会话内存中。密钥保存在
-                    Windows 凭据管理器中。
-                  </span>
-                </div>
-              </section>
-            )}
+                </section>
+              )}
+              {section === "services" && (
+                <section className="settings-section">
+                  <div className="settings-section__heading">
+                    <Radio size={18} />
+                    <h3>实时同传模型</h3>
+                  </div>
+                  <label className="field-group">
+                    <span className="field-label">模型</span>
+                    <input
+                      value={draft.realtime.model}
+                      readOnly
+                      spellCheck={false}
+                    />
+                  </label>
+                  <label className="field-group">
+                    <span className="field-label">WebSocket 接口地址</span>
+                    <input
+                      value={draft.realtime.baseUrl}
+                      onChange={(event) =>
+                        updateRealtime({ baseUrl: event.target.value })
+                      }
+                      spellCheck={false}
+                    />
+                    {fieldErrors["realtime.baseUrl"] && (
+                      <span className="field-error">
+                        {fieldErrors["realtime.baseUrl"]}
+                      </span>
+                    )}
+                  </label>
+                  <SecretField
+                    label="DashScope API Key"
+                    status={realtimeStatus}
+                    value={draft.realtime.apiKey}
+                    onChange={(apiKey) => updateRealtime({ apiKey })}
+                    clearRequested={Boolean(draft.realtime.clearApiKey)}
+                    onClearChange={(clearApiKey) =>
+                      updateRealtime({ clearApiKey })
+                    }
+                    canClearStored={
+                      realtimeTargetChanged &&
+                      settings.realtime.apiKeyStatus === "secure_store"
+                    }
+                  />
+                  {fieldErrors["realtime.model"] && (
+                    <p className="field-error">{fieldErrors["realtime.model"]}</p>
+                  )}
+                </section>
+              )}
+              {section === "privacy" && (
+                <section className="settings-section">
+                  <div className="settings-section__heading">
+                    <ShieldCheck size={18} />
+                    <h3>隐私与安全</h3>
+                  </div>
+                  <div className="security-note">
+                    <Check size={16} />
+                    <span>
+                      音频发送至配置的同传接口，不保存在本地；字幕仅保留在当前会话内存中。密钥保存在
+                      Windows 凭据管理器中。
+                    </span>
+                  </div>
+                </section>
+              )}
+            </div>
           </div>
         </div>
         {audioTestOpen && (
@@ -1031,6 +1044,7 @@ export function SettingsDialog({
         <footer className="settings-dialog__footer">
           <span
             className="settings-save-state"
+            data-state={saveError ? "error" : dirty ? "dirty" : "saved"}
             role={saveError ? "alert" : "status"}
           >
             {saveError ?? (dirty ? "有未保存的更改" : "设置已保存")}

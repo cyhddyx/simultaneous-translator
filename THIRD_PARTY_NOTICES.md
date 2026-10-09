@@ -1,3 +1,16 @@
+# Fusion Pixel Font
+
+The interface bundles the unmodified Fusion Pixel 12px proportional Simplified
+Chinese font by TakWolf, including Latin and CJK glyphs. It is used locally;
+no remote font request is made by the application.
+
+Source: https://github.com/TakWolf/fusion-pixel-font
+Asset origin: https://fusion-pixel-font.takwolf.com/
+Copyright (c) 2022, TakWolf (https://takwolf.com).
+License: SIL Open Font License, Version 1.1. The complete license is included at
+`desktop/public/fonts/LICENSE-OFL.txt` and in the built frontend at
+`fonts/LICENSE-OFL.txt`.
+
 # Optional VB-CABLE Component
 
 VB-CABLE is developed and owned by Vincent Burel / VB-Audio Software.

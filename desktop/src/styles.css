@@ -46,6 +46,9 @@
 
   --gutter: clamp(18px, 3vw, 32px);
   --ease: cubic-bezier(0.2, 0.8, 0.3, 1);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
 
   color: var(--text-body);
   background: var(--bg-base);
@@ -1042,23 +1045,19 @@ button:disabled {
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.44);
   font-size: 13px;
   font-weight: 600;
-  animation: toast-in 220ms var(--ease);
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity 180ms var(--ease-out),
+    transform 180ms var(--ease-out);
+  @starting-style {
+    opacity: 0;
+    transform: translateY(8px);
+  }
 }
 
 .toast svg {
   color: var(--accent-bright);
-}
-
-@keyframes toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-
-  to {
-    opacity: 1;
-    transform: none;
-  }
 }
 
 /* ==========================================================================
@@ -1093,16 +1092,10 @@ button:disabled {
   padding: 24px;
   background: rgba(6, 8, 11, 0.74);
   backdrop-filter: blur(3px);
-  animation: fade-in 160ms var(--ease);
-}
-
-@keyframes fade-in {
-  from {
+  opacity: 1;
+  transition: opacity 180ms var(--ease-out);
+  @starting-style {
     opacity: 0;
-  }
-
-  to {
-    opacity: 1;
   }
 }
 
@@ -1116,6 +1109,15 @@ button:disabled {
   border-radius: var(--radius-xl);
   background: var(--surface-1);
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  opacity: 1;
+  transform: scale(1);
+  transition:
+    opacity 220ms var(--ease-out),
+    transform 220ms var(--ease-out);
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.96);
+  }
 }
 
 .settings-dialog__header,
@@ -1261,6 +1263,15 @@ button:disabled {
   border-radius: var(--radius-xl);
   background: var(--surface-1);
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+  opacity: 1;
+  transform: scale(1);
+  transition:
+    opacity 220ms var(--ease-out),
+    transform 220ms var(--ease-out);
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.96);
+  }
 }
 
 .audio-test-dialog__header,
@@ -2509,6 +2520,12 @@ select:focus {
   *::before,
   *::after {
     scroll-behavior: auto !important;
+  }
+
+  .subtitle-window,
+  .subtitle-window *,
+  .subtitle-window *::before,
+  .subtitle-window *::after {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;

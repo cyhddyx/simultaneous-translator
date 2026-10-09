@@ -11,7 +11,7 @@ import {
   VolumeX,
   WifiOff,
   X,
-} from "lucide-react";
+} from "./PixelIcons";
 
 import { ResizeHandles } from "./TitleBar";
 import { windowControls } from "./window";

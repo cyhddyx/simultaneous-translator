@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Cable, Check, Download, ExternalLink, RefreshCw } from "lucide-react";
+import { Cable, Check, Download, ExternalLink, RefreshCw } from "./PixelIcons";
 import type { AudioDeviceList, AudioSettings } from "./types";
 import { translatorApi } from "./tauri";
 import { connectVirtualMicrophone, findVirtualMicrophone } from "./audioRouting";

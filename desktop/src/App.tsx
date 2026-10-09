@@ -15,7 +15,6 @@ import {
   LoaderCircle,
   MessageSquareDashed,
   Mic,
-  Languages,
   Radio,
   RefreshCw,
   Settings,
@@ -28,10 +27,9 @@ import {
   Waves,
   WifiOff,
   X,
-} from "lucide-react";
+} from "./PixelIcons";
 
 import { SettingsDialog } from "./SettingsDialog";
-import { AmbientVisualizer } from "./AmbientVisualizer";
 import { ResizeHandles, WindowControls } from "./TitleBar";
 import { isConfigurationComplete, translatorApi } from "./tauri";
 import {
@@ -171,7 +169,7 @@ function StatusTile({
       </span>
       <div className="status-tile__copy">
         <span className="status-tile__label">{label}</span>
-        <strong className="status-tile__value">{value}</strong>
+        <strong className="status-tile__value" title={value}>{value}</strong>
       </div>
       {trailing}
     </div>
@@ -410,6 +408,8 @@ export default function App() {
   // A stopped session keeps its history below, but the live stage must not
   // imply that its final subtitle is still being translated.
   const currentCaption = active ? latestSessionCaption(snapshot) : null;
+  const showCaptionCompanion =
+    !currentCaption && !session.partialTranscript && !session.partialTranslation;
   const writeLocalError = useCallback((title: string, message: string) => {
     setSnapshot((current) => ({
       ...current,
@@ -605,7 +605,7 @@ export default function App() {
         : "静音发言";
 
   return (
-    <main className="app-shell">
+    <main className="app-shell app-shell--pixel">
       <ResizeHandles />
 
       <div className="workspace">
@@ -617,13 +617,30 @@ export default function App() {
               aria-label="同传翻译"
               title="同传翻译"
             >
-              <Languages size={25} aria-hidden="true" />
+              <img
+                src="/app-icon.png"
+                alt=""
+                width={128}
+                height={128}
+                draggable={false}
+                aria-hidden="true"
+              />
             </div>
+            <span className="ambient-heading__copy" aria-hidden="true">
+              AUDIO QUEST
+              <small>PLAYER 01 // LIVE RUN</small>
+            </span>
           </header>
-          <AmbientVisualizer
-            active={phase === "listening"}
-            strength={session.partialTranscript ? 0.9 : 0.36}
-          />
+          <div
+            className="ambient-visualizer-container"
+            data-phase={phase}
+          >
+            <img
+              className="ambient-device-art"
+              src="/translator-console-pixel.png"
+              alt="像素风掌上同传翻译器，显示中文与 English 双语字幕"
+            />
+          </div>
           <div className="ambient-footer">
             <div className="ambient-session-label">
               <span>会话状态</span>
@@ -675,386 +692,428 @@ export default function App() {
 
         <div className="translation-panel">
           <header className="integrated-titlebar" data-tauri-drag-region>
+            <span
+              className="integrated-titlebar__title"
+              data-tauri-drag-region
+              aria-hidden="true"
+            >
+              TRANSLATION DECK <small>// ROOM 02</small>
+            </span>
             <WindowControls />
           </header>
-          <div className="translation-scroll">
-            <section className="runtime-bar" aria-label="运行时状态与通道控制">
-              <span
-                className={
-                  trayStatus
-                    ? `runtime-pill runtime-pill--${trayStatus}`
-                    : "runtime-pill runtime-pill--unavailable"
-                }
-                role="status"
-                aria-live="polite"
-                title={`托盘状态：${trayStatusText}`}
-              >
-                <TrayIcon
-                  size={15}
-                  className={trayStatus === "connecting" ? "spin" : undefined}
-                  aria-hidden="true"
-                />
-                <span className="runtime-pill__label">{trayStatusText}</span>
-              </span>
-
-              <div className="runtime-switches">
-                <button
-                  className={`runtime-switch${listenOn ? " is-on" : ""}`}
-                  type="button"
-                  onClick={() => void runRuntimeAction("toggle_listen_channel")}
-                  disabled={!runtimeReady || actionPending || !active || !listenConfigured}
-                  aria-pressed={listenOn}
-                  aria-label={`收听通道：${listenOn ? "已开启" : "已关闭"}`}
-                  title={listenChannelHint}
-                >
-                  <Headphones size={15} aria-hidden="true" />
-                  <span>收听</span>
-                  <em>{listenOn ? "开" : "关"}</em>
-                </button>
-
-                <button
-                  className={`runtime-switch${speakOn ? " is-on" : ""}`}
-                  type="button"
-                  onClick={() => void runRuntimeAction("toggle_speak_channel")}
-                  disabled={!runtimeReady || actionPending || !active || !speakConfigured}
-                  aria-pressed={speakOn}
-                  aria-label={`发言通道：${speakOn ? "已开启" : "已关闭"}`}
-                  title={speakChannelHint}
-                >
-                  <Mic size={15} aria-hidden="true" />
-                  <span>发言</span>
-                  <em>{speakOn ? "开" : "关"}</em>
-                </button>
-
-                <button
-                  className={`runtime-switch${speakMuted ? " is-muted" : ""}`}
-                  type="button"
-                  onClick={() => void runRuntimeAction("toggle_speak_mute")}
-                  disabled={!runtimeReady || actionPending || !active || !speakOn}
-                  aria-pressed={speakMuted}
-                  aria-label={`发言静音：${speakMuted ? "已静音" : "未静音"}`}
-                  title={muteHint}
-                >
-                  {speakMuted ? (
-                    <VolumeX size={15} aria-hidden="true" />
-                  ) : (
-                    <Volume2 size={15} aria-hidden="true" />
-                  )}
-                  <span>静音</span>
-                  <em>{speakMuted ? "已静音" : "未静音"}</em>
-                </button>
-
-                <button
-                  className={`runtime-switch${subtitleVisible ? " is-on" : ""}`}
-                  type="button"
-                  onClick={() => void runRuntimeAction("toggle_subtitle_window")}
-                  disabled={!runtimeReady || actionPending}
-                  aria-pressed={subtitleVisible}
-                  aria-label={`字幕悬浮窗：${subtitleVisible ? "已显示" : "已隐藏"}`}
-                  title={subtitleVisible ? "隐藏字幕悬浮窗" : "显示字幕悬浮窗"}
-                >
-                  <Captions size={15} aria-hidden="true" />
-                  <span>字幕窗</span>
-                  <em>{subtitleVisible ? "显示中" : "已隐藏"}</em>
-                </button>
-              </div>
-            </section>
-
-            <div className="translation-toolbar">
-              <div
-                className={`session-chip session-chip--${phase}`}
-                aria-live="polite"
-              >
-                {phase === "starting" || phase === "stopping" ? (
-                  <LoaderCircle size={14} className="spin" aria-hidden="true" />
-                ) : (
-                  <span className="session-chip__dot" aria-hidden="true" />
-                )}
-                <span>{loading ? "正在加载" : phaseLabel(phase)}</span>
-              </div>
-              <div className="translation-directions" aria-label="双向翻译语言">
-                {(["listen", "speak"] as const).map((id) => {
-                  const channel = snapshot.settings.audio[id];
-                  const Icon = id === "listen" ? Headphones : Mic;
-                  const label = id === "listen" ? "我听到" : "对方听到";
-                  return <button key={id}
-                    className={`language-pair ${channel.enabled ? "" : "is-inactive"}`}
-                    type="button" onClick={() => setSettingsOpen(true)} disabled={active}
-                    aria-label={`设置${label}的语言`}
-                    title={active ? "请先停止同传后修改语言" : `设置${label}的语言`}>
-                    <Icon size={14} aria-hidden="true" />
-                    <span>{label}</span><span className="language-pair__arrow" aria-hidden="true">→</span>
-                    <strong>{channel.targetLanguage}</strong>
-                    {!channel.enabled && <span className="direction-disabled">已停用</span>}
-                  </button>;
-                })}
-              </div>
-            </div>
-
-            {showShortcutNotice && shortcutNotice && (
-              <section
-                className="runtime-notice runtime-notice--shortcut"
-                role="status"
-              >
-                <TriangleAlert size={17} aria-hidden="true" />
-                <div className="runtime-notice__copy">
-                  <strong>全局快捷键未全部生效</strong>
-                  <span>{shortcutNotice}</span>
-                </div>
-                <button
-                  className="icon-button icon-button--quiet"
-                  type="button"
-                  onClick={() => setDismissedShortcutNotice(shortcutNotice)}
-                  aria-label="关闭快捷键提示"
-                  title="关闭快捷键提示"
-                >
-                  <X size={16} />
-                </button>
-              </section>
-            )}
-
-            {visibleRuntimeRows.map((row) => (
-              <section
-                key={row.key}
-                className={`runtime-error runtime-error--${row.service}${
-                  row.severity === "warning" ? " runtime-error--warning" : ""
-                }`}
-                role={row.severity === "warning" ? "status" : "alert"}
-              >
-                {row.service === "audio" ? (
-                  <VolumeX size={18} aria-hidden="true" />
-                ) : row.service === "network" ? (
-                  <WifiOff size={18} aria-hidden="true" />
-                ) : (
-                  <CircleAlert size={18} aria-hidden="true" />
-                )}
-                <div className="runtime-error__copy">
-                  <strong>{row.title}</strong>
-                  <span>{row.message}</span>
-                </div>
-                <div className="runtime-error__actions">
-                  {row.severity === "error" && row.recoverable && !active && (
-                    // Retry reuses `start_or_stop_session` on purpose: the
-                    // RuntimeAction set is frozen at the seven values in
-                    // tray-shortcuts-contract §4 and a dedicated "reconnect"
-                    // action would have to be added to the tray, the global
-                    // shortcuts and this window at once. A future standalone
-                    // reconnect must change the contract document first.
-                    <button
-                      className="button button--secondary button--compact"
-                      type="button"
-                      onClick={() => void runRuntimeAction("start_or_stop_session")}
-                      disabled={actionPending}
-                      title="重新开始同传"
-                    >
-                      <RefreshCw size={14} aria-hidden="true" />
-                      重试
-                    </button>
-                  )}
-                  <button
-                    className="icon-button icon-button--quiet"
-                    type="button"
-                    onClick={() =>
-                      setDismissedRuntimeErrors((current) => [...current, row.key])
-                    }
-                    aria-label={`关闭${row.title}提示`}
-                    title="关闭提示"
-                  >
-                    <X size={16} />
-                  </button>
-                </div>
-              </section>
-            ))}
-
-            {visibleError && (
-              <section className="error-banner" role="alert">
-                <CircleAlert size={18} aria-hidden="true" />
-                <div className="error-banner__copy">
-                  <strong>{visibleError.title}</strong>
-                  <span>{visibleError.message}</span>
-                </div>
-                <div className="error-banner__actions">
-                  {visibleError.recoverable && !active && (
-                    <button
-                      className="button button--secondary button--compact"
-                      type="button"
-                      onClick={retry}
-                    >
-                      <RefreshCw size={14} aria-hidden="true" />
-                      重试
-                    </button>
-                  )}
-                  {visibleError.service === "configuration" && (
-                    <button
-                      className="button button--secondary button--compact"
-                      type="button"
-                      onClick={() => setSettingsOpen(true)}
-                    >
-                      设置
-                    </button>
-                  )}
-                  <button
-                    className="icon-button icon-button--quiet"
-                    type="button"
-                    onClick={() => setDismissedErrorId(visibleError.id)}
-                    aria-label="关闭错误提示"
-                    title="关闭错误提示"
-                  >
-                    <X size={16} />
-                  </button>
-                </div>
-              </section>
-            )}
-
-            <section
-              className={`panel caption-stage caption-stage--${snapshot.settings.subtitleSize}`}
-              aria-labelledby="caption-stage-title"
+          <div className="translation-scroll-frame">
+            <div
+              className="translation-scroll"
+              tabIndex={0}
+              aria-label="翻译与会话记录"
             >
-              <div className="stage-topline">
-                <div className="panel-heading">
-                  <h2 id="caption-stage-title">实时翻译</h2>
-                </div>
-                <div className="waveform-wrap">
-                  <WaveformCanvas
-                    active={phase === "listening"}
-                    strength={session.partialTranscript ? 0.9 : 0.36}
-                  />
-                </div>
-              </div>
-
-              <div className="partial-line" aria-live="off">
-                <span className="caption-label">
-                  正在识别
-                  {partialChannelLabel && (
-                    <em className="channel-chip">{partialChannelLabel}</em>
-                  )}
+              <section className="runtime-bar" aria-label="运行时状态与通道控制">
+                <span className="runtime-bar__legend" aria-hidden="true">
+                  SYSTEM PANEL
                 </span>
-                <div className="partial-line__body">
-                  <p>
-                    {session.partialTranscript ||
-                      (phase === "listening"
-                        ? "正在聆听…"
-                        : "等待会话开始")}
-                  </p>
-                  {session.partialTranslation && (
-                    <p className="partial-line__translation">
-                      {session.partialTranslation}
-                    </p>
-                  )}
-                </div>
-              </div>
+                <span
+                  className={
+                    trayStatus
+                      ? `runtime-pill runtime-pill--${trayStatus}`
+                      : "runtime-pill runtime-pill--unavailable"
+                  }
+                  role="status"
+                  aria-live="polite"
+                  title={`托盘状态：${trayStatusText}`}
+                >
+                  <TrayIcon
+                    size={15}
+                    className={trayStatus === "connecting" ? "spin" : undefined}
+                    aria-hidden="true"
+                  />
+                  <span className="runtime-pill__label">{trayStatusText}</span>
+                </span>
 
-              <div className="current-caption">
-                <div className="current-caption__source">
-                  <span className="caption-label">原文</span>
-                  <p>{currentCaption?.sourceText ?? "等待语音输入"}</p>
+                <div className="runtime-switches">
+                  <button
+                    className={`runtime-switch${listenOn ? " is-on" : ""}`}
+                    type="button"
+                    onClick={() => void runRuntimeAction("toggle_listen_channel")}
+                    disabled={!runtimeReady || actionPending || !active || !listenConfigured}
+                    aria-pressed={listenOn}
+                    aria-label={`收听通道：${listenOn ? "已开启" : "已关闭"}`}
+                    title={listenChannelHint}
+                  >
+                    <Headphones size={15} aria-hidden="true" />
+                    <span>收听</span>
+                    <em>{listenOn ? "开" : "关"}</em>
+                  </button>
+
+                  <button
+                    className={`runtime-switch${speakOn ? " is-on" : ""}`}
+                    type="button"
+                    onClick={() => void runRuntimeAction("toggle_speak_channel")}
+                    disabled={!runtimeReady || actionPending || !active || !speakConfigured}
+                    aria-pressed={speakOn}
+                    aria-label={`发言通道：${speakOn ? "已开启" : "已关闭"}`}
+                    title={speakChannelHint}
+                  >
+                    <Mic size={15} aria-hidden="true" />
+                    <span>发言</span>
+                    <em>{speakOn ? "开" : "关"}</em>
+                  </button>
+
+                  <button
+                    className={`runtime-switch${speakMuted ? " is-muted" : ""}`}
+                    type="button"
+                    onClick={() => void runRuntimeAction("toggle_speak_mute")}
+                    disabled={!runtimeReady || actionPending || !active || !speakOn}
+                    aria-pressed={speakMuted}
+                    aria-label={`发言静音：${speakMuted ? "已静音" : "未静音"}`}
+                    title={muteHint}
+                  >
+                    {speakMuted ? (
+                      <VolumeX size={15} aria-hidden="true" />
+                    ) : (
+                      <Volume2 size={15} aria-hidden="true" />
+                    )}
+                    <span>静音</span>
+                    <em>{speakMuted ? "已静音" : "未静音"}</em>
+                  </button>
+
+                  <button
+                    className={`runtime-switch${subtitleVisible ? " is-on" : ""}`}
+                    type="button"
+                    onClick={() => void runRuntimeAction("toggle_subtitle_window")}
+                    disabled={!runtimeReady || actionPending}
+                    aria-pressed={subtitleVisible}
+                    aria-label={`字幕悬浮窗：${subtitleVisible ? "已显示" : "已隐藏"}`}
+                    title={subtitleVisible ? "隐藏字幕悬浮窗" : "显示字幕悬浮窗"}
+                  >
+                    <Captions size={15} aria-hidden="true" />
+                    <span>字幕窗</span>
+                    <em>{subtitleVisible ? "显示中" : "已隐藏"}</em>
+                  </button>
                 </div>
-                <div className="current-caption__translation">
-                  <span className="caption-label">译文</span>
-                  {stageTranslationState ? (
-                    <p className="translation-pending">
-                      {currentCaption.status === "queued" ||
-                      currentCaption.status === "translating" ? (
-                        <LoaderCircle
-                          size={18}
-                          className="spin"
-                          aria-hidden="true"
-                        />
-                      ) : (
-                        <CircleAlert size={18} aria-hidden="true" />
-                      )}
-                      {currentCaption ? captionStatusLabel(currentCaption) : ""}
-                    </p>
+              </section>
+
+              <div className="translation-toolbar">
+                <span className="translation-toolbar__badge" aria-hidden="true">
+                  ROUND 01
+                </span>
+                <div
+                  className={`session-chip session-chip--${phase}`}
+                  aria-live="polite"
+                >
+                  {phase === "starting" || phase === "stopping" ? (
+                    <LoaderCircle size={14} className="spin" aria-hidden="true" />
                   ) : (
-                    <p
-                      aria-live="polite"
-                      className={
-                        !stageTranslation ? "is-placeholder" : undefined
-                      }
-                    >
-                      {stageTranslation ?? "等待翻译"}
-                    </p>
+                    <span className="session-chip__dot" aria-hidden="true" />
                   )}
+                  <span>{loading ? "正在加载" : phaseLabel(phase)}</span>
+                </div>
+                <div className="translation-directions" aria-label="双向翻译语言">
+                  {(["listen", "speak"] as const).map((id) => {
+                    const channel = snapshot.settings.audio[id];
+                    const Icon = id === "listen" ? Headphones : Mic;
+                    const label = id === "listen" ? "我听到" : "对方听到";
+                    return <button key={id}
+                      className={`language-pair ${channel.enabled ? "" : "is-inactive"}`}
+                      type="button" onClick={() => setSettingsOpen(true)} disabled={active}
+                      aria-label={`设置${label}的语言`}
+                      title={active ? "请先停止同传后修改语言" : `设置${label}的语言`}>
+                      <Icon size={14} aria-hidden="true" />
+                      <span>{label}</span><span className="language-pair__arrow" aria-hidden="true">→</span>
+                      <strong>{channel.targetLanguage}</strong>
+                      {!channel.enabled && <span className="direction-disabled">已停用</span>}
+                    </button>;
+                  })}
                 </div>
               </div>
-            </section>
 
-            <section
-              className="panel history-section"
-              aria-labelledby="history-title"
-            >
-              <header className="history-section__header">
-                <div className="panel-heading">
-                  <h2 id="history-title">
-                    会话记录{" "}
-                    <span className="history-count">
-                      {snapshot.captions.length}
-                    </span>
-                  </h2>
-                </div>
-                <div className="history-actions">
+              {showShortcutNotice && shortcutNotice && (
+                <section
+                  className="runtime-notice runtime-notice--shortcut"
+                  role="status"
+                >
+                  <TriangleAlert size={17} aria-hidden="true" />
+                  <div className="runtime-notice__copy">
+                    <strong>全局快捷键未全部生效</strong>
+                    <span>{shortcutNotice}</span>
+                  </div>
                   <button
-                    className="icon-button"
+                    className="icon-button icon-button--quiet"
                     type="button"
-                    onClick={() => void handleCopy()}
-                    disabled={!snapshot.captions.length}
-                    aria-label="复制最近字幕"
-                    title="复制最近字幕"
+                    onClick={() => setDismissedShortcutNotice(shortcutNotice)}
+                    aria-label="关闭快捷键提示"
+                    title="关闭快捷键提示"
                   >
-                    <Copy size={16} />
+                    <X size={16} />
                   </button>
-                  <button
-                    className="icon-button"
-                    type="button"
-                    onClick={() => void handleClear()}
-                    disabled={!snapshot.captions.length || active}
-                    aria-label="清空字幕历史"
-                    title={active ? "停止同传后清空字幕历史" : "清空字幕历史"}
-                  >
-                    <Trash2 size={16} />
-                  </button>
-                </div>
-              </header>
-
-              {snapshot.captions.length ? (
-                <ol className="caption-history" aria-label="字幕历史">
-                  {[...snapshot.captions].reverse().map((caption) => (
-                    <li key={caption.id} className="caption-history__item">
-                      <time dateTime={caption.createdAt}>
-                        {formatCaptionTime(caption.createdAt)}
-                        {caption.channel && (
-                          <em className="channel-chip">
-                            {caption.channel === "speak" ? "我说" : "对方"}
-                          </em>
-                        )}
-                      </time>
-                      <div className="caption-history__content">
-                        <p className="history-source">{caption.sourceText}</p>
-                        <p
-                          className={
-                            caption.status === "translated"
-                              ? "history-translation"
-                              : "history-translation is-pending"
-                          }
-                        >
-                          {caption.translationText ??
-                            caption.errorMessage ??
-                            captionStatusLabel(caption)}
-                        </p>
-                      </div>
-                      <CaptionStatus caption={caption} />
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <div className="history-empty">
-                  <span className="history-empty__icon" aria-hidden="true">
-                    <MessageSquareDashed size={22} />
-                  </span>
-                  <p className="history-empty__title">尚无字幕记录</p>
-                </div>
+                </section>
               )}
-            </section>
+
+              {visibleRuntimeRows.map((row) => (
+                <section
+                  key={row.key}
+                  className={`runtime-error runtime-error--${row.service}${
+                    row.severity === "warning" ? " runtime-error--warning" : ""
+                  }`}
+                  role={row.severity === "warning" ? "status" : "alert"}
+                >
+                  {row.service === "audio" ? (
+                    <VolumeX size={18} aria-hidden="true" />
+                  ) : row.service === "network" ? (
+                    <WifiOff size={18} aria-hidden="true" />
+                  ) : (
+                    <CircleAlert size={18} aria-hidden="true" />
+                  )}
+                  <div className="runtime-error__copy">
+                    <strong>{row.title}</strong>
+                    <span>{row.message}</span>
+                  </div>
+                  <div className="runtime-error__actions">
+                    {row.severity === "error" && row.recoverable && !active && (
+                      // Retry reuses `start_or_stop_session` on purpose: the
+                      // RuntimeAction set is frozen at the seven values in
+                      // tray-shortcuts-contract §4 and a dedicated "reconnect"
+                      // action would have to be added to the tray, the global
+                      // shortcuts and this window at once. A future standalone
+                      // reconnect must change the contract document first.
+                      <button
+                        className="button button--secondary button--compact"
+                        type="button"
+                        onClick={() => void runRuntimeAction("start_or_stop_session")}
+                        disabled={actionPending}
+                        title="重新开始同传"
+                      >
+                        <RefreshCw size={14} aria-hidden="true" />
+                        重试
+                      </button>
+                    )}
+                    <button
+                      className="icon-button icon-button--quiet"
+                      type="button"
+                      onClick={() =>
+                        setDismissedRuntimeErrors((current) => [...current, row.key])
+                      }
+                      aria-label={`关闭${row.title}提示`}
+                      title="关闭提示"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                </section>
+              ))}
+
+              {visibleError && (
+                <section className="error-banner" role="alert">
+                  <CircleAlert size={18} aria-hidden="true" />
+                  <div className="error-banner__copy">
+                    <strong>{visibleError.title}</strong>
+                    <span>{visibleError.message}</span>
+                  </div>
+                  <div className="error-banner__actions">
+                    {visibleError.recoverable && !active && (
+                      <button
+                        className="button button--secondary button--compact"
+                        type="button"
+                        onClick={retry}
+                      >
+                        <RefreshCw size={14} aria-hidden="true" />
+                        重试
+                      </button>
+                    )}
+                    {visibleError.service === "configuration" && (
+                      <button
+                        className="button button--secondary button--compact"
+                        type="button"
+                        onClick={() => setSettingsOpen(true)}
+                      >
+                        设置
+                      </button>
+                    )}
+                    <button
+                      className="icon-button icon-button--quiet"
+                      type="button"
+                      onClick={() => setDismissedErrorId(visibleError.id)}
+                      aria-label="关闭错误提示"
+                      title="关闭错误提示"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                </section>
+              )}
+
+              <section
+                className={`panel caption-stage caption-stage--${snapshot.settings.subtitleSize}`}
+                aria-labelledby="caption-stage-title"
+              >
+                <div className="stage-topline">
+                  <div className="panel-heading">
+                    <h2 id="caption-stage-title">实时翻译</h2>
+                  </div>
+                  <div className="waveform-wrap">
+                    <WaveformCanvas
+                      active={phase === "listening"}
+                      strength={session.partialTranscript ? 0.9 : 0.36}
+                    />
+                  </div>
+                </div>
+
+                <div
+                  className={`partial-line${showCaptionCompanion ? " partial-line--waiting" : ""}`}
+                  aria-live="off"
+                >
+                  <span className="caption-label">
+                    正在识别
+                    {partialChannelLabel && (
+                      <em className="channel-chip">{partialChannelLabel}</em>
+                    )}
+                  </span>
+                  <div className="partial-line__body">
+                    <p>
+                      {session.partialTranscript ||
+                        (phase === "listening"
+                          ? "正在聆听…"
+                          : "等待会话开始")}
+                    </p>
+                    {session.partialTranslation && (
+                      <p className="partial-line__translation">
+                        {session.partialTranslation}
+                      </p>
+                    )}
+                  </div>
+                  {showCaptionCompanion && (
+                    <img
+                      className="caption-companion"
+                      src="/decorations/translator-bot.png"
+                      alt=""
+                      width={144}
+                      height={217}
+                      draggable={false}
+                      aria-hidden="true"
+                    />
+                  )}
+                </div>
+
+                <div className="current-caption">
+                  <div className="current-caption__source">
+                    <span className="caption-label">原文</span>
+                    <p>{currentCaption?.sourceText ?? "等待语音输入"}</p>
+                  </div>
+                  <div className="current-caption__translation">
+                    <span className="caption-label">译文</span>
+                    {stageTranslationState ? (
+                      <p className="translation-pending">
+                        {currentCaption.status === "queued" ||
+                        currentCaption.status === "translating" ? (
+                          <LoaderCircle
+                            size={18}
+                            className="spin"
+                            aria-hidden="true"
+                          />
+                        ) : (
+                          <CircleAlert size={18} aria-hidden="true" />
+                        )}
+                        {currentCaption ? captionStatusLabel(currentCaption) : ""}
+                      </p>
+                    ) : (
+                      <p
+                        aria-live="polite"
+                        className={
+                          !stageTranslation ? "is-placeholder" : undefined
+                        }
+                      >
+                        {stageTranslation ?? "等待翻译"}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </section>
+
+              <section
+                className="panel history-section"
+                aria-labelledby="history-title"
+              >
+                <header className="history-section__header">
+                  <div className="panel-heading">
+                    <h2 id="history-title">
+                      会话记录{" "}
+                      <span className="history-count">
+                        {snapshot.captions.length}
+                      </span>
+                    </h2>
+                  </div>
+                  <img
+                    className="history-section__tape"
+                    src="/decorations/memory-tape.png"
+                    alt=""
+                    width={224}
+                    height={143}
+                    draggable={false}
+                    aria-hidden="true"
+                  />
+                  <div className="history-actions">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => void handleCopy()}
+                      disabled={!snapshot.captions.length}
+                      aria-label="复制最近字幕"
+                      title="复制最近字幕"
+                    >
+                      <Copy size={16} />
+                    </button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => void handleClear()}
+                      disabled={!snapshot.captions.length || active}
+                      aria-label="清空字幕历史"
+                      title={active ? "停止同传后清空字幕历史" : "清空字幕历史"}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </header>
+
+                {snapshot.captions.length ? (
+                  <ol className="caption-history" aria-label="字幕历史">
+                    {[...snapshot.captions].reverse().map((caption) => (
+                      <li key={caption.id} className="caption-history__item">
+                        <time dateTime={caption.createdAt}>
+                          {formatCaptionTime(caption.createdAt)}
+                          {caption.channel && (
+                            <em className="channel-chip">
+                              {caption.channel === "speak" ? "我说" : "对方"}
+                            </em>
+                          )}
+                        </time>
+                        <div className="caption-history__content">
+                          <p className="history-source">{caption.sourceText}</p>
+                          <p
+                            className={
+                              caption.status === "translated"
+                                ? "history-translation"
+                                : "history-translation is-pending"
+                            }
+                          >
+                            {caption.translationText ??
+                              caption.errorMessage ??
+                              captionStatusLabel(caption)}
+                          </p>
+                        </div>
+                        <CaptionStatus caption={caption} />
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <div className="history-empty">
+                    <span className="history-empty__icon" aria-hidden="true">
+                      <MessageSquareDashed size={22} />
+                    </span>
+                    <p className="history-empty__title">尚无字幕记录</p>
+                  </div>
+                )}
+              </section>
+            </div>
           </div>
           <footer className="session-controls">
             <div className="control-dock">
@@ -1112,27 +1171,28 @@ export default function App() {
                 <Copy size={20} />
               </button>
             </div>
-            <span className="session-controls__label" role="status">
-              {loading
-                ? "正在加载"
-                : phase === "needs_configuration"
-                  ? "配置同传"
-                  : phase === "stopping"
-                    ? "正在停止"
-                    : active
-                      ? phaseLabel(phase)
-                      : "开始同传"}
-            </span>
+            <div className="session-feedback">
+              <span className="session-controls__label" role="status">
+                {loading
+                  ? "正在加载"
+                  : phase === "needs_configuration"
+                    ? "配置同传"
+                    : phase === "stopping"
+                      ? "正在停止"
+                      : active
+                        ? phaseLabel(phase)
+                        : "开始同传"}
+              </span>
+              {toast && (
+                <div className="session-message" role="status">
+                  <CheckCircle2 size={16} aria-hidden="true" />
+                  <span>{toast}</span>
+                </div>
+              )}
+            </div>
           </footer>
         </div>
       </div>
-
-      {toast && (
-        <div className="toast" role="status">
-          <CheckCircle2 size={16} aria-hidden="true" />
-          {toast}
-        </div>
-      )}
 
       {settingsOpen && (
         <SettingsDialog

@@ -9,7 +9,7 @@ import {
   RotateCcw,
   Volume2,
   X,
-} from "lucide-react";
+} from "./PixelIcons";
 import { translatorApi } from "./tauri";
 import {
   audioTestDeviceKind,
