@@ -30,6 +30,7 @@ import {
 } from "./PixelIcons";
 
 import { SettingsDialog } from "./SettingsDialog";
+import { CaptionTail } from "./CaptionTail";
 import { ResizeHandles, WindowControls } from "./TitleBar";
 import { isConfigurationComplete, translatorApi } from "./tauri";
 import {
@@ -44,13 +45,14 @@ import {
   type RuntimeChangeKind,
 } from "./runtime";
 import {
-  applyTranslatorEvent,
+  applyRuntimeTranslatorEvent,
   captionStatusLabel,
   errorMessage,
   formatCaptionHistory,
   formatCaptionTime,
   isSessionActive,
   latestSessionCaption,
+  reconcileRuntimeSession,
 } from "./snapshot";
 import {
   createInitialSnapshot,
@@ -224,6 +226,7 @@ export default function App() {
   const historyHydratedRef = useRef(false);
   // Last applied runtime state, so a change can be classified before rendering.
   const runtimeRef = useRef<RuntimeState | null>(null);
+  const acceptedRuntimeRef = useRef<RuntimeState | null>(null);
   // Set by a local dispatch so the resulting state change does not toast twice.
   const suppressRuntimeToastRef = useRef<{
     signature: RuntimeChangeKind;
@@ -232,11 +235,17 @@ export default function App() {
   const actionPendingRef = useRef(false);
 
   const applyEvent = useCallback((event: TranslatorEvent) => {
-    setSnapshot((current) => applyTranslatorEvent(current, event));
+    setSnapshot((current) =>
+      applyRuntimeTranslatorEvent(current, event, acceptedRuntimeRef.current),
+    );
   }, []);
 
   const applyRuntimeEvent = useCallback((incoming: RuntimeState) => {
-    setRuntime((current) => applyRuntimeState(current, incoming));
+    const next = applyRuntimeState(acceptedRuntimeRef.current, incoming);
+    if (next === acceptedRuntimeRef.current) return;
+    acceptedRuntimeRef.current = next;
+    setRuntime(next);
+    setSnapshot((current) => reconcileRuntimeSession(current, next));
   }, []);
 
   useEffect(() => {
@@ -253,7 +262,10 @@ export default function App() {
         const initial = await translatorApi.getSnapshot();
         if (!disposed) {
           setSnapshot((current) =>
-            initial.revision >= current.revision ? initial : current,
+            reconcileRuntimeSession(
+              initial.revision >= current.revision ? initial : current,
+              acceptedRuntimeRef.current,
+            ),
           );
           historyHydratedRef.current = true;
         }
@@ -331,7 +343,7 @@ export default function App() {
         runtimeUnsubscribeRef.current = unsubscribe;
         const initial = await translatorApi.getRuntimeState();
         if (!disposed) {
-          setRuntime((current) => applyRuntimeState(current, initial));
+          applyRuntimeEvent(initial);
         }
       } catch (error) {
         // A native build without the runtime channel must not break captions:
@@ -444,7 +456,7 @@ export default function App() {
         if (signature) {
           suppressRuntimeToastRef.current = { signature, revision: next.revision };
         }
-        setRuntime((current) => applyRuntimeState(current, next));
+        applyRuntimeEvent(next);
         setDismissedErrorId(null);
         setDismissedRuntimeErrors([]);
         const message = describeRuntimeActionResult(action, before, next);
@@ -457,7 +469,7 @@ export default function App() {
         setActionPending(false);
       }
     },
-    [],
+    [applyRuntimeEvent],
   );
 
   const handleSessionControl = () => {
@@ -968,16 +980,16 @@ export default function App() {
                     )}
                   </span>
                   <div className="partial-line__body">
-                    <p>
+                    <CaptionTail lines={3}>
                       {session.partialTranscript ||
                         (phase === "listening"
                           ? "正在聆听…"
                           : "等待会话开始")}
-                    </p>
+                    </CaptionTail>
                     {session.partialTranslation && (
-                      <p className="partial-line__translation">
+                      <CaptionTail lines={3} className="partial-line__translation">
                         {session.partialTranslation}
-                      </p>
+                      </CaptionTail>
                     )}
                   </div>
                   {showCaptionCompanion && (
@@ -996,7 +1008,7 @@ export default function App() {
                 <div className="current-caption">
                   <div className="current-caption__source">
                     <span className="caption-label">原文</span>
-                    <p>{currentCaption?.sourceText ?? "等待语音输入"}</p>
+                    <CaptionTail lines={3}>{currentCaption?.sourceText ?? "等待语音输入"}</CaptionTail>
                   </div>
                   <div className="current-caption__translation">
                     <span className="caption-label">译文</span>
@@ -1015,14 +1027,15 @@ export default function App() {
                         {currentCaption ? captionStatusLabel(currentCaption) : ""}
                       </p>
                     ) : (
-                      <p
+                      <CaptionTail
+                        lines={3}
                         aria-live="polite"
                         className={
                           !stageTranslation ? "is-placeholder" : undefined
                         }
                       >
                         {stageTranslation ?? "等待翻译"}
-                      </p>
+                      </CaptionTail>
                     )}
                   </div>
                 </div>

@@ -9,7 +9,9 @@ import {
   runtimeErrorRows,
 } from "../src/runtime.ts";
 import {
+  applyRuntimeTranslatorEvent,
   applyTranslatorEvent,
+  reconcileRuntimeSession,
   selectSubtitleView,
   sessionCanReceive,
 } from "../src/snapshot.ts";
@@ -184,6 +186,112 @@ test("stale revisions and other sessions never reach the overlay", () => {
   assert.equal(applyTranslatorEvent(snapshot, foreign), snapshot);
   assert.equal(selectSubtitleView(snapshot).source, "keep me");
   assert.equal(selectSubtitleView(snapshot).sessionId, "s1");
+});
+
+test("native stop clears an old session even without the sidecar stopped event", () => {
+  let snapshot = createInitialSnapshot();
+  snapshot = applyTranslatorEvent(
+    snapshot,
+    sessionEvent(900, "s1", {
+      phase: "starting", sessionId: "s1", partialTranscript: "旧原文",
+      partialTranslation: "旧译文", partialChannel: "listen",
+    }),
+  );
+  snapshot = applyTranslatorEvent(snapshot, captionEvent(901, "s1", caption(1, "listen")));
+
+  // The old reducer alone rejects a new session when no terminal event arrived.
+  const starting = sessionEvent(902, "s2", { phase: "starting", sessionId: "s2" });
+  assert.equal(applyTranslatorEvent(snapshot, starting), snapshot);
+
+  const stopped = { ...createInitialRuntimeState(), revision: 2 };
+  snapshot = reconcileRuntimeSession(snapshot, stopped);
+  assert.equal(snapshot.session.sessionId, null);
+  assert.equal(snapshot.session.partialTranscript, "");
+  assert.equal(snapshot.session.partialTranslation, "");
+  assert.equal(snapshot.session.partialChannel, null);
+  assert.equal(snapshot.session.startedAt, null);
+  assert.equal(snapshot.captions.length, 1);
+  assert.equal(snapshot.revision, 901);
+
+  const restarted = {
+    ...stopped, revision: 3, sessionId: "s2", sessionPhase: "starting",
+    listenEnabled: true, updatedAt: EMITTED_AT,
+  };
+  snapshot = applyRuntimeTranslatorEvent(snapshot, starting, restarted);
+  assert.equal(snapshot.session.sessionId, "s2");
+  assert.equal(snapshot.session.startedAt, EMITTED_AT);
+  assert.equal(snapshot.session.queue.pending, 0);
+
+  const listening = { ...restarted, revision: 4, sessionPhase: "listening" };
+  snapshot = applyRuntimeTranslatorEvent(
+    snapshot, sessionEvent(903, "s2", { partialTranscript: "新原文", partialTranslation: "新译文" }),
+    listening,
+  );
+  assert.equal(selectSubtitleView(snapshot).source, "新原文");
+  assert.equal(selectSubtitleView(snapshot).translation, "新译文");
+  assert.equal(selectSubtitleView(snapshot).current, null);
+});
+
+test("a replaced session ignores all late old-session lifecycle and caption events", () => {
+  let snapshot = createInitialSnapshot();
+  snapshot = applyTranslatorEvent(snapshot, sessionEvent(2, "s1", { phase: "starting", sessionId: "s1" }));
+  const runtime = {
+    ...createInitialRuntimeState(), revision: 10000, sessionId: "s2",
+    sessionPhase: "listening", listenEnabled: true, updatedAt: EMITTED_AT,
+  };
+  snapshot = reconcileRuntimeSession(snapshot, runtime);
+  assert.equal(snapshot.revision, 2, "the two revision counters must remain independent");
+  snapshot = applyRuntimeTranslatorEvent(snapshot, sessionEvent(3, "s2", { partialTranscript: "new" }), runtime);
+  for (const late of [
+    sessionEvent(4, "s1", { phase: "starting", sessionId: "s1" }),
+    sessionEvent(5, "s1", { phase: "idle", sessionId: null }),
+    captionEvent(6, "s1", caption(1, "listen")),
+    sessionEvent(7, "s1", { partialTranscript: "old" }),
+  ]) {
+    assert.equal(applyRuntimeTranslatorEvent(snapshot, late, runtime), snapshot);
+  }
+  assert.equal(snapshot.session.partialTranscript, "new");
+  assert.equal(snapshot.session.sessionId, "s2");
+});
+
+test("same-session runtime changes preserve live text and failed starts release their id", () => {
+  let snapshot = createInitialSnapshot();
+  const runtime = {
+    ...createInitialRuntimeState(), revision: 1, sessionId: "s1",
+    sessionPhase: "listening", listenEnabled: true,
+  };
+  snapshot = applyRuntimeTranslatorEvent(
+    snapshot, sessionEvent(1, "s1", { partialTranscript: "keep", partialTranslation: "保留" }), runtime,
+  );
+  const toggled = { ...runtime, revision: 2, subtitleVisible: true };
+  assert.equal(reconcileRuntimeSession(snapshot, toggled), snapshot);
+  const stopping = reconcileRuntimeSession(snapshot, { ...toggled, sessionPhase: "stopping" });
+  assert.equal(stopping.session.partialTranscript, "");
+  assert.equal(stopping.session.partialTranslation, "");
+
+  const failed = { ...createInitialRuntimeState(), revision: 3, sessionPhase: "error" };
+  const released = reconcileRuntimeSession(snapshot, failed);
+  assert.equal(released.session.sessionId, null);
+  assert.equal(released.session.phase, "error");
+  const idle = { ...failed, revision: 4, sessionPhase: "idle" };
+  assert.equal(applyRuntimeTranslatorEvent(released,
+    sessionEvent(10, "s1", { phase: "starting", sessionId: "s1" }), idle).session.sessionId, null);
+});
+
+test("runtime fallback and long-caption history keep the full original text", () => {
+  let snapshot = createInitialSnapshot();
+  snapshot.session.phase = "needs_configuration";
+  assert.equal(reconcileRuntimeSession(snapshot, createInitialRuntimeState()), snapshot);
+  snapshot = applyRuntimeTranslatorEvent(
+    snapshot, sessionEvent(1, "s1", { phase: "starting", sessionId: "s1" }), null,
+  );
+  const long = "连续讲话的极端情况。".repeat(1000) + "最新一句";
+  snapshot = applyRuntimeTranslatorEvent(snapshot, captionEvent(2, "s1", {
+    ...caption(1, "listen"), sourceText: long, translationText: long,
+  }), null);
+  assert.equal(snapshot.captions[0].sourceText, long);
+  assert.equal(snapshot.captions[0].translationText, long);
+  assert.equal(selectSubtitleView(snapshot).current.translationText, long);
 });
 
 test("the overlay reuses settings.subtitleSize instead of adding a setting", () => {

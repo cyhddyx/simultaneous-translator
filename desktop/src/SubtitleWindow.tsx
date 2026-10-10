@@ -14,6 +14,7 @@ import {
 } from "./PixelIcons";
 
 import { ResizeHandles } from "./TitleBar";
+import { CaptionTail } from "./CaptionTail";
 import { windowControls } from "./window";
 import { translatorApi } from "./tauri";
 import {
@@ -22,7 +23,12 @@ import {
   runtimeErrorRows,
   trayStatusLabel,
 } from "./runtime";
-import { applyTranslatorEvent, errorMessage, selectSubtitleView } from "./snapshot";
+import {
+  applyRuntimeTranslatorEvent,
+  errorMessage,
+  reconcileRuntimeSession,
+  selectSubtitleView,
+} from "./snapshot";
 import {
   createInitialSnapshot,
   type AppSnapshot,
@@ -52,6 +58,7 @@ export default function SubtitleWindow() {
   const [browserHidden, setBrowserHidden] = useState(false);
   const unsubscribeRef = useRef<(() => void) | null>(null);
   const runtimeUnsubscribeRef = useRef<(() => void) | null>(null);
+  const acceptedRuntimeRef = useRef<RuntimeState | null>(null);
 
   // `transparent(true)` needs a transparent root; the class lives only while
   // this window is mounted (docs/subtitle-window.md §6).
@@ -67,11 +74,17 @@ export default function SubtitleWindow() {
   }, []);
 
   const applyEvent = useCallback((event: TranslatorEvent) => {
-    setSnapshot((current) => applyTranslatorEvent(current, event));
+    setSnapshot((current) =>
+      applyRuntimeTranslatorEvent(current, event, acceptedRuntimeRef.current),
+    );
   }, []);
 
   const applyRuntimeEvent = useCallback((incoming: RuntimeState) => {
-    setRuntime((current) => applyRuntimeState(current, incoming));
+    const next = applyRuntimeState(acceptedRuntimeRef.current, incoming);
+    if (next === acceptedRuntimeRef.current) return;
+    acceptedRuntimeRef.current = next;
+    setRuntime(next);
+    setSnapshot((current) => reconcileRuntimeSession(current, next));
   }, []);
 
   useEffect(() => {
@@ -90,7 +103,10 @@ export default function SubtitleWindow() {
         const initial = await translatorApi.getSnapshot();
         if (!disposed) {
           setSnapshot((current) =>
-            initial.revision >= current.revision ? initial : current,
+            reconcileRuntimeSession(
+              initial.revision >= current.revision ? initial : current,
+              acceptedRuntimeRef.current,
+            ),
           );
         }
       } catch (error) {
@@ -124,7 +140,7 @@ export default function SubtitleWindow() {
         runtimeUnsubscribeRef.current = unsubscribe;
         const initial = await translatorApi.getRuntimeState();
         if (!disposed) {
-          setRuntime((current) => applyRuntimeState(current, initial));
+          applyRuntimeEvent(initial);
         }
       } catch {
         // Status text simply stays unavailable; subtitles keep working.
@@ -170,7 +186,7 @@ export default function SubtitleWindow() {
     if (!runtime || runtime.subtitleVisible === target) return;
     void translatorApi
       .dispatchNativeAction("toggle_subtitle_window")
-      .then((state) => setRuntime((current) => applyRuntimeState(current, state)))
+      .then(applyRuntimeEvent)
       .catch(() => {
         // The close button must never throw; the status text stays as it is.
       });
@@ -292,27 +308,32 @@ export default function SubtitleWindow() {
       </header>
 
       <section className="subtitle-window__stage">
-        <p className="subtitle-window__source">{sourceLine}</p>
-        <p
-          className={
-            translationLine
-              ? "subtitle-window__translation"
-              : "subtitle-window__translation is-placeholder"
-          }
-          style={{ fontSize: `${SUBTITLE_FONT_PX[size]}px` }}
-          aria-live="polite"
-        >
-          {translationLine ? (
-            translationLine
-          ) : translationPending && view.current ? (
-            <>
-              <LoaderCircle size={16} className="spin" aria-hidden="true" />
-              {view.current.statusLabel}
-            </>
-          ) : (
-            "等待翻译"
-          )}
-        </p>
+        <CaptionTail lines={2} className="subtitle-window__source">{sourceLine}</CaptionTail>
+        {translationLine ? (
+          <CaptionTail
+            lines={3}
+            className="subtitle-window__translation"
+            style={{ fontSize: `${SUBTITLE_FONT_PX[size]}px` }}
+            aria-live="polite"
+          >
+            {translationLine}
+          </CaptionTail>
+        ) : (
+          <p
+            className="subtitle-window__translation is-placeholder"
+            style={{ fontSize: `${SUBTITLE_FONT_PX[size]}px` }}
+            aria-live="polite"
+          >
+            {translationPending && view.current ? (
+              <>
+                <LoaderCircle size={16} className="spin" aria-hidden="true" />
+                {view.current.statusLabel}
+              </>
+            ) : (
+              "等待翻译"
+            )}
+          </p>
+        )}
       </section>
 
       {errorRows.map((row) => (

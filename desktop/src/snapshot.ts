@@ -15,6 +15,7 @@ import type {
   ChannelId,
   EngineError,
   ErrorService,
+  RuntimeState,
   SessionPhase,
   TranslatorEvent,
 } from "./types";
@@ -215,6 +216,74 @@ export function applyTranslatorEvent(
   }
 
   return { ...snapshot, revision, settings: event.data.payload };
+}
+
+/** Native lifecycle updates also arrive when a stopped sidecar cannot emit. */
+export function reconcileRuntimeSession(
+  snapshot: AppSnapshot,
+  runtime: RuntimeState | null,
+): AppSnapshot {
+  if (!runtime) return snapshot;
+  const phase =
+    runtime.sessionPhase === "idle" && snapshot.session.phase === "needs_configuration"
+      ? "needs_configuration"
+      : runtime.sessionPhase;
+  const replaced = snapshot.session.sessionId !== runtime.sessionId;
+  if (!replaced && snapshot.session.phase === phase) return snapshot;
+
+  if (!replaced) {
+    return {
+      ...snapshot,
+      session: {
+        ...snapshot.session,
+        phase,
+        ...(phase === "stopping"
+          ? { partialTranscript: "", partialTranslation: "", partialChannel: null }
+          : {}),
+      },
+    };
+  }
+
+  const health = runtime.sessionId ? "connecting" : "unknown";
+  return {
+    ...snapshot,
+    // Runtime and translator revisions are separate counters; keep this one.
+    session: {
+      ...snapshot.session,
+      phase,
+      sessionId: runtime.sessionId,
+      startedAt: runtime.sessionId ? runtime.updatedAt : null,
+      deviceName: null,
+      partialTranscript: "",
+      partialTranslation: "",
+      partialChannel: null,
+      deviceNames: {},
+      channels: {
+        listen: runtime.listenEnabled ? health : "unknown",
+        speak: runtime.speakEnabled ? health : "unknown",
+      },
+      health: { audio: health, recognition: health, translation: health },
+      queue: { ...snapshot.session.queue, pending: 0, skipped: 0, lagMs: 0 },
+      lastError: null,
+    },
+  };
+}
+
+export function applyRuntimeTranslatorEvent(
+  snapshot: AppSnapshot,
+  event: TranslatorEvent,
+  runtime: RuntimeState | null,
+): AppSnapshot {
+  const current = reconcileRuntimeSession(snapshot, runtime);
+  if (
+    runtime &&
+    event.type !== "settings" &&
+    event.data.sessionId !== runtime.sessionId &&
+    !(event.type === "error" && !event.data.sessionId && event.data.payload.service === "configuration")
+  ) {
+    return current;
+  }
+  return reconcileRuntimeSession(applyTranslatorEvent(current, event), runtime);
 }
 
 /** Captions belonging to the currently attached session only. */

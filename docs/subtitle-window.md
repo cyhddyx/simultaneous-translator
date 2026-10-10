@@ -67,6 +67,7 @@ const isSubtitleWindow = params.get("window") === "subtitle";
 4. 字体大小复用既有 `settings.subtitleSize`（`small | medium | large`），不新增设置项。
 5. 运行时状态（托盘状态、静音、通道开关、错误）来自 `runtime-state` 事件 + `get_runtime_state`，
    **不**在字幕窗口重复推导。
+6. 主窗口与字幕窗口共用 `snapshot.ts` 的运行时会话同步逻辑：以已经接受的 `runtime-state.sessionId` 为准，停止、启动失败或会话替换时清空实时字段，保留历史记录。引擎没有发出终止事件也必须解除旧会话绑定；旧会话迟到的字幕和状态事件不得重新绑定。运行时 revision 与翻译 revision 是独立计数，不能互相覆盖。
 
 > 明确禁止：字幕窗口自己 spawn 一个 sidecar 订阅、自己维护一套 revision 计数、
 > 或把 `translator-event` 再包装成新的全局事件名。
@@ -87,11 +88,13 @@ SubtitleWindow
 
 - **只显示字幕**：不出现设置入口、主控制栏、历史管理、会话控制按钮。
 - 字幕窗口只显示当前会话的实时句子；历史会话和之前已完成的句子不在悬浮窗重复展示。
+- 长文本显示末尾的实际换行：原文最多 2 行、译文最多 3 行。主界面的实时原文与译文各最多 3 行。全文保留在记录里；追加文字、窗口缩放和字体加载后自动跟到末尾，不截断模型结果。
 - 背景透明/半透明（默认 `rgba(15, 23, 42, 0.82)`），文字必须带足够对比度。
 - 拖拽区使用 `data-tauri-drag-region`（依赖 capability `core:window:allow-start-dragging`）。
 - 静音或通道关闭时用**图标 + 文字**体现，不允许只靠颜色。
 - `subtitleSize` 映射：`small → 15px / medium → 19px / large → 24px`（译文行）。
 - 小尺寸（420×120）下不得出现元素重叠；必要时隐藏拖拽条副标题。
+- 高度不超过 152px 时显示原文末尾 1 行、译文末尾 2 行；高度不超过 130px 时译文也收为末尾 1 行，三档字号均须露出最新一行。
 - 无边框窗口需要可拖拽 + 可缩放；缩放依赖 `core:window:allow-start-resize-dragging`。
 
 ---
