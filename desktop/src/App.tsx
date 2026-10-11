@@ -30,6 +30,8 @@ import {
 } from "./PixelIcons";
 
 import { SettingsDialog } from "./SettingsDialog";
+import { UpdateBanner } from "./AppUpdate";
+import { useAppUpdate } from "./useAppUpdate";
 import { CaptionTail } from "./CaptionTail";
 import { ResizeHandles, WindowControls } from "./TitleBar";
 import { isConfigurationComplete, translatorApi } from "./tauri";
@@ -206,6 +208,8 @@ function CaptionStatus({ caption }: { caption: CaptionSegment }) {
 }
 
 export default function App() {
+  const update = useAppUpdate();
+  const [settingsStartSection, setSettingsStartSection] = useState<"general" | "updates">("general");
   const [snapshot, setSnapshot] = useState<AppSnapshot>(() =>
     createInitialSnapshot(),
   );
@@ -719,6 +723,10 @@ export default function App() {
               tabIndex={0}
               aria-label="翻译与会话记录"
             >
+              <UpdateBanner update={update} onOpen={() => {
+                setSettingsStartSection("updates");
+                setSettingsOpen(true);
+              }} />
               <section className="runtime-bar" aria-label="运行时状态与通道控制">
                 <span className="runtime-bar__legend" aria-hidden="true">
                   SYSTEM PANEL
@@ -1209,9 +1217,11 @@ export default function App() {
 
       {settingsOpen && (
         <SettingsDialog
+          update={update}
+          initialSection={settingsStartSection}
           settings={snapshot.settings}
           sessionActive={active}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => { setSettingsOpen(false); setSettingsStartSection("general"); }}
           onSave={handleSaveSettings}
           onValidate={(draft) => translatorApi.validateSettings(draft)}
         />

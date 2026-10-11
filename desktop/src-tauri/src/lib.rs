@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 mod translation_languages;
 mod tray;
+mod updater;
 mod virtual_microphone;
 
 // Tauri's `tray-icon` feature pulls in `muda`, whose Windows backend imports
@@ -2837,6 +2838,7 @@ pub fn run() {
         .manage(EngineManager::default())
         .manage(ProbeManager::default())
         .manage(virtual_microphone::InstallerState::default())
+        .manage(updater::UpdateState::default())
         .manage(tray::RuntimeHub::default())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -2868,6 +2870,10 @@ pub fn run() {
             run_audio_test,
             virtual_microphone::install_virtual_microphone,
             virtual_microphone::open_virtual_microphone_link,
+            updater::check_app_update,
+            updater::download_app_update,
+            updater::install_app_update,
+            updater::open_app_releases,
             save_settings,
             start_translation,
             stop_translation,

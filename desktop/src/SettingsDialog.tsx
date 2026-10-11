@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Check,
+  Download,
   Eye,
   EyeOff,
   Headphones,
@@ -18,6 +19,8 @@ import {
 } from "./PixelIcons";
 import { translatorApi } from "./tauri";
 import { AudioDeviceTestWizard } from "./AudioDeviceTestWizard";
+import { AppUpdateSection } from "./AppUpdate";
+import type { AppUpdateController } from "./useAppUpdate";
 import { VirtualMicrophoneSection } from "./VirtualMicrophoneSection";
 import { findTranslationLanguage, outputLanguageError, outputLanguages } from "./translationLanguages";
 import {
@@ -33,8 +36,10 @@ import {
   type SettingsValidation,
 } from "./types";
 
-type SettingsSection = "general" | "audio" | "shortcuts" | "services" | "privacy";
+type SettingsSection = "general" | "audio" | "shortcuts" | "services" | "privacy" | "updates";
 interface SettingsDialogProps {
+  update: AppUpdateController;
+  initialSection?: SettingsSection;
   settings: PublicSettings;
   sessionActive: boolean;
   onClose: () => void;
@@ -59,6 +64,7 @@ const sectionLabels: Array<{
   { id: "shortcuts", label: "快捷键", icon: Keyboard },
   { id: "services", label: "同传模型", icon: Radio },
   { id: "privacy", label: "隐私与安全", icon: ShieldCheck },
+  { id: "updates", label: "软件更新", icon: Download },
 ];
 const SHORTCUT_ACTIONS: Array<{
   id: keyof ShortcutSettings;
@@ -499,13 +505,15 @@ function AudioChannelCard({
 }
 
 export function SettingsDialog({
+  update,
+  initialSection = "general",
   settings,
   sessionActive,
   onClose,
   onSave,
   onValidate,
 }: SettingsDialogProps) {
-  const [section, setSection] = useState<SettingsSection>("general");
+  const [section, setSection] = useState<SettingsSection>(initialSection);
   const [draft, setDraft] = useState(() => toDraft(settings));
   const [recordingShortcut, setRecordingShortcut] = useState<keyof ShortcutSettings | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
@@ -716,8 +724,8 @@ export function SettingsDialog({
               >
                 <Icon size={16} />
                 <span className="settings-nav__label">{label}</span>
-                {id === "privacy" && (
-                  <span className="settings-nav__compact-label" aria-hidden="true">隐私</span>
+                {(id === "privacy" || id === "services" || id === "updates") && (
+                  <span className="settings-nav__compact-label" aria-hidden="true">{id === "privacy" ? "隐私" : id === "services" ? "模型" : "更新"}</span>
                 )}
               </button>
             ))}
@@ -1028,6 +1036,10 @@ export function SettingsDialog({
                   </div>
                 </section>
               )}
+              {section === "updates" && <AppUpdateSection update={update} sessionActive={sessionActive} onInstall={() => {
+                if (dirty && !window.confirm("退出并安装将放弃未保存的设置更改，是否继续？")) return;
+                void update.install();
+              }} />}
             </div>
           </div>
         </div>

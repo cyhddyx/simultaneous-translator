@@ -118,6 +118,18 @@ npm run desktop:dev
 
 ## 安装与打包
 
+### 软件更新（从 0.5.2 开始）
+
+程序启动后自动查询本仓库的 GitHub Releases，并在运行期间每 6 小时检查一次。发现新版本时主界面显示“发现新版本”提示，点击“查看更新”进入“设置 → 软件更新”。也可以在该页面手动“检查更新”，或关闭自动检查；开关立即生效并在本机保留。
+
+更新检查包含 beta 预发布版本，按版本号比较 `beta0.5.3`、`v0.5.3` 和 `0.5.3` 等标签，忽略草稿与无法识别的标签；相同或更低版本不会提示更新。版本号取自当前打包程序。网络失败仅在更新页显示错误，不中断同传，也不会把失败误报为“已是最新版本”。
+
+点击“下载更新”将安装包下载到应用缓存目录，并核对同一 Release 的 `SHA256SUMS.txt`；安装包大小或 SHA-256 不符时阻止安装。下载完成后点击“退出并安装”，程序退出并打开 Windows 安装向导；同传运行时需要先停止。还提供 GitHub 发布页入口。安装由用户发起，下载和更新检查不影响正在进行的翻译。
+
+发布新版本时，需要同步 `desktop/package.json`、`desktop/src-tauri/Cargo.toml` 和 `desktop/src-tauri/tauri.conf.json` 的版本号，并向对应 Release 上传 `simultaneous-translator_<版本>_x64-setup.exe` 与 `SHA256SUMS.txt`。校验文件每行格式为 `<64 位 SHA-256>  <安装包文件名>`。当前实现适用于 Windows x64。
+
+**0.5.1 及更早版本没有更新功能，需要先手动下载安装 0.5.2；此后可在应用内得知和获取新版本。**
+
 只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_x64-setup.exe`，不需要编译源码。
 
 ### 程序由两部分组成，缺一不可

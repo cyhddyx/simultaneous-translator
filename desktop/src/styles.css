@@ -3935,6 +3935,31 @@ body.subtitle-root {
   background: rgba(148, 197, 214, 0.26);
 }
 
+.update-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  margin-bottom: 18px;
+  border: 2px solid var(--text-strong);
+  background: var(--accent-tint);
+  color: var(--text-strong);
+}
+.update-banner > span { flex: 1; min-width: 160px; }
+.update-banner strong, .update-banner small { display: block; }
+.update-banner small { margin-top: 3px; color: var(--text-muted); }
+.update-version { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border: 1px solid var(--line); background: var(--surface-tile); }
+.update-status { margin-top: 24px; color: var(--text-strong); }
+.app-update-section .switch-track { pointer-events: none; }
+.update-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.update-actions .button { white-space: normal; }
+.update-detail { margin: 8px 0; color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
+.update-progress { display: grid; gap: 6px; margin-top: 12px; }
+.update-progress progress { width: 100%; accent-color: var(--accent); }
+.update-release { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+.update-notes { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
+
 /* Minimum window size is 420x120: keep the stage readable without overlap. */
 @media (max-height: 152px) {
   .subtitle-window {

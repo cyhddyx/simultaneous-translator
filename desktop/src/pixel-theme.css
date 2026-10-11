@@ -876,7 +876,7 @@
   .app-shell--pixel :is(.settings-dialog, .audio-test-dialog) { height: calc(100dvh - 24px); width: 100%; }
   .app-shell--pixel :is(.settings-dialog__header, .audio-test-dialog__header) { padding: 12px 16px; }
   .app-shell--pixel .settings-dialog__body { grid-template-columns: minmax(0, 1fr); grid-template-rows: max-content minmax(0, 1fr); }
-  .app-shell--pixel .settings-nav { grid-auto-flow: column; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 5px; padding: 8px; overflow: visible; border-right: 0; border-bottom: 1px solid var(--pixel-edge); }
+  .app-shell--pixel .settings-nav { grid-auto-flow: column; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 5px; padding: 8px; overflow: visible; border-right: 0; border-bottom: 1px solid var(--pixel-edge); }
   .app-shell--pixel .settings-nav__item { justify-content: center; gap: 5px; min-height: 34px; padding: 5px; font-size: 12px; white-space: nowrap; }
   .app-shell--pixel .settings-nav__item svg { width: 14px; height: 14px; }
   .app-shell--pixel .settings-scroll-frame { margin: 10px; }
@@ -890,7 +890,7 @@
   .app-shell--pixel .history-section__tape { width: 56px; }
   .app-shell--pixel .field-grid { grid-template-columns: minmax(0, 1fr); gap: 18px; }
   .app-shell--pixel .settings-nav__item { flex-direction: column; gap: 3px; font-size: 12px; line-height: 1.5; white-space: normal; }
-  .app-shell--pixel .settings-nav__item[data-section="privacy"] .settings-nav__label { display: none; }
+  .app-shell--pixel .settings-nav__item:is([data-section="privacy"], [data-section="services"], [data-section="updates"]) .settings-nav__label { display: none; }
   .app-shell--pixel .settings-nav__compact-label { display: inline; }
   .app-shell--pixel .shortcut-row { grid-template-columns: minmax(0, 1fr); gap: 10px; padding-block: 14px; }
   .app-shell--pixel .shortcut-recorder { min-width: 0; width: 100%; }
