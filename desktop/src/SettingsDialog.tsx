@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Check,
   Download,
@@ -18,6 +18,7 @@ import {
   X,
 } from "./PixelIcons";
 import { translatorApi } from "./tauri";
+import { ApiKeyHelpLink } from "./ApiKeyHelpLink";
 import { AudioDeviceTestWizard } from "./AudioDeviceTestWizard";
 import { AppUpdateSection } from "./AppUpdate";
 import type { AppUpdateController } from "./useAppUpdate";
@@ -40,6 +41,7 @@ type SettingsSection = "general" | "audio" | "shortcuts" | "services" | "privacy
 interface SettingsDialogProps {
   update: AppUpdateController;
   initialSection?: SettingsSection;
+  initialSetup?: boolean;
   settings: PublicSettings;
   sessionActive: boolean;
   onClose: () => void;
@@ -163,6 +165,7 @@ function SecretField({
   clearRequested,
   onClearChange,
   canClearStored = false,
+  help,
 }: {
   label: string;
   status: SecretStatus;
@@ -171,7 +174,9 @@ function SecretField({
   clearRequested: boolean;
   onClearChange: (clear: boolean) => void;
   canClearStored?: boolean;
+  help?: ReactNode;
 }) {
+  const inputId = useId();
   const [visible, setVisible] = useState(false);
   const environmentOwned = status === "environment";
   const replacementPending = Boolean(value?.trim());
@@ -189,9 +194,10 @@ function SecretField({
   const statusTone = clearRequested || replacementPending ? "pending" : status;
 
   return (
-    <label className="field-group">
+    <div className="field-group">
       <span className="field-label">
-        {label}
+        <label htmlFor={inputId}>{label}</label>
+        {help}
         <span className={`secret-source secret-source--${statusTone}`}>
           <KeyRound size={12} aria-hidden="true" />
           {statusLabel}
@@ -199,6 +205,7 @@ function SecretField({
       </span>
       <span className="secret-input-wrap">
         <input
+          id={inputId}
           value={environmentOwned ? "" : (value ?? "")}
           onChange={(event) => {
             onClearChange(false);
@@ -255,7 +262,7 @@ function SecretField({
           </>
         )}
       </span>
-    </label>
+    </div>
   );
 }
 
@@ -507,6 +514,7 @@ function AudioChannelCard({
 export function SettingsDialog({
   update,
   initialSection = "general",
+  initialSetup = false,
   settings,
   sessionActive,
   onClose,
@@ -514,6 +522,8 @@ export function SettingsDialog({
   onValidate,
 }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>(initialSection);
+  const [setupStep, setSetupStep] = useState<0 | 1 | null>(initialSetup ? 0 : null);
+  const inSetup = setupStep !== null;
   const [draft, setDraft] = useState(() => toDraft(settings));
   const [recordingShortcut, setRecordingShortcut] = useState<keyof ShortcutSettings | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
@@ -577,6 +587,13 @@ export function SettingsDialog({
   const realtimeStatus: SecretStatus = realtimeTargetChanged
     ? "missing"
     : settings.realtime.apiKeyStatus;
+  useEffect(() => {
+    if (setupStep !== 1) return;
+    const frame = window.requestAnimationFrame(() => {
+      dialogRef.current?.querySelector<HTMLInputElement>(".secret-input-wrap input")?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [setupStep]);
   const requestClose = useCallback(() => {
     if (savingRef.current) return;
     if (dirty && !window.confirm("放弃未保存的设置更改？")) return;
@@ -595,7 +612,7 @@ export function SettingsDialog({
     const focusable = () =>
       Array.from(
         dialog.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
         ),
       );
 
@@ -634,8 +651,15 @@ export function SettingsDialog({
     setSaving(true);
     setSaveError(null);
     try {
+      if (inSetup && (draft.realtime.clearApiKey ||
+        (!draft.realtime.apiKey?.trim() && realtimeStatus !== "secure_store" && realtimeStatus !== "environment"))) {
+        setFieldErrors({ "realtime.apiKey": "请先粘贴从控制台复制的 API Key。" });
+        setSetupStep(1);
+        return;
+      }
       const validation = await onValidate(draft);
       if (!validation.valid) {
+        setSetupStep(null);
         setFieldErrors(validation.fieldErrors);
         const first = Object.keys(validation.fieldErrors)[0] ?? "";
         setSection(
@@ -680,6 +704,22 @@ export function SettingsDialog({
   const conversationMode = draft.audio.listen.enabled && draft.audio.speak.enabled
     ? "both" : draft.audio.speak.enabled ? "speak" : "listen";
 
+  const realtimeKeyField = (
+    <>
+      <SecretField
+        label="API 密钥（API Key）"
+        help={<ApiKeyHelpLink />}
+        status={realtimeStatus}
+        value={draft.realtime.apiKey}
+        onChange={(apiKey) => updateRealtime({ apiKey })}
+        clearRequested={Boolean(draft.realtime.clearApiKey)}
+        onClearChange={(clearApiKey) => updateRealtime({ clearApiKey })}
+        canClearStored={realtimeTargetChanged && settings.realtime.apiKeyStatus === "secure_store"}
+      />
+      {fieldErrors["realtime.apiKey"] && <p className="field-error" role="alert">{fieldErrors["realtime.apiKey"]}</p>}
+    </>
+  );
+
   return (
     <div
       className="modal-backdrop"
@@ -688,27 +728,36 @@ export function SettingsDialog({
     >
       <section
         ref={dialogRef}
-        className="settings-dialog"
+        className={`settings-dialog${inSetup ? " settings-dialog--setup" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-title"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="settings-dialog__header">
-          <h2 id="settings-title">设置</h2>
+          <h2 id="settings-title">{inSetup ? "首次配置向导" : "设置"}</h2>
           <button
             className="icon-button"
             type="button"
             onClick={requestClose}
             disabled={saving}
-            aria-label="关闭设置"
-            title="关闭设置"
+            aria-label={inSetup ? "关闭首次配置向导" : "关闭设置"}
+            title={inSetup ? "关闭首次配置向导" : "关闭设置"}
           >
             <X size={19} />
           </button>
         </header>
         <div className="settings-dialog__body">
-          <nav className="settings-nav" aria-label="设置分区">
+          {inSetup ? (
+            <ol className="setup-steps" aria-label="配置步骤">
+              {["获取密钥", "填写并保存"].map((label, index) => (
+                <li key={label} aria-current={setupStep === index ? "step" : undefined}>
+                  <span>{setupStep > index ? <Check size={14} /> : index + 1}</span>
+                  {label}
+                </li>
+              ))}
+            </ol>
+          ) : <nav className="settings-nav" aria-label="设置分区">
             {sectionLabels.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
@@ -729,16 +778,48 @@ export function SettingsDialog({
                 )}
               </button>
             ))}
-          </nav>
+          </nav>}
           <div className="settings-scroll-frame">
             <div
-              key={section}
+              key={inSetup ? `setup-${setupStep}` : section}
               className="settings-panel"
               data-section={section}
               tabIndex={0}
-              aria-label={`${sectionLabels.find((item) => item.id === section)?.label}设置内容`}
+              aria-label={inSetup ? "首次配置内容" : `${sectionLabels.find((item) => item.id === section)?.label}设置内容`}
             >
-              {section === "general" && (
+              {inSetup && (
+                <section className="settings-section setup-content">
+                  <div className="settings-section__heading">
+                    <KeyRound size={20} />
+                    <div>
+                      <h3>{setupStep === 0 ? "先获取你的 API Key" : "粘贴密钥，完成配置"}</h3>
+                      <p>{setupStep === 0 ? "API Key 是使用翻译服务的凭证，只需配置一次。" : "将刚刚复制的完整密钥粘贴到下方，点击保存即可。"}</p>
+                    </div>
+                  </div>
+                  {setupStep === 0 ? (
+                    <>
+                      <ol className="api-key-instructions">
+                        <li><strong>打开密钥控制台</strong><p>点击下方“获取密钥”，注册或登录阿里云账号，按平台提示开通百炼服务。</p></li>
+                        <li><strong>创建 API Key</strong><p>选择与翻译接口一致的地域和业务空间，在“API Key”页面点击“创建 API Key”。默认入口为华北 2（北京）。</p></li>
+                        <li><strong>复制完整密钥</strong><p>点击密钥旁的复制按钮，然后回到本软件，进入下一步粘贴。</p></li>
+                      </ol>
+                      <div className="api-key-guide-links"><ApiKeyHelpLink /><ApiKeyHelpLink kind="guide" /></div>
+                      <p className="api-key-note">翻译服务的用量与费用以平台说明为准。使用自定义接口时，请向对应服务商获取密钥。</p>
+                    </>
+                  ) : (
+                    <>
+                      {realtimeKeyField}
+                      <p className="api-key-note">密钥会安全保存在 Windows 凭据管理器中。保存后，点击主界面的“开始同传”即可使用。</p>
+                      <details className="setup-endpoint">
+                        <summary>查看翻译接口地址</summary>
+                        <p>{draft.realtime.baseUrl}</p>
+                        <p>密钥需与此接口匹配。如需修改地址，可稍后前往“设置 → 同传模型”。</p>
+                      </details>
+                    </>
+                  )}
+                </section>
+              )}
+              {!inSetup && section === "general" && (
                 <section className="settings-section">
                   <div className="settings-section__heading">
                     <SlidersHorizontal size={18} />
@@ -835,7 +916,7 @@ export function SettingsDialog({
                   />
                 </section>
               )}
-              {section === "shortcuts" && (
+              {!inSetup && section === "shortcuts" && (
                 <section className="settings-section">
                   <div className="settings-section__heading">
                     <Keyboard size={18} />
@@ -922,7 +1003,7 @@ export function SettingsDialog({
                   </button>
                 </section>
               )}
-              {section === "audio" && (
+              {!inSetup && section === "audio" && (
                 <section className="settings-section">
                   <div className="settings-section__heading">
                     <Volume2 size={18} />
@@ -973,7 +1054,7 @@ export function SettingsDialog({
                   )}
                 </section>
               )}
-              {section === "services" && (
+              {!inSetup && section === "services" && (
                 <section className="settings-section">
                   <div className="settings-section__heading">
                     <Radio size={18} />
@@ -1002,26 +1083,18 @@ export function SettingsDialog({
                       </span>
                     )}
                   </label>
-                  <SecretField
-                    label="DashScope API Key"
-                    status={realtimeStatus}
-                    value={draft.realtime.apiKey}
-                    onChange={(apiKey) => updateRealtime({ apiKey })}
-                    clearRequested={Boolean(draft.realtime.clearApiKey)}
-                    onClearChange={(clearApiKey) =>
-                      updateRealtime({ clearApiKey })
-                    }
-                    canClearStored={
-                      realtimeTargetChanged &&
-                      settings.realtime.apiKeyStatus === "secure_store"
-                    }
-                  />
+                  {realtimeKeyField}
+                  <div className="api-key-guide-links">
+                    <button type="button" className="setup-guide-button" onClick={() => setSetupStep(0)}>首次配置向导</button>
+                    <ApiKeyHelpLink kind="guide" />
+                  </div>
+                  <p className="api-key-note">注册或登录阿里云百炼，选择对应地域和业务空间，创建 API Key 并复制到上方。自定义接口请使用对应服务商的密钥。</p>
                   {fieldErrors["realtime.model"] && (
                     <p className="field-error">{fieldErrors["realtime.model"]}</p>
                   )}
                 </section>
               )}
-              {section === "privacy" && (
+              {!inSetup && section === "privacy" && (
                 <section className="settings-section">
                   <div className="settings-section__heading">
                     <ShieldCheck size={18} />
@@ -1036,7 +1109,7 @@ export function SettingsDialog({
                   </div>
                 </section>
               )}
-              {section === "updates" && <AppUpdateSection update={update} sessionActive={sessionActive} onInstall={() => {
+              {!inSetup && section === "updates" && <AppUpdateSection update={update} sessionActive={sessionActive} onInstall={() => {
                 if (dirty && !window.confirm("退出并安装将放弃未保存的设置更改，是否继续？")) return;
                 void update.install();
               }} />}
@@ -1059,24 +1132,27 @@ export function SettingsDialog({
             data-state={saveError ? "error" : dirty ? "dirty" : "saved"}
             role={saveError ? "alert" : "status"}
           >
-            {saveError ?? (dirty ? "有未保存的更改" : "设置已保存")}
+            {saveError ?? (inSetup ? `第 ${setupStep + 1} 步 / 共 2 步` : dirty ? "有未保存的更改" : "设置已保存")}
           </span>
           <div className="settings-actions">
+            {setupStep === 1 && (
+              <button className="button button--secondary" type="button" disabled={saving} onClick={() => setSetupStep(0)}>上一步</button>
+            )}
             <button
               className="button button--secondary"
               type="button"
               disabled={saving}
               onClick={requestClose}
             >
-              取消
+              {inSetup ? "稍后配置" : "取消"}
             </button>
             <button
               className="button button--primary"
               type="button"
               disabled={saving}
-              onClick={() => void save()}
+              onClick={() => setupStep === 0 ? setSetupStep(1) : void save()}
             >
-              {saving ? "正在保存" : "保存设置"}
+              {saving ? "正在保存" : setupStep === 0 ? "下一步：填写密钥" : setupStep === 1 ? "保存并完成" : "保存设置"}
             </button>
           </div>
         </footer>

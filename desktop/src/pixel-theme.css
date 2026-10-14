@@ -661,6 +661,53 @@
 .app-shell--pixel .settings-save-state[data-state="error"] { color: #8c213e; }
 .app-shell--pixel .settings-actions { gap: 10px; }
 
+.app-shell--pixel .api-key-help { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.app-shell--pixel .field-label:has(.api-key-help) { justify-content: flex-start; flex-wrap: wrap; }
+.app-shell--pixel .field-label:has(.api-key-help) .secret-source { margin-left: auto; }
+.app-shell--pixel .api-key-help a,
+.app-shell--pixel .setup-guide-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  color: #225fb2;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1.6;
+  text-decoration: none;
+  cursor: pointer;
+}
+.app-shell--pixel .api-key-help a:hover,
+.app-shell--pixel .setup-guide-button:hover { text-decoration: underline; }
+.app-shell--pixel .api-key-help a:focus-visible,
+.app-shell--pixel .setup-guide-button:focus-visible { outline: 2px solid #225fb2; outline-offset: 4px; }
+.app-shell--pixel .api-key-guide-links { display: flex; align-items: center; flex-wrap: wrap; gap: 14px 22px; margin-top: 20px; }
+.app-shell--pixel .api-key-note { margin: 18px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.8; }
+.app-shell--pixel .settings-dialog--setup { width: min(760px, 100%); height: min(600px, calc(100dvh - 48px)); }
+.app-shell--pixel .settings-dialog--setup .settings-panel { padding: 26px 24px; }
+.app-shell--pixel .setup-steps { display: flex; flex-direction: column; gap: 20px; margin: 0; padding: 28px 16px; list-style: none; border-right: var(--pixel-line); background: var(--pixel-paper); }
+.app-shell--pixel .setup-steps li { display: flex; align-items: center; gap: 9px; color: var(--text-muted); font-size: 12px; }
+.app-shell--pixel .setup-steps li > span { display: grid; place-items: center; flex-shrink: 0; width: 26px; height: 26px; border: 1px solid var(--pixel-edge); background: var(--pixel-white); }
+.app-shell--pixel .setup-steps li[aria-current="step"] { color: var(--text-strong); font-weight: 700; }
+.app-shell--pixel .setup-steps li[aria-current="step"] > span { border: var(--pixel-line); background: var(--pixel-lime); }
+.app-shell--pixel .setup-content h3 { font-size: 22px; }
+.app-shell--pixel .api-key-instructions { display: grid; gap: 18px; padding-left: 22px; margin: 22px 0 0; list-style: decimal; }
+.app-shell--pixel .api-key-instructions li { padding-left: 4px; }
+.app-shell--pixel .api-key-instructions strong { color: var(--text-strong); font-size: 14px; }
+.app-shell--pixel .api-key-instructions p { margin: 5px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.8; }
+.app-shell--pixel .setup-endpoint { margin-top: 24px; color: var(--text-muted); font-size: 12px; line-height: 1.8; }
+.app-shell--pixel .setup-endpoint summary { cursor: pointer; }
+.app-shell--pixel .setup-endpoint p { margin-top: 8px; overflow-wrap: anywhere; }
+.app-shell--pixel .settings-dialog--setup .settings-dialog__footer { flex-wrap: wrap; }
+.app-shell--pixel .settings-dialog--setup .settings-actions { flex-wrap: wrap; justify-content: flex-end; }
+
+@media (max-width: 700px) {
+  .app-shell--pixel .settings-dialog--setup .settings-dialog__body { grid-template-columns: minmax(0, 1fr); grid-template-rows: max-content minmax(0, 1fr); }
+  .app-shell--pixel .settings-dialog--setup .setup-steps { flex-direction: row; flex-wrap: wrap; gap: 12px 24px; padding: 14px 16px; border-right: 0; border-bottom: var(--pixel-line); }
+  .app-shell--pixel .settings-dialog--setup .settings-panel { padding: 20px 16px; }
+}
+
 /* Form primitives use exactly the same edges and active state. */
 .app-shell--pixel .button {
   min-height: 36px;

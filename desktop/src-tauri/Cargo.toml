@@ -1,6 +1,6 @@
 [package]
 name = "simultaneous-translator"
-version = "0.5.2"
+version = "1.0.0"
 description = "Desktop simultaneous translation workspace"
 authors = ["cyhddyx"]
 edition = "2021"

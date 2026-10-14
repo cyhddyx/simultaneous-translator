@@ -22,6 +22,17 @@
 
 ## 模型连接
 
+### 首次配置 API Key
+
+未配置密钥的新用户打开软件时，会显示“首次配置向导”。按以下两步完成配置：
+
+1. 点击“获取密钥”，打开[阿里云百炼 API Key 控制台](https://bailian.console.aliyun.com/cn-beijing/model/settings/api-key)，注册或登录账号，按平台提示开通服务，选择对应地域和业务空间，创建并复制 API Key。
+2. 回到软件点击“下一步：填写密钥”，粘贴完整密钥，再点击“保存并完成”。之后点击主界面的“开始同传”。
+
+详细操作见[官方密钥获取教程](https://help.aliyun.com/zh/model-studio/get-api-key)。密钥需与翻译接口所在地域和业务空间一致；使用自定义接口时请向对应服务商获取密钥，费用以平台说明为准。
+
+向导可以稍后配置，通过“配置同传”或“设置 → 同传模型 → 首次配置向导”重新打开。设置页的密钥输入框旁也提供“获取密钥”链接；已配置密钥的用户升级后保留原配置。
+
 默认地址：
 
 ```text
@@ -128,7 +139,7 @@ npm run desktop:dev
 
 发布新版本时，需要同步 `desktop/package.json`、`desktop/src-tauri/Cargo.toml` 和 `desktop/src-tauri/tauri.conf.json` 的版本号，并向对应 Release 上传 `simultaneous-translator_<版本>_x64-setup.exe` 与 `SHA256SUMS.txt`。校验文件每行格式为 `<64 位 SHA-256>  <安装包文件名>`。当前实现适用于 Windows x64。
 
-**0.5.1 及更早版本没有更新功能，需要先手动下载安装 0.5.2；此后可在应用内得知和获取新版本。**
+**当前正式版本为 1.0.0（Release 标签 `v1.0.0`），不带 beta。0.5.2 用户可在应用内获取更新；0.5.1 及更早版本请手动下载安装当前正式版。**
 
 只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_x64-setup.exe`，不需要编译源码。
 

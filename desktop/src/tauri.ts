@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { audioLanguageErrors } from "./translationLanguages";
+import { API_KEY_HELP_URLS, type ApiKeyHelpKind } from "./apiKeyHelp";
 
 import {
   MockOpenSettingsChannel,
@@ -1021,6 +1022,11 @@ export const translatorApi = {
   async installVirtualMicrophone(): Promise<void> {
     if (!isTauriRuntime()) throw new Error("请在 Windows 桌面版中安装虚拟麦克风。");
     await invoke("install_virtual_microphone");
+  },
+
+  async openApiKeyHelp(kind: ApiKeyHelpKind): Promise<void> {
+    if (isTauriRuntime()) await invoke("open_api_key_help", { kind });
+    else window.open(API_KEY_HELP_URLS[kind], "_blank", "noopener,noreferrer");
   },
 
   async openVirtualMicrophoneLink(kind: "product" | "license" | "donate"): Promise<void> {

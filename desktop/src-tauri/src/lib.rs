@@ -21,6 +21,7 @@ use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
 use url::Url;
 use uuid::Uuid;
 
+mod api_key_help;
 mod translation_languages;
 mod tray;
 mod updater;
@@ -2870,6 +2871,7 @@ pub fn run() {
             run_audio_test,
             virtual_microphone::install_virtual_microphone,
             virtual_microphone::open_virtual_microphone_link,
+            api_key_help::open_api_key_help,
             updater::check_app_update,
             updater::download_app_update,
             updater::install_app_update,

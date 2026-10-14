@@ -216,6 +216,8 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeState | null>(null);
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [setupRequested, setSetupRequested] = useState(false);
+  const setupOfferedRef = useRef(false);
   const [actionPending, setActionPending] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [dismissedErrorId, setDismissedErrorId] = useState<string | null>(null);
@@ -420,6 +422,16 @@ export default function App() {
       : runtime.sessionPhase
     : session.phase;
   const active = isSessionActive(phase);
+  useEffect(() => {
+    if (loading || active || !historyHydratedRef.current || setupOfferedRef.current) return;
+    setupOfferedRef.current = true;
+    if (snapshot.settings.realtime.apiKeyStatus !== "missing") return;
+    try {
+      if (window.localStorage.getItem("translator:first-setup-dismissed") === "1") return;
+    } catch { /* The guide still works when browser storage is unavailable. */ }
+    setSetupRequested(true);
+    setSettingsOpen(true);
+  }, [loading, active, snapshot.settings.realtime.apiKeyStatus]);
   const elapsed = useElapsed(session.startedAt, active);
   // A stopped session keeps its history below, but the live stage must not
   // imply that its final subtitle is still being translated.
@@ -479,6 +491,7 @@ export default function App() {
   const handleSessionControl = () => {
     if (actionPendingRef.current) return;
     if (phase === "needs_configuration") {
+      setSetupRequested(true);
       setSettingsOpen(true);
       return;
     }
@@ -1219,9 +1232,18 @@ export default function App() {
         <SettingsDialog
           update={update}
           initialSection={settingsStartSection}
+          initialSetup={setupRequested}
           settings={snapshot.settings}
           sessionActive={active}
-          onClose={() => { setSettingsOpen(false); setSettingsStartSection("general"); }}
+          onClose={() => {
+            if (setupRequested) {
+              try { window.localStorage.setItem("translator:first-setup-dismissed", "1"); }
+              catch { /* Do not prevent closing when storage is unavailable. */ }
+            }
+            setSettingsOpen(false);
+            setSetupRequested(false);
+            setSettingsStartSection("general");
+          }}
           onSave={handleSaveSettings}
           onValidate={(draft) => translatorApi.validateSettings(draft)}
         />
