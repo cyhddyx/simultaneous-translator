@@ -43,6 +43,8 @@ wss://maas.qianwenaiapi.com/api-ws/v1/realtime
 
 客户端等待 `session.updated` 后开始采集，处理 3.8 的增量字幕、完整字幕和语音事件。文本模式与语音模式通过实际会话配置区分，不发送独立 ASR 模型参数。
 
+网络临时断开或服务端结束连接后，受影响的通道会自动重连，界面显示“正在连接”，恢复后继续翻译，无需重新点开始。重连保留当前通道开关和发言静音状态，另一通道继续工作；等待间隔从 1 秒逐步增加，最长 15 秒。点击停止会取消重连。鉴权、配置和音频设备故障仍显示具体错误，需要按提示处理。中断时未完成的片段会标为失败，不会与重连后的字幕混在一起。
+
 音色按通道独立设置：发言默认“本人音色”，收听默认“系统音色”。发言复刻使用 `voice: "default"`、`enable_voice_clone: true` 和 `voice_clone_options.frequency: "once"`；收听可单独选择“对方音色”，使用 `frequency: "always"` 跟随输入语音重新复刻，避免整场对话固定为首次采到的说话人。系统音色明确发送 `enable_voice_clone: false`。复刻效果由模型决定，并不提供说话人身份验证。文字模式不发送复刻参数。
 
 程序会核对服务端是否确认复刻开关与频率；接口未确认时显示错误，不静默回退成系统音色。配置确认并不等同于复刻已经完成，实际相似度仍需由说话人试听。
@@ -139,7 +141,7 @@ npm run desktop:dev
 
 发布新版本时，需要同步 `desktop/package.json`、`desktop/src-tauri/Cargo.toml` 和 `desktop/src-tauri/tauri.conf.json` 的版本号，并向对应 Release 上传 `simultaneous-translator_<版本>_x64-setup.exe` 与 `SHA256SUMS.txt`。校验文件每行格式为 `<64 位 SHA-256>  <安装包文件名>`。当前实现适用于 Windows x64。
 
-**当前正式版本为 1.0.0（Release 标签 `v1.0.0`），不带 beta。0.5.2 用户可在应用内获取更新；0.5.1 及更早版本请手动下载安装当前正式版。**
+**当前源码版本为 1.0.1，包含自动重连修复；最新已发布正式版为 1.0.0（Release 标签 `v1.0.0`）。0.5.2 用户可在应用内获取已发布更新；0.5.1 及更早版本请手动下载安装正式版。**
 
 只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_x64-setup.exe`，不需要编译源码。
 
@@ -191,6 +193,7 @@ npm run desktop:build                                          # 3. 先生成 si
 
 ```powershell
 .venv\Scripts\python.exe scripts\test_tauri_bridge.py
+.venv\Scripts\python.exe scripts\test_realtime_reconnect.py
 .venv\Scripts\python.exe scripts\test_audio_isolation.py
 .venv\Scripts\python.exe scripts\test_runtime_channels.py
 .venv\Scripts\python.exe scripts\test_audio_device_tests.py

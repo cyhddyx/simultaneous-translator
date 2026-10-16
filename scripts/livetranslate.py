@@ -183,6 +183,18 @@ PLAYER_QUEUE_CHUNKS = 240
 CONNECT_TIMEOUT_S = 20.0
 FINISH_TIMEOUT_S = 15.0
 CLOSE_TIMEOUT_S = 5.0
+RECONNECT_INITIAL_DELAY_S = 1.0
+RECONNECT_MAX_DELAY_S = 15.0
+RECONNECT_STABLE_SECONDS = 30.0
+RETRYABLE_NETWORK_ERRORS = frozenset({
+    "realtime_connect_timeout",
+    "realtime_configuration_timeout",
+    "realtime_connection_closed",
+    "realtime_receive_failed",
+    "realtime_send_failed",
+    "realtime_stream_timeout",
+    ERROR_CODE_WEBSOCKET_CONNECT_FAILED,
+})
 
 # Shared with the desktop UI and native save/start validation.
 _LANGUAGES = json.loads(Path(__file__).with_name("translation_languages.json").read_text(encoding="utf-8"))["languages"]
@@ -783,7 +795,12 @@ class LiveTranslateChannel(threading.Thread):
         self._api_key = api_key
         self._options = options
         self._finished = asyncio.Event()
+        self._finishing = False
         self._failed = False
+        self._retry_enabled = False
+        self._retry_pending = False
+        self._retry_wakeup = asyncio.Event()
+        self._stream_started_at: float | None = None
         self._player: _PcmPlayer | None = None
         self._system_capture: SystemCapture | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -802,13 +819,11 @@ class LiveTranslateChannel(threading.Thread):
     def run(self) -> None:
         try:
             _ensure_com_initialized()
-            asyncio.run(self._main())
+            asyncio.run(self._run_with_reconnect())
         except Exception as exc:  # noqa: BLE001 - surfaced as a channel error
             self._report_failure("realtime_channel_failed", f"{self._spec.label}通道失败：{exc}")
         finally:
-            if self._player is not None:
-                self._player.stop()
-                self._player.join(timeout=1.0)
+            self._stop_player()
             self._session.mark_channel_settled(self._spec.channel)
             self._session.on_channel_exit(self._spec.channel)
 
@@ -820,12 +835,62 @@ class LiveTranslateChannel(threading.Thread):
             # Wake the receive loop out of a long ``recv`` wait.
             with contextlib.suppress(RuntimeError):
                 self._loop.call_soon_threadsafe(self._configuration_ready.set)
+                self._loop.call_soon_threadsafe(self._retry_wakeup.set)
         if self._player is not None:
             self._player.stop()
         if self._system_capture is not None:
             self._system_capture.close()
 
     # -------------------------------------------------------------- async main
+
+    def _stop_player(self) -> None:
+        if self._player is not None:
+            self._player.stop()
+            self._player.join(timeout=1.0)
+            self._player = None
+
+    async def _run_with_reconnect(self) -> None:
+        """Reconnect this direction without replacing the user session."""
+
+        self._loop = asyncio.get_running_loop()
+        self._retry_enabled = True
+        delay = RECONNECT_INITIAL_DELAY_S
+        while not self._session.stop_event.is_set():
+            self._failed = False
+            self._retry_pending = False
+            self._updated = False
+            self._finishing = False
+            self._stream_started_at = None
+            self._finished.clear()
+            self._configuration_ready.clear()
+            self._source_deltas.clear()
+            self._translation_deltas.clear()
+            self._completed_responses.clear()
+            try:
+                await self._main()
+            except Exception as exc:  # noqa: BLE001 - unknown faults are not retried
+                self._report_failure("realtime_channel_failed", f"{self._spec.label}通道失败：{exc}")
+            finally:
+                self._stop_player()
+            if self._session.stop_event.is_set() or not self._retry_pending:
+                return
+
+            self._session.reset_channel_connection(self._spec.channel)
+            if (self._stream_started_at is not None
+                    and time.monotonic() - self._stream_started_at >= RECONNECT_STABLE_SECONDS):
+                delay = RECONNECT_INITIAL_DELAY_S
+            detail = f"{self._spec.label}通道连接中断，{delay:g} 秒后自动重连。"
+            self._server.on_realtime_channel(self._session, self._spec.channel, "connecting", detail=detail)
+            report_channel_network(self._session, self._spec.channel, STATUS_CONNECTING, detail)
+            await self._wait_to_retry(delay)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY_S)
+
+    async def _wait_to_retry(self, delay: float) -> None:
+        try:
+            # request_stop wakes this wait even at the maximum backoff.
+            await asyncio.wait_for(self._retry_wakeup.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
 
     async def _main(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -849,6 +914,8 @@ class LiveTranslateChannel(threading.Thread):
                 self._report_failure("audio_device_missing", f"{self._spec.label}通道未找到可用的输入设备")
                 return
             recorder, device_info = device
+            if self._session.stop_event.is_set():
+                return
             self._session.mark_channel_ready(self._spec.channel)
             # The device is open, so the audio link itself is healthy from here on
             # even if the WebSocket handshake later fails.
@@ -859,6 +926,8 @@ class LiveTranslateChannel(threading.Thread):
             stage = "connect"
             ws_url = f"{self._base_url}?model={self._model}"
             async with _build_connector(ws_url, self._api_key) as websocket:
+                if self._session.stop_event.is_set():
+                    return
                 reader = asyncio.create_task(self._receive_loop(websocket))
                 try:
                     stage = "configure"
@@ -871,6 +940,7 @@ class LiveTranslateChannel(threading.Thread):
                         self._player = _PcmPlayer(self._spec.output_device, self._spec.channel, self._on_playback_error)
                         self._player.start()
                     stage = "capture"
+                    self._stream_started_at = time.monotonic()
                     self._server.on_realtime_channel(self._session, self._spec.channel, "streaming")
                     await self._capture_loop(websocket, pool, recorder)
                 finally:
@@ -892,14 +962,27 @@ class LiveTranslateChannel(threading.Thread):
             if stage == "audio":
                 self._report_failure("audio_device_failed", f"{self._spec.label}通道音频设备打开失败：{exc}")
             elif stage == "connect":
-                # The handshake itself failed (refused, TLS, 4xx upgrade).  The
-                # generic ``realtime_channel_failed`` catch-all stays in place for
-                # every other unexpected error; this scenario now carries the code
-                # contract 4.4 names explicitly.
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                status = status or getattr(exc, "status_code", None)
+                if status in (401, 403):
+                    self._report_failure(
+                        ERROR_CODE_AUTH_FAILED,
+                        f"{self._spec.label}通道服务端鉴权失败，请检查 API Key：{exc}",
+                        recoverable=False,
+                    )
+                    return
+                permanent = isinstance(status, int) and 400 <= status < 500 and status not in (408, 429)
                 self._report_failure(
                     ERROR_CODE_WEBSOCKET_CONNECT_FAILED,
                     f"{self._spec.label}通道连接同传接口失败：{exc}",
+                    recoverable=not permanent,
                 )
+            elif stage == "configure":
+                from websockets.exceptions import ConnectionClosed
+
+                if not isinstance(exc, (OSError, ConnectionClosed)):
+                    raise
+                self._report_failure("realtime_send_failed", f"{self._spec.label}通道配置发送中断：{exc}")
             else:
                 raise
         finally:
@@ -994,7 +1077,7 @@ class LiveTranslateChannel(threading.Thread):
                         f"{self._spec.label}通道音频设备已断开：{exc}",
                     )
                 return
-            if self._session.stop_event.is_set():
+            if self._session.stop_event.is_set() or self._failed:
                 break
             if not channel_audio_enabled(self._session, channel):
                 # Runtime channel switch (contract section 6).  The frame is
@@ -1112,6 +1195,8 @@ class LiveTranslateChannel(threading.Thread):
             return
         if event_type == "session.finished":
             self._finished.set()
+            if not self._finishing and not self._session.stop_event.is_set():
+                self._report_failure("realtime_connection_closed", f"{self._spec.label}通道服务端会话已结束")
             return
 
         if event_type == "conversation.item.input_audio_transcription.delta":
@@ -1231,6 +1316,7 @@ class LiveTranslateChannel(threading.Thread):
         self._player.push(samples)
 
     async def _finish(self, websocket: Any) -> None:
+        self._finishing = True
         with contextlib.suppress(Exception):
             await websocket.send(
                 json.dumps(
@@ -1257,6 +1343,13 @@ class LiveTranslateChannel(threading.Thread):
         self._failed = True
         self._configuration_ready.set()
         channel = self._spec.channel
+        can_recover = error_recoverable(code) if recoverable is None else recoverable
+        self._retry_pending = self._retry_enabled and can_recover and code in RETRYABLE_NETWORK_ERRORS
+        if self._retry_pending:
+            detail = f"{self._spec.label}通道连接中断，正在自动重连。"
+            self._server.on_realtime_channel(self._session, channel, "connecting", detail=detail)
+            report_channel_network(self._session, channel, STATUS_CONNECTING, detail)
+            return
         self._server.on_realtime_channel(self._session, channel, "failed", detail=message)
         if error_service(code) == SERVICE_AUDIO:
             report_status(
@@ -1272,7 +1365,7 @@ class LiveTranslateChannel(threading.Thread):
             scope="audio" if code.startswith("audio_") else "translation",
             code=code,
             message=message,
-            recoverable=error_recoverable(code) if recoverable is None else recoverable,
+            recoverable=can_recover,
             service=error_service(code),
         )
 
@@ -1373,6 +1466,7 @@ class RealtimeSession:
         self._audio_ready = False
         self._audio_startup_settled = threading.Event()
         self._pending_channels = {spec.channel for spec in specs}
+        self._running_channels = {spec.channel for spec in specs}
         self._pending_asr: dict[str, list[tuple[int, str]]] = {spec.channel: [] for spec in specs}
         self._orphan_translations: dict[str, list[str]] = {spec.channel: [] for spec in specs}
         self._response_seqs: dict[str, dict[str, int]] = {spec.channel: {} for spec in specs}
@@ -1458,17 +1552,17 @@ class RealtimeSession:
     def on_channel_exit(self, channel: str) -> None:
         """Retire the session once every channel has stopped.
 
-        Called from the exiting channel's own ``run``, so it is still ``alive``
-        at this point and must be excluded from the liveness check.
+        Track logical exits: a sibling may not have started its thread yet, or
+        both threads may still appear alive while running their final callbacks.
         """
 
-        exiting = threading.current_thread()
         with self._lock:
             self._pending_channels.discard(channel)
-            remaining = any(
-                item is not exiting and item.is_alive() for item in self.channels
-            )
-        if not remaining:
+            if channel not in self._running_channels:
+                return
+            self._running_channels.remove(channel)
+            all_closed = not self._running_channels
+        if all_closed:
             self.server.on_realtime_all_channels_closed(self)
 
     @property
@@ -1494,6 +1588,27 @@ class RealtimeSession:
         """The realtime model translates server-side, so there is no local queue."""
 
     # ------------------------------------------------------ caption assembly
+
+    def reset_channel_connection(self, channel: str) -> None:
+        """Settle interrupted turns before response IDs restart on a new socket."""
+
+        with self._lock:
+            pending = self._pending_asr.get(channel, [])
+            sequences = {sequence for sequence, _text in pending}
+            sequences.update(self._response_seqs.get(channel, {}).values())
+            self._pending_asr[channel] = []
+            self._orphan_translations[channel] = []
+            self._response_seqs[channel] = {}
+            for sequence in sequences:
+                self._source_text.pop(sequence, None)
+        for sequence, text in pending:
+            self.server.emit_session_event(self, "translation.failed", {
+                "source_seq": sequence,
+                "source_text": text,
+                "channel": channel,
+                "code": "realtime_connection_closed",
+                "message": "连接中断，此片段未完成；后续语音将在重连后继续翻译。",
+            })
 
     def _emit_session_event(
         self, event: str, data: dict[str, Any], *, allow_stopping: bool = False

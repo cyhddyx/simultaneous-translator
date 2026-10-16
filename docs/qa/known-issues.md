@@ -57,6 +57,10 @@
 
 ## KI-03 D1/D2 偏差：契约声明了实现永远不会发出的 code —— **ACCEPTED（Lead 已裁决）**
 
+> 2026-10-16 更新：下列 D2 是历史记录。1.0.1 已实现通道内自动重连，通过
+> `network.status=connecting` 表达恢复过程；`websocket_reconnecting` 仍是保留错误码。
+> 当前判据见 `runtime-channel-control.md` §4.4.1 与 `scripts/test_realtime_reconnect.py`。
+
 - **现象**：`audio_start_failed` 与 `websocket_reconnecting` 出现在 `docs/runtime-channel-control.md` §4.4 的对照表里，
   且在 Python 的 `error_service` / `error_recoverable` 映射中已声明，但**没有任何代码路径会发出它们**。
 - **D1 反向验证（我实测，真实引擎）**：

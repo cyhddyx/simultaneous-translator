@@ -109,6 +109,7 @@ network_error  >  audio_error  >  connecting  >  translating  >  not_started
 fn derive_tray_status(state) -> TrayStatus {
     if state.network_health == Failed { return NetworkError; }
     if state.audio_health   == Failed { return AudioError; }
+    if state.session_id.is_some() && state.network_health == Connecting { return Connecting; }
     match state.session_phase {
         Starting | Stopping => Connecting,
         Listening if state.session_id.is_some() => Translating,
@@ -119,6 +120,9 @@ fn derive_tray_status(state) -> TrayStatus {
 
 同时出现网络与音频错误时，托盘主状态显示「网络异常」，`lastError` 保留最近一条；
 两个具体错误分别体现在主界面错误区，不互相覆盖。
+
+连接中断后自动重连沿用当前会话；`networkHealth=connecting` 时托盘与主界面显示
+「正在连接」，恢复后回到「正常翻译」。这不改变开始/停止动作的语义，用户可随时停止。
 
 状态文案（托盘 tooltip / 菜单首项 / 主界面共用，前端 `trayStatusLabel()` 必须与此一致）：
 

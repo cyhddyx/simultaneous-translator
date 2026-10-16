@@ -122,15 +122,15 @@
 
 | ID | 场景 | 预期 | 覆盖 | 状态 |
 |---|---|---|---|---|
-| D-01 | WebSocket 连接失败 | `network/websocket_connect_failed, recoverable:true` → `trayStatus=network_error`（R §4.4 表） | L3-C1 + L1 | 见 reverification |
-| D-02 | 部分通道故障（sibling 存活） | **判据（Lead 裁决 D2）**：`network.status{status:"degraded"}`；**不得**触发 `trayStatus=network_error`；**不得**发 `websocket_reconnecting`（引擎无重连逻辑） | L3-C2 | 见 reverification |
+| D-01 | 临时 WebSocket 连接失败 | `network.status=connecting`，原会话内自动恢复，不发送终止错误 | test_realtime_reconnect.py + L1 | 1.0.1 已覆盖 |
+| D-02 | 部分通道永久故障（sibling 存活） | `network.status=degraded`，sibling 继续；临时断线只重连受影响通道 | L3-C2 + test_realtime_reconnect.py | 1.0.1 已覆盖 |
 | D-02b | 全通道故障 | `network.status{status:"failed"}` → 触发 `network_error` | L3-C3 + L1 | 见 reverification |
 | D-03 | 鉴权失败 | `network/auth_failed, recoverable:false` | L2 + L8 | 部分 |
 | D-04 | 翻译超时/断开 | `translation_timeout` / `translation_disconnected` | L2 | 见 reverification |
-| D-05 | 断线期间 UI | 主界面错误区显示，托盘显示「网络异常」，字幕窗口仍显示历史字幕 | L5 + L8 | 部分 |
+| D-05 | 断线期间 UI | 临时断线显示「正在连接」，字幕保留；永久故障仍显示错误 | L1 + L5 + L8 | 部分 |
 | D-06 | 网络恢复 | `network.status{status:ready}`，`networkHealth` 复位，`trayStatus` 回落 | L1 + L2 | 见 reverification |
 | D-07 | `network.status` 仅变化时发 | 重复同值不发（R §4.3） | L2 | 见 reverification |
-| D-08 | 不存在 `websocket_reconnecting` 事件 | 全场景 grep 原始事件流，0 命中（D2 偏差的**负面**断言） | L3-C1/C2/C3 | 见 reverification |
+| D-08 | 重连与停止 | 正常关闭、异常断线、服务端 session.finished 后恢复字幕；停止取消等待，开关与静音保留；鉴权和配置错误不循环重试 | test_realtime_reconnect.py | 1.0.1 已覆盖 |
 
 
 ## 7. 矩阵 E：字幕窗口

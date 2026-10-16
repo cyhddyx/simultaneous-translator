@@ -236,7 +236,7 @@
 
 #### 4.4.1 Agent 0 裁决记录（2026-10-07，Agent 2 提出）
 
-三条均由 Agent 0 裁定，**不做进一步代码改动**：
+以下保留原裁决记录；D2 已于 2026-10-16 随断线自动恢复修复更新：
 
 **D1 — `audio_start_failed` 保留为「已声明、当前不发出」（接受偏差）**
 
@@ -250,24 +250,30 @@
 `error.service == "audio"`，**不**要求 `code == "audio_start_failed"`。
 `audio_start_failed` 作为保留名，不得被其它场景占用。
 
-**D2 — `websocket_reconnecting` 保留为「已声明、当前不发出」（接受偏差）**
+**D2 — 网络中断后在原会话内自动恢复（2026-10-16 修订）**
 
-理由：当前引擎**没有重连逻辑**——握手或接收失败即终止 session，不存在「重连中」这一真实状态。
-为一个不存在的状态发事件属于伪造数据，会污染托盘状态。
+连接超时、临时握手失败、收发中断及服务端主动结束连接时，受影响通道自动重建
+WebSocket，等待间隔依次为 1、2、4、8、15 秒，之后保持 15 秒；连续正常运行
+30 秒后恢复初始间隔。重连期间通道线程仍然存活，不发送 `state: stopped`。
+`network.status` 与 `channel.status` 上报 `connecting`，成功确认会话配置后恢复
+`ready` / `streaming`。不为可自动恢复的网络中断重复发送终止错误，
+`websocket_reconnecting` 保留为兼容错误码。
 
-**替代判据**：网络健康由 `network.status` 承载：
-`degraded`（同一 session 中部分通道故障、sibling 仍存活）与 `failed`（全通道故障）。
-依据契约第 3 节，只有 `failed` 会把 `trayStatus` 推成 `network_error`，`degraded` 不会。
-`websocket_reconnecting` 保留给未来真正实现重连的版本。
+重连沿用原 `session_id`、通道开关与发言静音状态，不写配置、不重建整个会话，
+不影响另一通道。断开前未完成的字幕以 `translation.failed` 结算，防止新连接
+的响应错配到旧原文。停止或退出立即取消等待，之后不得再建立新连接。
+
+鉴权失败、明确的非临时 HTTP 4xx、配置拒绝及音频设备故障不自动重试，仍按
+原有错误协议报告。永久故障的网络健康继续使用 `degraded` / `failed` 聚合。
 
 **D3 — `recoverable` 取值修正：批准**
 
 `realtime_voice_clone_unsupported`、`realtime_output_mismatch` 由 `true` 改为 `false`。
 按本表「配置非法 → `false`」的口径，二者都是需要改设置才能恢复的配置类问题。
 
-已核验无副作用：`recoverable` 在 Rust 侧**只**被存入 `RuntimeError`，源码中不存在
-任何依赖 `recoverable` 的自动重启/重试分支；前端只用它决定是否显示「重试」入口，
-配置类错误隐藏重试入口正是期望行为。
+`recoverable` 在 Rust 侧只存入 `RuntimeError`，前端据此决定是否显示「重试」入口。
+引擎自动恢复仅适用于明确列出的临时连接错误，且要求 `recoverable != false`；
+不得因为一个未知错误标为可恢复，就无限重试。
 
 ---
 

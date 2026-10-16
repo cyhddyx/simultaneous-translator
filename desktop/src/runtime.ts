@@ -237,6 +237,7 @@ function isActivePhase(phase: SessionPhase): boolean {
 export function deriveMockTrayStatus(state: RuntimeState): TrayStatus {
   if (state.networkHealth === "failed") return "network_error";
   if (state.audioHealth === "failed") return "audio_error";
+  if (state.sessionId && state.networkHealth === "connecting") return "connecting";
   if (state.sessionPhase === "starting" || state.sessionPhase === "stopping") {
     return "connecting";
   }

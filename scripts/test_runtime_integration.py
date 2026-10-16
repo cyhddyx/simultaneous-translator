@@ -21,7 +21,8 @@
 * **Tier C — 反向验证（证伪型）**：C1 在**真实引擎**上用不存在的麦克风设备制造
   音频启动失败（验证错误分类 `service=audio` 且**不是** `audio_start_failed`）；
   C2/C3 通过 `QA_FAULT` 注入部分通道故障，验证 `network.status` 的
-  `degraded`/`failed` 聚合与「全程不发 `websocket_reconnecting`」。
+  `degraded`/`failed` 聚合；自动重连的真实 WebSocket 链路另见
+  `test_realtime_reconnect.py`。
 * **Tier D — 严格参数校验与竞态**：有活跃 session 时错误码优先级无歧义，
   可做严格断言（`invalid_channel` / `invalid_params` / `session_mismatch`）；
   另含交错/同值连发的并发断言与 stop 幂等。
@@ -882,7 +883,7 @@ def tier_c1_real_audio_failure(results: Results) -> None:
             if isinstance(item.get("data"), dict)
             and item["data"].get("code") == "websocket_reconnecting"
         ]
-        results.check(tier, "没有发出 websocket_reconnecting（D2 偏差）", not reconnecting,
+        results.check(tier, "音频故障不会触发网络重连错误", not reconnecting,
                       json.dumps(reconnecting, ensure_ascii=False)[:300])
 
         audio_status = [
@@ -916,10 +917,10 @@ def tier_c2_partial_fault(results: Results) -> None:
                 timeout=25.0,
                 what="network.status=degraded",
             )
-            results.check(tier, "部分通道故障 → network.status=degraded（D2 替代判据）", True,
+            results.check(tier, "永久部分通道故障 → network.status=degraded", True,
                           json.dumps(degraded, ensure_ascii=False)[:300])
         except SidecarError as exc:
-            results.check(tier, "部分通道故障 → network.status=degraded（D2 替代判据）", False,
+            results.check(tier, "永久部分通道故障 → network.status=degraded", False,
                           str(exc)[:600])
             return
 
@@ -930,7 +931,7 @@ def tier_c2_partial_fault(results: Results) -> None:
             if isinstance(item.get("data"), dict)
             and item["data"].get("code") == "websocket_reconnecting"
         ]
-        results.check(tier, "没有发出 websocket_reconnecting（D2：引擎无重连逻辑）",
+        results.check(tier, "永久故障桩不伪造 websocket_reconnecting",
                       not reconnecting, json.dumps(reconnecting, ensure_ascii=False)[:300])
 
         failed_status = [
@@ -1184,6 +1185,14 @@ def tier_e_ghost_state(results: Results) -> None:
         results.check(tier, "§1.5 前置：静音成功（changed:true）",
                       bool(mute.get("ok")) and result_of(mute).get("changed") is True,
                       json.dumps(mute, ensure_ascii=False)[:240])
+        # Responses precede their events on the wire. Wait for the preceding
+        # mute event before marking the next operation's event-order window.
+        sidecar.wait_payload(
+            lambda item: item.get("event") == "runtime.mute"
+            and item.get("data", {}).get("muted") is True,
+            mark=mark,
+            what="runtime.mute=true before closing the channel",
+        )
 
         mark = sidecar.mark()
         disable = sidecar.expect_command(

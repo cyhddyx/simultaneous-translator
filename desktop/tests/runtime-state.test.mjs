@@ -51,6 +51,18 @@ test("the five tray status labels match the contract wording", () => {
   ]);
 });
 
+test("a live session shows connecting during recovery and translating when ready", () => {
+  const state = {
+    ...createInitialRuntimeState(),
+    sessionId: "recovering-session",
+    sessionPhase: "listening",
+    networkHealth: "connecting",
+  };
+  assert.equal(deriveMockTrayStatus(state), "connecting");
+  assert.equal(deriveMockTrayStatus({ ...state, networkHealth: "ready" }), "translating");
+  assert.equal(deriveMockTrayStatus({ ...state, sessionId: null }), "not_started");
+});
+
 test("a stale or repeated runtime revision is dropped without a new object", () => {
   const first = {
     ...createInitialRuntimeState(),

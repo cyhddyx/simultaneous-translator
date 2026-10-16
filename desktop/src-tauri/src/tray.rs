@@ -262,6 +262,9 @@ fn derive_tray_status(state: &RuntimeState) -> TrayStatus {
     if state.audio_health == RuntimeHealth::Failed {
         return TrayStatus::AudioError;
     }
+    if state.session_id.is_some() && state.network_health == RuntimeHealth::Connecting {
+        return TrayStatus::Connecting;
+    }
     match state.session_phase {
         SessionPhase::Starting | SessionPhase::Stopping => TrayStatus::Connecting,
         SessionPhase::Listening if state.session_id.is_some() => TrayStatus::Translating,
@@ -1409,6 +1412,11 @@ mod tests {
         state.session_id = Some("session-1".into());
         assert_eq!(derive_tray_status(&state), TrayStatus::Translating);
 
+        state.network_health = RuntimeHealth::Connecting;
+        assert_eq!(derive_tray_status(&state), TrayStatus::Connecting);
+        state.network_health = RuntimeHealth::Ready;
+        assert_eq!(derive_tray_status(&state), TrayStatus::Translating);
+
         state.audio_health = RuntimeHealth::Failed;
         assert_eq!(derive_tray_status(&state), TrayStatus::AudioError);
         state.network_health = RuntimeHealth::Failed;
@@ -1682,7 +1690,7 @@ mod tests {
             &mut state,
             &json!({"type":"event","event":"network.status","session_id":"session-1","data":{"status":"connecting"}})
         ));
-        assert_eq!(derive_tray_status(&state), TrayStatus::Translating);
+        assert_eq!(derive_tray_status(&state), TrayStatus::Connecting);
 
         // 只有 failed 升级为错误状态。
         assert!(reduce_engine_payload(
