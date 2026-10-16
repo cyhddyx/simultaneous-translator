@@ -141,7 +141,7 @@ npm run desktop:dev
 
 发布新版本时，需要同步 `desktop/package.json`、`desktop/src-tauri/Cargo.toml` 和 `desktop/src-tauri/tauri.conf.json` 的版本号，并向对应 Release 上传 `simultaneous-translator_<版本>_x64-setup.exe` 与 `SHA256SUMS.txt`。校验文件每行格式为 `<64 位 SHA-256>  <安装包文件名>`。当前实现适用于 Windows x64。
 
-**当前源码版本为 1.0.1，包含自动重连修复；最新已发布正式版为 1.0.0（Release 标签 `v1.0.0`）。0.5.2 用户可在应用内获取已发布更新；0.5.1 及更早版本请手动下载安装正式版。**
+**当前正式版本为 1.0.1（Release 标签 `v1.0.1`），包含自动重连修复。0.5.2 及更新版本用户可在应用内获取更新；0.5.1 及更早版本请手动下载安装正式版。**
 
 只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_x64-setup.exe`，不需要编译源码。
 
