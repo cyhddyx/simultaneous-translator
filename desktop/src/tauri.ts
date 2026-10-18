@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { audioLanguageErrors } from "./translationLanguages";
 import { API_KEY_HELP_URLS, type ApiKeyHelpKind } from "./apiKeyHelp";
+import { mergeCaptionHistory, type HistoryExport } from "./history";
 
 import {
   MockOpenSettingsChannel,
@@ -61,6 +62,63 @@ const deepCopy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 const now = () => new Date().toISOString();
 const CAPTION_HISTORY_STORAGE_KEY = "simultaneous-translator.caption-history";
+const CAPTION_HISTORY_DATABASE = "simultaneous-translator-history";
+const CAPTION_HISTORY_STORE = "captions";
+
+let captionHistoryDatabase: Promise<IDBDatabase | null> | null = null;
+let captionHistoryLoad: Promise<CaptionSegment[]> | null = null;
+let captionHistoryCache: CaptionSegment[] | null = null;
+/** Object identity index: pending writes only touch captions React replaced. */
+let captionHistoryIndex: Map<string, CaptionSegment> | null = null;
+let captionHistoryFallbackPending = false;
+let captionHistoryWriteQueue: Promise<void> = Promise.resolve();
+
+function isCaptionSegment(item: unknown): item is CaptionSegment {
+  if (!item || typeof item !== "object") return false;
+  const caption = item as Partial<CaptionSegment>;
+  return (
+    typeof caption.id === "string" &&
+    typeof caption.sessionId === "string" &&
+    typeof caption.sequence === "number" &&
+    typeof caption.sourceText === "string" &&
+    typeof caption.status === "string" &&
+    typeof caption.createdAt === "string"
+  );
+}
+
+function sortCaptionHistory(captions: CaptionSegment[]): CaptionSegment[] {
+  return [...captions].sort(
+    (left, right) =>
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.sequence - right.sequence ||
+      left.id.localeCompare(right.id),
+  );
+}
+
+function openCaptionHistoryDatabase(): Promise<IDBDatabase | null> {
+  if (captionHistoryDatabase) return captionHistoryDatabase;
+  captionHistoryDatabase = new Promise((resolve) => {
+    if (typeof window === "undefined" || !window.indexedDB) {
+      resolve(null);
+      return;
+    }
+    try {
+      const request = window.indexedDB.open(CAPTION_HISTORY_DATABASE, 1);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(CAPTION_HISTORY_STORE)) {
+          database.createObjectStore(CAPTION_HISTORY_STORE, { keyPath: "id" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+      request.onblocked = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+  return captionHistoryDatabase;
+}
 
 function readCaptionHistory(): CaptionSegment[] {
   if (typeof window === "undefined") return [];
@@ -68,33 +126,149 @@ function readCaptionHistory(): CaptionSegment[] {
     const raw = window.localStorage.getItem(CAPTION_HISTORY_STORAGE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (item): item is CaptionSegment =>
-        Boolean(item) &&
-        typeof item === "object" &&
-        typeof (item as CaptionSegment).id === "string" &&
-        typeof (item as CaptionSegment).sessionId === "string" &&
-        typeof (item as CaptionSegment).sequence === "number" &&
-        typeof (item as CaptionSegment).sourceText === "string" &&
-        typeof (item as CaptionSegment).status === "string" &&
-        typeof (item as CaptionSegment).createdAt === "string",
-    );
+    return Array.isArray(parsed) ? parsed.filter(isCaptionSegment) : [];
   } catch {
     return [];
   }
 }
 
-function writeCaptionHistory(captions: CaptionSegment[]): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(
-      CAPTION_HISTORY_STORAGE_KEY,
-      JSON.stringify(captions),
-    );
-  } catch {
-    // Storage can be unavailable in private or restricted WebView contexts.
-  }
+function readAllCaptionRows(database: IDBDatabase): Promise<CaptionSegment[]> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(CAPTION_HISTORY_STORE, "readonly");
+    const request = transaction.objectStore(CAPTION_HISTORY_STORE).getAll();
+    request.onsuccess = () => resolve(request.result.filter(isCaptionSegment));
+    request.onerror = () => reject(request.error ?? new Error("读取历史记录失败。"));
+    transaction.onabort = () => reject(transaction.error ?? new Error("读取历史记录失败。"));
+  });
+}
+
+function writeCaptionRows(database: IDBDatabase, captions: CaptionSegment[], clear = false): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(CAPTION_HISTORY_STORE, "readwrite");
+    const store = transaction.objectStore(CAPTION_HISTORY_STORE);
+    if (clear) store.clear();
+    else captions.forEach((caption) => store.put(caption));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error("保存历史记录失败。"));
+    transaction.onabort = () => reject(transaction.error ?? new Error("保存历史记录失败。"));
+  });
+}
+
+async function loadCaptionHistory(): Promise<CaptionSegment[]> {
+  if (captionHistoryCache) return [...captionHistoryCache];
+  if (captionHistoryLoad) return [...(await captionHistoryLoad)];
+
+  captionHistoryLoad = (async () => {
+    const legacy = readCaptionHistory();
+    const database = await openCaptionHistoryDatabase();
+    captionHistoryFallbackPending = Boolean(database && legacy.length);
+    if (!database) {
+      captionHistoryCache = sortCaptionHistory(legacy);
+      captionHistoryIndex = new Map(captionHistoryCache.map((caption) => [caption.id, caption]));
+      return captionHistoryCache;
+    }
+
+    let merged: CaptionSegment[] | null = null;
+    try {
+      const saved = await readAllCaptionRows(database);
+      // Merge legacy records and any newer fallback written after a failed
+      // database transaction. Remove the fallback only after a durable commit.
+      const complete = mergeCaptionHistory(saved, legacy);
+      merged = complete;
+      if (legacy.length) {
+        await writeCaptionRows(database, complete);
+        window.localStorage.removeItem(CAPTION_HISTORY_STORAGE_KEY);
+        captionHistoryFallbackPending = false;
+      }
+      captionHistoryCache = complete;
+      captionHistoryIndex = new Map(complete.map((caption) => [caption.id, caption]));
+      return complete;
+    } catch {
+      // If the database was readable but migration/removing the fallback
+      // failed, keep the merged archive for this run and refresh the fallback
+      // best-effort. Falling back to localStorage alone here would hide rows
+      // already present in IndexedDB until the next successful startup.
+      captionHistoryCache = sortCaptionHistory(merged ?? legacy);
+      captionHistoryIndex = new Map(captionHistoryCache.map((caption) => [caption.id, caption]));
+      if (merged) {
+        try {
+          writeCaptionHistoryFallback(captionHistoryCache);
+        } catch {
+          // The in-memory copy remains available for this run and can still be
+          // exported even if both persistence paths are temporarily unavailable.
+        }
+      }
+      return captionHistoryCache;
+    }
+  })();
+  return [...(await captionHistoryLoad)];
+}
+
+function persistCaptionHistory(captions: CaptionSegment[]): Promise<void> {
+  const write = captionHistoryWriteQueue.then(async () => {
+    await loadCaptionHistory();
+    // An unchanged caption keeps its object identity across React updates, so
+    // a reference comparison is enough to find rows that actually need an
+    // IndexedDB write.  A full JSON compare would scan the whole archive on
+    // every incoming subtitle and grow quadratically in a long session.
+    const index = captionHistoryIndex ?? new Map<string, CaptionSegment>();
+    const changed = captions.filter((caption) => index.get(caption.id) !== caption);
+    if (!changed.length && !captionHistoryFallbackPending) return;
+
+    // Prepare a candidate index and only publish it after one durable store has
+    // accepted the changed rows. Otherwise a failed caption would look
+    // unchanged on the next React update and never get retried.
+    const nextIndex = new Map(index);
+    for (const caption of changed) nextIndex.set(caption.id, caption);
+    const complete = sortCaptionHistory([...nextIndex.values()]);
+    const database = await openCaptionHistoryDatabase();
+    try {
+      if (!database) throw new Error("IndexedDB is unavailable.");
+      // After any fallback write, copy the full archive back before removing
+      // that fallback. Otherwise a stale fallback could overwrite newer
+      // translations from IndexedDB during the next startup migration.
+      await writeCaptionRows(database, captionHistoryFallbackPending ? complete : changed);
+      if (captionHistoryFallbackPending) {
+        window.localStorage.removeItem(CAPTION_HISTORY_STORAGE_KEY);
+        captionHistoryFallbackPending = false;
+      }
+    } catch (databaseError) {
+      try {
+        writeCaptionHistoryFallback(complete);
+        if (!database) captionHistoryFallbackPending = false;
+      } catch (fallbackError) {
+        throw new Error("本机存储不可用，请及时导出本次记录。", {
+          cause: new AggregateError([databaseError, fallbackError]),
+        });
+      }
+    }
+    captionHistoryCache = complete;
+    captionHistoryIndex = nextIndex;
+  });
+  captionHistoryWriteQueue = write.catch(() => undefined);
+  return write;
+}
+
+async function clearCaptionHistory(): Promise<void> {
+  const clear = captionHistoryWriteQueue.then(async () => {
+    const database = await openCaptionHistoryDatabase();
+    if (database) await writeCaptionRows(database, [], true);
+    // Keep failures visible: an undeleted migration fallback would repopulate
+    // the cleared archive after the next reload.
+    window.localStorage.removeItem(CAPTION_HISTORY_STORAGE_KEY);
+    captionHistoryFallbackPending = false;
+    captionHistoryCache = [];
+    captionHistoryIndex = new Map();
+    captionHistoryLoad = Promise.resolve([]);
+  });
+  captionHistoryWriteQueue = clear.catch(() => undefined);
+  await clear;
+}
+
+function writeCaptionHistoryFallback(captions: CaptionSegment[]): void {
+  if (typeof window === "undefined") throw new Error("本地备用存储不可用。");
+  window.localStorage.setItem(CAPTION_HISTORY_STORAGE_KEY, JSON.stringify(captions));
+  captionHistoryFallbackPending = true;
 }
 
 const mockSentences = [
@@ -394,7 +568,7 @@ class MockTranslator {
   ): void {
     if (this.snapshot.session.sessionId !== sessionId) return;
     const segment: CaptionSegment = {
-      id: `mock-caption-${++this.sequence}`,
+      id: `${sessionId}:${++this.sequence}`,
       sessionId,
       sequence: this.sequence,
       sourceText,
@@ -909,7 +1083,12 @@ export const translatorApi = {
   isTauri: isTauriRuntime(),
 
   async getSnapshot(): Promise<AppSnapshot> {
-    if (!isTauriRuntime()) return mockTranslator.getSnapshot();
+    if (!isTauriRuntime()) {
+      const snapshot = mockTranslator.getSnapshot();
+      const archived = await loadCaptionHistory();
+      if (archived.length) snapshot.captions = archived;
+      return snapshot;
+    }
     const [raw, activeSession] = await Promise.all([
       invoke<BackendSettingsSnapshot>("get_settings"),
       invoke<ActiveSessionSnapshot>("get_active_session"),
@@ -919,7 +1098,7 @@ export const translatorApi = {
     const snapshot = createInitialSnapshot();
     snapshot.revision = bridgeRevision;
     snapshot.settings = settings;
-    snapshot.captions = readCaptionHistory();
+    snapshot.captions = await loadCaptionHistory();
     snapshot.session.phase = isConfigurationComplete(settings)
       ? "idle"
       : "needs_configuration";
@@ -964,16 +1143,31 @@ export const translatorApi = {
   },
 
   async clearHistory(): Promise<void> {
-    if (!isTauriRuntime()) return mockTranslator.clearHistory();
-    try {
-      window.localStorage.removeItem(CAPTION_HISTORY_STORAGE_KEY);
-    } catch {
-      // The UI still clears its in-memory copy when storage is unavailable.
-    }
+    if (!isTauriRuntime()) await mockTranslator.clearHistory();
+    await clearCaptionHistory();
   },
 
-  persistCaptionHistory(captions: CaptionSegment[]): void {
-    writeCaptionHistory(captions);
+  persistCaptionHistory(captions: CaptionSegment[]): Promise<void> {
+    return persistCaptionHistory(captions);
+  },
+
+  async exportHistory(file: HistoryExport): Promise<string> {
+    if (isTauriRuntime()) {
+      // The native command opens a Save-As dialog and returns the written
+      // path, or null when the user cancelled.  Keep the filename/text pair
+      // nested so the Rust side can keep its own `file` argument struct.
+      const path = await invoke<string | null>("export_caption_history", { file });
+      return path ? `已保存至 ${path}` : "已取消导出";
+    }
+    const url = URL.createObjectURL(new Blob([file.text], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = file.filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return `已下载 ${file.filename}`;
   },
 
   async validateSettings(draft: SettingsDraft): Promise<SettingsValidation> {

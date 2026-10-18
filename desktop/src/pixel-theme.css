@@ -1000,3 +1000,142 @@
   .app-shell--pixel .microphone-button:hover:not(:disabled) { transform: none; transition: none; }
   .app-shell--pixel :is(.modal-backdrop, .settings-dialog, .audio-test-dialog, .session-message, .ambient-device-art) { transform: none; transition: opacity 120ms var(--ease-out); }
 }
+
+/* ---- Session history dialog (full archive) ----
+   Same pixel chrome as the settings dialog, but the left column lists dates
+   and the right column reads as one continuous transcript per session. */
+.app-shell--pixel .history-backdrop { padding: 24px; }
+.app-shell--pixel .history-dialog {
+  width: min(960px, 100%);
+  height: min(700px, calc(100dvh - 48px));
+  color: var(--pixel-ink);
+  border: var(--pixel-line);
+  border-radius: 0;
+  background: var(--pixel-white);
+  box-shadow: 5px 5px 0 #241a32;
+}
+.app-shell--pixel .history-dialog__header {
+  align-items: center;
+  padding: 14px 20px;
+  border-bottom: var(--pixel-line);
+  background: #e9e2ef;
+}
+.app-shell--pixel .history-dialog__header h2 {
+  margin: 0;
+  color: var(--pixel-ink);
+  font-family: inherit;
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+.app-shell--pixel .history-dialog__subtitle { margin-top: 4px; color: var(--pixel-muted); font-size: 12px; }
+.app-shell--pixel .history-dialog__body { grid-template-columns: 216px minmax(0, 1fr); }
+.app-shell--pixel .history-dialog__date-panel {
+  gap: 10px;
+  padding: 14px 12px;
+  border-right: var(--pixel-line);
+  background: #e8eee5;
+}
+.app-shell--pixel .history-dialog__panel-heading { padding: 0 4px; }
+.app-shell--pixel .history-dialog__section-label { color: var(--pixel-muted); font-size: 12px; }
+.app-shell--pixel .history-dialog__date-summary { color: var(--pixel-muted); font-size: 12px; }
+.app-shell--pixel .history-dialog__dates { gap: 8px; padding: 2px 2px 8px; }
+.app-shell--pixel .history-date {
+  gap: 8px;
+  padding: 8px 9px;
+  color: var(--pixel-ink);
+  border: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+}
+.app-shell--pixel .history-date:hover:not(:disabled) { background: #ece7f1; }
+.app-shell--pixel .history-date.is-selected {
+  color: var(--pixel-ink);
+  border-color: var(--pixel-ink);
+  background: var(--pixel-lime);
+  box-shadow: 2px 2px 0 var(--pixel-ink);
+}
+.app-shell--pixel .history-date__copy strong { font-size: 12px; }
+.app-shell--pixel .history-date__copy small { color: var(--pixel-muted); font-size: 12px; }
+.app-shell--pixel .history-date__count {
+  min-width: 22px;
+  color: var(--pixel-ink);
+  font-size: 12px;
+  border: 1px solid var(--pixel-edge);
+  border-radius: 0;
+  background: var(--pixel-white);
+}
+.app-shell--pixel .history-date.is-selected .history-date__count { border-color: var(--pixel-ink); }
+.app-shell--pixel .history-dialog__day { padding: 12px 16px 0; }
+.app-shell--pixel .history-dialog__day-header {
+  padding-bottom: 10px;
+  border-bottom: 1px dashed var(--pixel-edge);
+}
+.app-shell--pixel .history-dialog__day-header h3 { color: var(--pixel-ink); font-size: 15px; font-weight: 700; }
+.app-shell--pixel .history-dialog__day-header p { color: var(--pixel-muted); font-size: 12px; }
+.app-shell--pixel .history-dialog__today {
+  color: var(--pixel-ink);
+  font-size: 12px;
+  border: 1px solid var(--pixel-ink);
+  border-radius: 0;
+  background: var(--pixel-pink);
+}
+.app-shell--pixel .history-sessions { gap: 14px; padding: 12px 2px 18px; }
+.app-shell--pixel .history-session__header {
+  gap: 10px;
+  padding: 5px 8px;
+  border-left: 3px solid var(--pixel-plum);
+  background: #f2e0e9;
+}
+.app-shell--pixel .history-session__name { color: var(--pixel-ink); font-size: 12px; }
+.app-shell--pixel .history-session__range { color: var(--pixel-muted); font-size: 12px; }
+.app-shell--pixel .history-session__count { color: var(--pixel-muted); font-size: 12px; }
+.app-shell--pixel .history-dialog__captions .caption-history__item { padding: 10px; }
+.app-shell--pixel .history-dialog__footer {
+  gap: 16px;
+  padding: 12px 20px;
+  border-top: var(--pixel-line);
+  background: #eadde4;
+}
+.app-shell--pixel .history-dialog__feedback { color: #493346; font-size: 12px; font-weight: 600; }
+.app-shell--pixel .history-dialog__actions { gap: 10px; }
+.app-shell--pixel .history-dialog__empty { background: var(--pixel-white); }
+.app-shell--pixel .history-dialog__empty strong { color: var(--pixel-ink); font-size: 14px; }
+.app-shell--pixel .history-dialog__empty span { color: var(--pixel-muted); font-size: 12px; }
+
+@media (max-width: 760px) {
+  .app-shell--pixel .history-dialog__body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: max-content minmax(0, 1fr);
+  }
+  .app-shell--pixel .history-dialog__date-panel {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: var(--pixel-line);
+  }
+  .app-shell--pixel .history-dialog__panel-heading { flex: 0 0 auto; padding: 0; }
+  .app-shell--pixel .history-dialog__dates { display: flex; flex-wrap: wrap; gap: 8px; overflow: visible; padding: 0; }
+  .app-shell--pixel .history-date { width: auto; grid-template-columns: 16px max-content max-content; }
+  .app-shell--pixel .history-date__copy { display: contents; }
+  .app-shell--pixel .history-date__copy small { display: none; }
+  .app-shell--pixel .history-dialog__actions { width: 100%; }
+}
+
+@media (max-width: 560px) {
+  .app-shell--pixel .history-dialog__day-header { flex-wrap: wrap; gap: 6px; }
+  .app-shell--pixel .history-session__header { flex-wrap: wrap; gap: 4px 8px; }
+  .app-shell--pixel .history-session__count { margin-left: 0; }
+}
+
+@media (max-width: 520px) {
+  .app-shell--pixel .history-backdrop { padding: 8px; }
+  .app-shell--pixel .history-dialog { height: calc(100dvh - 16px); }
+  .app-shell--pixel .history-dialog__header { padding: 10px 14px; }
+  .app-shell--pixel .history-dialog__header h2 { font-size: 20px; }
+  .app-shell--pixel .history-dialog__footer { flex-wrap: wrap; gap: 8px; }
+  .app-shell--pixel .history-dialog__actions .button { flex: 1 1 auto; justify-content: center; }
+}

@@ -2820,6 +2820,141 @@ fn cleanup_engine(manager: &EngineManager) {
     manager.clear_pending();
 }
 
+// Session-history export. The filename arrives over the IPC boundary and is only
+// a suggestion for the save dialog, but it still has to be a single valid Windows
+// file name. The text is written byte for byte because the frontend already adds
+// the UTF-8 BOM that Windows text editors use to detect the encoding.
+#[derive(Deserialize)]
+struct CaptionHistoryExportInput {
+    filename: String,
+    text: String,
+}
+
+const MAX_CAPTION_HISTORY_FILENAME_CHARS: usize = 120;
+const CAPTION_HISTORY_FILENAME_STEM: &str = "会话历史";
+const CAPTION_HISTORY_FILENAME_SUFFIX: &str = ".txt";
+// These stems address Windows devices instead of files, with or without an
+// extension (`CON.txt` is still the console), so the sanitizer prefixes them.
+const WINDOWS_RESERVED_FILE_STEMS: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Reduce a suggested export name to one safe `.txt` file name.
+fn sanitize_caption_history_filename(raw: &str) -> String {
+    // Keep the last path component only: directory prefixes, `..` traversal and
+    // drive-relative prefixes can never point outside the directory the dialog
+    // opens in.
+    let suggested = raw.rsplit(['/', '\\']).next().unwrap_or_default();
+    let mut cleaned = String::with_capacity(suggested.len());
+    let mut previous_was_dot = false;
+    for character in suggested.chars() {
+        if character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            continue;
+        }
+        if character == '.' {
+            // `..` stays a traversal segment even without a path separator.
+            if previous_was_dot {
+                continue;
+            }
+            previous_was_dot = true;
+        } else {
+            previous_was_dot = false;
+        }
+        cleaned.push(character);
+    }
+    // Windows drops trailing dots and spaces, and a suggested extension never
+    // decides the format: both are removed before the canonical `.txt` suffix is
+    // appended below.
+    let mut stem = cleaned.trim_matches(['.', ' ']).to_string();
+    if stem
+        .to_ascii_lowercase()
+        .ends_with(CAPTION_HISTORY_FILENAME_SUFFIX)
+    {
+        stem.truncate(stem.len() - CAPTION_HISTORY_FILENAME_SUFFIX.len());
+    }
+    // Any other extension is replaced rather than kept (`report.md` -> `report.txt`).
+    if let Some(position) = stem.rfind('.') {
+        if position > 0 {
+            stem.truncate(position);
+        }
+    }
+    let stem_limit = MAX_CAPTION_HISTORY_FILENAME_CHARS - CAPTION_HISTORY_FILENAME_SUFFIX.len();
+    let mut stem = stem
+        .chars()
+        .take(stem_limit)
+        .collect::<String>()
+        .trim_end_matches(['.', ' '])
+        .to_string();
+    if stem.is_empty() {
+        stem = CAPTION_HISTORY_FILENAME_STEM.to_string();
+    }
+    if WINDOWS_RESERVED_FILE_STEMS
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        stem.insert(0, '_');
+    }
+    format!("{stem}{CAPTION_HISTORY_FILENAME_SUFFIX}")
+}
+
+/// Write the exported bytes to `dir/filename` and return the resulting path.
+fn write_caption_history_file(dir: &Path, filename: &str, text: &str) -> Result<PathBuf, String> {
+    let path = dir.join(filename);
+    // `text` already starts with the UTF-8 BOM the export adds, so writing the
+    // raw bytes keeps that hint without re-encoding the content.
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|error| format!("无法保存会话历史文件 {}：{error}", path.display()))?;
+    Ok(path)
+}
+
+/// Default directory for the save dialog: documents, then downloads, then the
+/// current directory. A missing directory is skipped so the dialog never opens
+/// on a path that cannot be browsed.
+fn caption_history_directory(app: &AppHandle) -> PathBuf {
+    [app.path().document_dir(), app.path().download_dir()]
+        .into_iter()
+        .find_map(|candidate| candidate.ok().filter(|directory| directory.is_dir()))
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn export_caption_history_blocking(
+    app: &AppHandle,
+    input: CaptionHistoryExportInput,
+) -> Result<Option<String>, String> {
+    let filename = sanitize_caption_history_filename(&input.filename);
+    let directory = caption_history_directory(app);
+    // `rfd` runs its own modal message loop; the command below keeps it on the
+    // blocking pool so a Tauri runtime worker is never stalled by the dialog.
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("文本文件", &["txt"])
+        .set_file_name(&filename)
+        .set_directory(&directory)
+        .save_file()
+    else {
+        // The user cancelled: nothing was written and the history is untouched.
+        return Ok(None);
+    };
+    // The dialog lets the user rename the file or pick another directory, so the
+    // returned path wins over the suggested name.
+    let target_directory = path.parent().unwrap_or(directory.as_path());
+    let target_filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "保存位置的文件名无效".to_string())?;
+    let saved = write_caption_history_file(target_directory, target_filename, &input.text)?;
+    Ok(Some(saved.display().to_string()))
+}
+
+#[tauri::command]
+async fn export_caption_history(
+    app: AppHandle,
+    file: CaptionHistoryExportInput,
+) -> Result<Option<String>, String> {
+    spawn_command(move || export_caption_history_blocking(&app, file)).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         // Global shortcuts stay native-only: no WebView ever gets the
@@ -2877,6 +3012,7 @@ pub fn run() {
             updater::install_app_update,
             updater::open_app_releases,
             save_settings,
+            export_caption_history,
             start_translation,
             stop_translation,
             tray::get_runtime_state,
@@ -3616,5 +3752,136 @@ mod tests {
             request.pointer("/params/secrets/realtime_api_key"),
             Some(&json!("realtime-secret"))
         );
+    }
+
+    struct TestExportDirectory(PathBuf);
+
+    impl TestExportDirectory {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "simultaneous-translator-export-test-{}",
+                Uuid::new_v4()
+            ));
+            fs::create_dir_all(&directory).expect("test export directory should be created");
+            Self(directory)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestExportDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn caption_history_export_input_reads_the_frontend_contract() {
+        let input: CaptionHistoryExportInput = serde_json::from_value(json!({
+            "filename": "会话历史-2026-10-18.txt",
+            "text": "\u{FEFF}会话历史 · 2026-10-18\n"
+        }))
+        .expect("history export input should deserialize from the IPC payload");
+
+        assert_eq!(input.filename, "会话历史-2026-10-18.txt");
+        assert!(input.text.starts_with('\u{FEFF}'));
+    }
+
+    #[test]
+    fn caption_history_filename_strips_paths_and_keeps_cjk() {
+        assert_eq!(
+            sanitize_caption_history_filename("..\\..\\Windows\\System32\\evil.exe"),
+            "evil.txt"
+        );
+        assert_eq!(
+            sanitize_caption_history_filename("sub/dir/report.MD"),
+            "report.txt"
+        );
+        assert_eq!(
+            sanitize_caption_history_filename("会话历史-2026-10-18.txt"),
+            "会话历史-2026-10-18.txt"
+        );
+    }
+
+    #[test]
+    fn caption_history_filename_removes_reserved_characters() {
+        assert_eq!(
+            sanitize_caption_history_filename("<bad>:name?|*\"\u{0}.txt"),
+            "badname.txt"
+        );
+        assert_eq!(
+            sanitize_caption_history_filename("会话\t历史\n.txt"),
+            "会话历史.txt"
+        );
+    }
+
+    #[test]
+    fn caption_history_filename_never_targets_a_windows_device() {
+        assert_eq!(sanitize_caption_history_filename("CON"), "_CON.txt");
+        assert_eq!(sanitize_caption_history_filename("lpt1.txt"), "_lpt1.txt");
+    }
+
+    #[test]
+    fn caption_history_filename_falls_back_for_unusable_suggestions() {
+        for raw in ["", "   ", ".", "..", "dir/", "..\\", "<>:\"|?*"] {
+            assert_eq!(
+                sanitize_caption_history_filename(raw),
+                "会话历史.txt",
+                "suggestion {raw:?} should fall back to the default name"
+            );
+        }
+    }
+
+    #[test]
+    fn caption_history_filename_forces_a_lowercase_txt_extension() {
+        assert_eq!(
+            sanitize_caption_history_filename("report.TXT"),
+            "report.txt"
+        );
+        assert_eq!(sanitize_caption_history_filename("notes.md"), "notes.txt");
+        assert_eq!(sanitize_caption_history_filename("history"), "history.txt");
+    }
+
+    #[test]
+    fn caption_history_filename_is_bounded_and_keeps_cjk_characters() {
+        let suggested = format!("{}.txt", "长".repeat(200));
+        let filename = sanitize_caption_history_filename(&suggested);
+
+        assert_eq!(filename.chars().count(), MAX_CAPTION_HISTORY_FILENAME_CHARS);
+        assert!(filename.ends_with(CAPTION_HISTORY_FILENAME_SUFFIX));
+        assert_eq!(
+            filename
+                .chars()
+                .filter(|character| *character == '长')
+                .count(),
+            MAX_CAPTION_HISTORY_FILENAME_CHARS - CAPTION_HISTORY_FILENAME_SUFFIX.len()
+        );
+    }
+
+    #[test]
+    fn caption_history_export_writes_the_exact_utf8_bytes() {
+        let directory = TestExportDirectory::new();
+        let text = "\u{FEFF}会话历史 · 2026-10-18\n共 1 条字幕\n\n[10:00:00] 对方\n原文：hello\n译文：你好\n";
+        let path = write_caption_history_file(directory.path(), "会话历史-2026-10-18.txt", text)
+            .expect("history export should be written");
+
+        assert_eq!(path, directory.path().join("会话历史-2026-10-18.txt"));
+        assert_eq!(fs::read(&path).unwrap().as_slice(), text.as_bytes());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn caption_history_export_reports_a_write_failure() {
+        let directory = TestExportDirectory::new();
+        let error = write_caption_history_file(
+            &directory.path().join("missing-subdirectory"),
+            "会话历史.txt",
+            "text",
+        )
+        .expect_err("a missing directory must not be reported as a successful save");
+
+        assert!(error.contains("无法保存会话历史文件"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "simultaneous-translator"
-version = "1.0.1"
+version = "1.0.2"
 description = "Desktop simultaneous translation workspace"
 authors = ["cyhddyx"]
 edition = "2021"
@@ -20,6 +20,10 @@ keyring = { version = "3", features = ["windows-native"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls", "system-proxy"] }
+# Native "save file" dialog for exporting the caption history. `default-features`
+# is off on purpose: rfd's defaults pull in GTK, which this Windows-only dialog
+# does not need.
+rfd = { version = "0.15", default-features = false }
 semver = "1"
 sha2 = "0.10"
 # `tray-icon` enables the system tray used by the native runtime controls;

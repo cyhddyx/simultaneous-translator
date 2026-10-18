@@ -11,6 +11,7 @@ import {
   CircleAlert,
   CircleDashed,
   Copy,
+  CalendarDays,
   Headphones,
   LoaderCircle,
   MessageSquareDashed,
@@ -30,6 +31,7 @@ import {
 } from "./PixelIcons";
 
 import { SettingsDialog } from "./SettingsDialog";
+import { HistoryDialog } from "./HistoryDialog";
 import { UpdateBanner } from "./AppUpdate";
 import { useAppUpdate } from "./useAppUpdate";
 import { CaptionTail } from "./CaptionTail";
@@ -55,6 +57,7 @@ import {
   isSessionActive,
   latestSessionCaption,
   reconcileRuntimeSession,
+  RECENT_CAPTION_LIMIT,
 } from "./snapshot";
 import {
   createInitialSnapshot,
@@ -69,6 +72,10 @@ import {
   type TranslatorEvent,
 } from "./types";
 import { WaveformCanvas } from "./WaveformCanvas";
+import {
+  buildCaptionHistoryExport,
+  mergeCaptionHistory,
+} from "./history";
 
 function formatElapsed(startedAt: string | null, now: number): string {
   if (!startedAt) return "00:00";
@@ -216,6 +223,7 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeState | null>(null);
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [setupRequested, setSetupRequested] = useState(false);
   const setupOfferedRef = useRef(false);
   const [actionPending, setActionPending] = useState(false);
@@ -269,7 +277,10 @@ export default function App() {
         if (!disposed) {
           setSnapshot((current) =>
             reconcileRuntimeSession(
-              initial.revision >= current.revision ? initial : current,
+              {
+                ...(initial.revision >= current.revision ? initial : { ...current, settings: initial.settings }),
+                captions: mergeCaptionHistory(initial.captions, current.captions),
+              },
               acceptedRuntimeRef.current,
             ),
           );
@@ -396,7 +407,9 @@ export default function App() {
 
   useEffect(() => {
     if (historyHydratedRef.current) {
-      translatorApi.persistCaptionHistory(snapshot.captions);
+      void translatorApi.persistCaptionHistory(snapshot.captions).catch((error) => {
+        setToast(`历史保存失败：${errorMessage(error, "请及时导出本次记录。")}`);
+      });
     }
   }, [snapshot.captions]);
 
@@ -422,6 +435,7 @@ export default function App() {
       : runtime.sessionPhase
     : session.phase;
   const active = isSessionActive(phase);
+  const recentCaptions = snapshot.captions.slice(-RECENT_CAPTION_LIMIT);
   useEffect(() => {
     if (loading || active || !historyHydratedRef.current || setupOfferedRef.current) return;
     setupOfferedRef.current = true;
@@ -509,6 +523,14 @@ export default function App() {
         errorMessage(error, "无法将字幕复制到剪贴板。"),
       );
     }
+  };
+
+  const handleExportHistoryDay = async (dateKey: string) => {
+    return translatorApi.exportHistory(buildCaptionHistoryExport(snapshot.captions, dateKey));
+  };
+
+  const handleExportAllHistory = async () => {
+    return translatorApi.exportHistory(buildCaptionHistoryExport(snapshot.captions));
   };
 
   const handleClear = async () => {
@@ -1071,7 +1093,7 @@ export default function App() {
                     <h2 id="history-title">
                       会话记录{" "}
                       <span className="history-count">
-                        {snapshot.captions.length}
+                        {recentCaptions.length}
                       </span>
                     </h2>
                   </div>
@@ -1085,6 +1107,15 @@ export default function App() {
                     aria-hidden="true"
                   />
                   <div className="history-actions">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => setHistoryOpen(true)}
+                      aria-label="打开会话历史"
+                      title="按日期查看和导出完整会话历史"
+                    >
+                      <CalendarDays size={16} />
+                    </button>
                     <button
                       className="icon-button"
                       type="button"
@@ -1108,9 +1139,9 @@ export default function App() {
                   </div>
                 </header>
 
-                {snapshot.captions.length ? (
+                {recentCaptions.length ? (
                   <ol className="caption-history" aria-label="字幕历史">
-                    {[...snapshot.captions].reverse().map((caption) => (
+                    {[...recentCaptions].reverse().map((caption) => (
                       <li key={caption.id} className="caption-history__item">
                         <time dateTime={caption.createdAt}>
                           {formatCaptionTime(caption.createdAt)}
@@ -1246,6 +1277,15 @@ export default function App() {
           }}
           onSave={handleSaveSettings}
           onValidate={(draft) => translatorApi.validateSettings(draft)}
+        />
+      )}
+
+      {historyOpen && (
+        <HistoryDialog
+          captions={snapshot.captions}
+          onClose={() => setHistoryOpen(false)}
+          onExport={handleExportHistoryDay}
+          onExportAll={handleExportAllHistory}
         />
       )}
     </main>

@@ -6,6 +6,7 @@ Run: .venv/Scripts/python.exe scripts/test_realtime_reconnect.py
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import time
@@ -28,6 +29,14 @@ class Recorder:
 
     def __exit__(self, *_args: object) -> None:
         pass
+
+
+class ToneRecorder(Recorder):
+    """Non-silent capture so keepalive silence stays distinguishable from audio."""
+
+    def record(self, frames: int) -> object:
+        time.sleep(0.003)
+        return np.full((frames, 1), 0.25, dtype="float32")
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
@@ -192,6 +201,144 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             channel.request_stop()
             await asyncio.wait_for(task, timeout=0.5)
             self.assertEqual(attempt.await_count, 1)
+
+    async def test_idle_channel_keeps_sending_silence_instead_of_timing_out(self):
+        session = self.session()
+        channel = session.channels[0]
+        appends: list[dict] = []
+        finish_requests: list[dict] = []
+        connection_closed = asyncio.Event()
+        # A runtime-disabled channel still opens and drains its device but never
+        # forwards a frame, which is exactly the muted/quiet case the keepalive
+        # exists for.  The real capture loop runs here; only its sends are gated.
+        session.runtime.set_channel("listen", False)
+
+        async def handler(socket):
+            try:
+                async for raw in socket:
+                    event = json.loads(raw)
+                    if event["type"] == "session.update":
+                        await socket.send(json.dumps({"type": "session.updated", "session": event["session"]}))
+                    elif event["type"] == "input_audio_buffer.append":
+                        appends.append(event)
+                    elif event["type"] == "session.finish":
+                        finish_requests.append(event)
+                        await socket.send('{"type":"session.finished"}')
+            except ConnectionClosed:
+                pass
+            finally:
+                connection_closed.set()
+
+        async with serve(handler, "127.0.0.1", 0) as websocket_server:
+            channel._base_url = f"ws://127.0.0.1:{websocket_server.sockets[0].getsockname()[1]}"
+            with patch.object(channel, "_prepare_input", side_effect=lambda: (Recorder(), {})), \
+                    patch.object(live, "KEEPALIVE_IDLE_GAP_S", 0.05), \
+                    patch.object(live, "KEEPALIVE_CHECK_INTERVAL_S", 0.02):
+                task = asyncio.create_task(channel._run_with_reconnect())
+                try:
+                    await self.wait_until(lambda: bool(appends))
+                    self.assertFalse(task.done())
+                    self.assertFalse(connection_closed.is_set())
+                    self.assertFalse(session.stop_event.is_set())
+                    self.assertFalse(self.events("error"))
+                    silence = base64.b64decode(appends[0]["audio"])
+                    self.assertEqual(silence, bytes(live.FRAME_SAMPLES * 2))
+                    self.assertEqual(len(silence), 3200)
+                finally:
+                    await self.stop(session, [task])
+        # The clean stop still performs the one session.finish handshake.
+        self.assertEqual(len(finish_requests), 1)
+
+    async def test_flowing_capture_frames_keep_the_keepalive_idle(self):
+        session = self.session()
+        channel = session.channels[0]
+        appends: list[dict] = []
+
+        async def handler(socket):
+            try:
+                async for raw in socket:
+                    event = json.loads(raw)
+                    if event["type"] == "session.update":
+                        await socket.send(json.dumps({"type": "session.updated", "session": event["session"]}))
+                    elif event["type"] == "input_audio_buffer.append":
+                        appends.append(event)
+                    elif event["type"] == "session.finish":
+                        await socket.send('{"type":"session.finished"}')
+            except ConnectionClosed:
+                pass
+
+        async with serve(handler, "127.0.0.1", 0) as websocket_server:
+            channel._base_url = f"ws://127.0.0.1:{websocket_server.sockets[0].getsockname()[1]}"
+            silence = bytes(live.FRAME_SAMPLES * 2)
+            # A gap far larger than the test window: only capture frames may appear.
+            with patch.object(channel, "_prepare_input", side_effect=lambda: (ToneRecorder(), {})), \
+                    patch.object(live, "KEEPALIVE_IDLE_GAP_S", 60.0), \
+                    patch.object(live, "KEEPALIVE_CHECK_INTERVAL_S", 0.01):
+                task = asyncio.create_task(channel._run_with_reconnect())
+                try:
+                    await self.wait_until(lambda: len(appends) >= 3)
+                    # Let the keepalive loop run many check cycles while audio flows.
+                    await asyncio.sleep(0.1)
+                    payloads = [base64.b64decode(event["audio"]) for event in appends]
+                    self.assertGreaterEqual(len(payloads), 3)
+                    self.assertTrue(all(payload and payload != silence for payload in payloads))
+                    self.assertFalse(session.stop_event.is_set())
+                    self.assertFalse(self.events("error"))
+                finally:
+                    await self.stop(session, [task])
+
+    async def test_request_stop_cancels_the_keepalive_before_finishing(self):
+        session = self.session()
+        channel = session.channels[0]
+        appends: list[dict] = []
+        finish_requests: list[dict] = []
+        session.runtime.set_channel("listen", False)
+
+        async def handler(socket):
+            try:
+                async for raw in socket:
+                    event = json.loads(raw)
+                    if event["type"] == "session.update":
+                        await socket.send(json.dumps({"type": "session.updated", "session": event["session"]}))
+                    elif event["type"] == "input_audio_buffer.append":
+                        appends.append(event)
+                    elif event["type"] == "session.finish":
+                        finish_requests.append(event)
+                        await socket.send('{"type":"session.finished"}')
+            except ConnectionClosed:
+                pass
+
+        async with serve(handler, "127.0.0.1", 0) as websocket_server:
+            channel._base_url = f"ws://127.0.0.1:{websocket_server.sockets[0].getsockname()[1]}"
+            with patch.object(channel, "_prepare_input", side_effect=lambda: (Recorder(), {})), \
+                    patch.object(live, "KEEPALIVE_IDLE_GAP_S", 0.0), \
+                    patch.object(live, "KEEPALIVE_CHECK_INTERVAL_S", 0.05):
+                task = asyncio.create_task(channel._run_with_reconnect())
+                try:
+                    await self.wait_until(lambda: bool(appends))
+                    channel.request_stop()
+                    # The keepalive is parked in an interval sleep; only the
+                    # explicit cancel lets the channel finish this promptly.
+                    await asyncio.wait_for(task, timeout=1.0)
+                finally:
+                    if not task.done():
+                        await self.stop(session, [task])
+            sent_at_stop = len(appends)
+            await asyncio.sleep(0.2)
+            self.assertEqual(len(appends), sent_at_stop)
+        self.assertEqual(len(finish_requests), 1)
+        self.assertFalse(channel._failed)
+
+    def test_keepalive_constants_stay_inside_the_server_idle_budget(self):
+        # The server terminates a session after ~300 s without client audio.
+        # The longest possible gap between appends on a quiet channel is one
+        # idle gap plus one check interval, which must stay far below that.
+        self.assertLess(live.KEEPALIVE_IDLE_GAP_S + live.KEEPALIVE_CHECK_INTERVAL_S, 300.0)
+        self.assertGreater(live.KEEPALIVE_CHECK_INTERVAL_S, 0.0)
+        self.assertLess(live.KEEPALIVE_CHECK_INTERVAL_S, live.KEEPALIVE_IDLE_GAP_S)
+        self.assertEqual(live.KEEPALIVE_FRAME_SECONDS, live.FRAME_SECONDS)
+        self.assertEqual(int(live.INPUT_SAMPLE_RATE * live.KEEPALIVE_FRAME_SECONDS), live.FRAME_SAMPLES)
+        self.assertEqual(len(bytes(live.FRAME_SAMPLES * 2)), 3200)
 
     async def test_retry_backoff_is_capped_and_resets_after_a_stable_connection(self):
         session = self.session()

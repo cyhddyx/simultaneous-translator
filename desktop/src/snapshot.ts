@@ -20,7 +20,7 @@ import type {
   TranslatorEvent,
 } from "./types";
 
-export const MAX_VISIBLE_HISTORY = 40;
+export const RECENT_CAPTION_LIMIT = 8;
 
 export function isSessionActive(phase: SessionPhase): boolean {
   return phase === "starting" || phase === "listening" || phase === "stopping";
@@ -184,7 +184,10 @@ export function applyTranslatorEvent(
     return {
       ...snapshot,
       revision,
-      captions: captions.slice(-MAX_VISIBLE_HISTORY),
+      // Keep the complete archive in memory. The compact main-screen preview
+      // applies its own limit; trimming here would make older records
+      // impossible to export later.
+      captions,
     };
   }
 

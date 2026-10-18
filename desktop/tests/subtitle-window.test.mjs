@@ -12,6 +12,7 @@ import {
   applyRuntimeTranslatorEvent,
   applyTranslatorEvent,
   reconcileRuntimeSession,
+  RECENT_CAPTION_LIMIT,
   selectSubtitleView,
   sessionCanReceive,
 } from "../src/snapshot.ts";
@@ -86,6 +87,27 @@ test("the overlay exposes only the newest caption from the shared reducer", () =
   assert.equal(view.translation, "各位好");
   assert.equal(view.current.id, "c4");
   assert.equal(view.current.sourceText, "source 4");
+});
+
+test("the main-screen display limit does not truncate the complete caption history", () => {
+  let snapshot = createInitialSnapshot();
+  snapshot = applyTranslatorEvent(
+    snapshot,
+    sessionEvent(1, "s1", { phase: "starting", sessionId: "s1" }),
+  );
+  for (let index = 1; index <= 60; index += 1) {
+    snapshot = applyTranslatorEvent(
+      snapshot,
+      captionEvent(index + 1, "s1", caption(index, "listen")),
+    );
+  }
+
+  assert.equal(RECENT_CAPTION_LIMIT, 8);
+  assert.equal(snapshot.captions.length, 60);
+  assert.deepEqual(
+    snapshot.captions.slice(-RECENT_CAPTION_LIMIT).map((item) => item.id),
+    Array.from({ length: RECENT_CAPTION_LIMIT }, (_, index) => `c${index + 53}`),
+  );
 });
 
 test("an in-flight caption is marked as pending, not as translated", () => {

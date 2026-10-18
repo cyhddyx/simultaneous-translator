@@ -19,6 +19,9 @@ Wire protocol (``wss://<host>/api-ws/v1/realtime?model=<model>``):
   the client never sends ``input_audio_buffer.commit``.
 * ``session.finish`` must be sent before closing, otherwise the last utterance
   is lost; the server acknowledges with ``session.finished``.
+* a silent ``input_audio_buffer.append`` is sent periodically while the client
+  has sent nothing, so a quiet or muted channel cannot hit the server's ~300 s
+  idle timeout (error 1007) and tear the whole translation session down.
 
 Qwen3.8 text arrives through ``response.text.delta`` (text only) or
 ``response.audio_transcript.delta`` (text + audio). Fragments are accumulated
@@ -186,6 +189,18 @@ CLOSE_TIMEOUT_S = 5.0
 RECONNECT_INITIAL_DELAY_S = 1.0
 RECONNECT_MAX_DELAY_S = 15.0
 RECONNECT_STABLE_SECONDS = 30.0
+# The realtime server closes a session after ~300 s in which the client sent
+# nothing (server error 1007 "Idle timeout").  A muted channel, a quiet room or
+# a stalled capture worker all look exactly like that from the server's side, so
+# a silence frame is appended well before the budget runs out.  60 s leaves a
+# wide safety margin for clock skew and network hiccups, and a 100 ms frame of
+# digital silence is free under automatic turn detection: it resets the idle
+# timer without opening a turn or producing a caption.
+KEEPALIVE_IDLE_GAP_S = 60.0
+KEEPALIVE_CHECK_INTERVAL_S = 10.0
+# The keepalive reuses the capture loop's frame length; ``FRAME_SAMPLES`` samples
+# of PCM16 are 3200 bytes, i.e. 100 ms of digital silence.
+KEEPALIVE_FRAME_SECONDS = 0.1
 RETRYABLE_NETWORK_ERRORS = frozenset({
     "realtime_connect_timeout",
     "realtime_configuration_timeout",
@@ -801,6 +816,11 @@ class LiveTranslateChannel(threading.Thread):
         self._retry_pending = False
         self._retry_wakeup = asyncio.Event()
         self._stream_started_at: float | None = None
+        # Monotonic time of the last successful ``input_audio_buffer.append``.
+        # The idle keepalive reads it to tell a quiet channel from a streaming
+        # one; ``None`` means nothing has been sent since configuration became
+        # ready (which the keepalive treats as idle immediately).
+        self._last_audio_sent_at: float | None = None
         self._player: _PcmPlayer | None = None
         self._system_capture: SystemCapture | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -929,6 +949,7 @@ class LiveTranslateChannel(threading.Thread):
                 if self._session.stop_event.is_set():
                     return
                 reader = asyncio.create_task(self._receive_loop(websocket))
+                keepalive: asyncio.Task[None] | None = None
                 try:
                     stage = "configure"
                     await self._send_session_update(websocket)
@@ -942,8 +963,20 @@ class LiveTranslateChannel(threading.Thread):
                     stage = "capture"
                     self._stream_started_at = time.monotonic()
                     self._server.on_realtime_channel(self._session, self._spec.channel, "streaming")
+                    # The model accepted this configuration, so from here on an
+                    # idle socket must not be mistaken for a dead client.  The
+                    # idle clock starts now: nothing has been sent on this socket.
+                    self._last_audio_sent_at = time.monotonic()
+                    keepalive = asyncio.create_task(self._keepalive_loop(websocket))
                     await self._capture_loop(websocket, pool, recorder)
                 finally:
+                    # Cancel the keepalive before ``session.finish``: awaiting it
+                    # first guarantees no silence frame can be queued behind the
+                    # finish request, and it must never outlive this connection.
+                    if keepalive is not None:
+                        keepalive.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await keepalive
                     if self._updated and not self._failed:
                         await self._finish(websocket)
                     reader.cancel()
@@ -1106,6 +1139,53 @@ class LiveTranslateChannel(threading.Thread):
                 if not self._session.stop_event.is_set():
                     self._report_failure("realtime_send_failed", f"{self._spec.label}通道音频发送失败：{exc}")
                 return
+            # Refresh the idle clock only on a completed send: a failed append
+            # means the socket is already gone and the keepalive must not paper
+            # over it.
+            self._last_audio_sent_at = time.monotonic()
+
+    # ------------------------------------------------------------ idle keepalive
+
+    async def _keepalive_loop(self, websocket: Any) -> None:
+        """Append digital silence while this channel has sent nothing for a while.
+
+        The realtime server ends a session after ~300 s without client audio
+        (error 1007 "Idle timeout"), and our channel only forwards frames while
+        it is enabled and unmuted, so a muted channel, a quiet room or a stalled
+        capture device would silently kill the whole translation session.  A
+        100 ms frame of zeros keeps the server's idle timer fresh; under
+        automatic turn detection it never opens a turn, so it cannot produce an
+        empty caption.  The loop is cancelled before ``session.finish`` is sent,
+        so it can never append audio to a session that is deliberately closing.
+        """
+
+        # 100 ms of PCM16 little-endian digital silence, encoded once because the
+        # payload is identical every time.
+        silence = base64.b64encode(bytes(FRAME_SAMPLES * 2)).decode("ascii")
+        keepalives = 0
+        while True:
+            await asyncio.sleep(KEEPALIVE_CHECK_INTERVAL_S)
+            if self._session.stop_event.is_set() or self._failed or self._finishing:
+                return
+            last_sent = self._last_audio_sent_at
+            if last_sent is not None and time.monotonic() - last_sent < KEEPALIVE_IDLE_GAP_S:
+                continue
+            keepalives += 1
+            try:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "event_id": f"event_{self._spec.channel}_keepalive_{keepalives}",
+                            "type": "input_audio_buffer.append",
+                            "audio": silence,
+                        }
+                    )
+                )
+            except Exception:  # noqa: BLE001 - the receive/capture loops report failures
+                # The socket is gone; _receive_loop or _capture_loop already owns
+                # failure reporting, so a keepalive send must not report twice.
+                return
+            self._last_audio_sent_at = time.monotonic()
 
     # ------------------------------------------------------------ protocol I/O
 
