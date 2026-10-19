@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=同传翻译
+Name[zh_CN]=同传翻译
+GenericName=实时同传翻译
+GenericName[zh_CN]=实时同传翻译
+Comment=实时双向语音同传，可采集系统声音并输出译文语音
+Comment[zh_CN]=实时双向语音同传，可采集系统声音并输出译文语音
+Exec={{exec}}
+Icon={{icon}}
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=translation;translator;subtitle;speech;
+Keywords[zh_CN]=同传;翻译;字幕;语音;
+StartupNotify=true
+StartupWMClass={{name}}

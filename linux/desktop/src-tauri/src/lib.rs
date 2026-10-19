@@ -1,0 +1,4050 @@
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+use keyring::{Entry, Error as KeyringError};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
+use url::Url;
+use uuid::Uuid;
+
+mod api_key_help;
+mod translation_languages;
+mod tray;
+mod updater;
+mod virtual_microphone;
+
+// Dev and packaged builds share Tauri's application identifier, so they need
+// separate storage names or a release build will inherit local test entries.
+// The service/account naming is kept identical to the Windows port; only the
+// backing store changed (Secret Service instead of the Credential Manager).
+#[cfg(debug_assertions)]
+const KEYRING_SERVICE: &str = "SimultaneousTranslator";
+#[cfg(not(debug_assertions))]
+const KEYRING_SERVICE: &str = "SimultaneousTranslatorProduction";
+#[cfg(debug_assertions)]
+const SETTINGS_FILE: &str = "settings.json";
+#[cfg(not(debug_assertions))]
+const SETTINGS_FILE: &str = "settings.production.json";
+const SETTINGS_SCHEMA_VERSION: u32 = 9;
+const SECRET_ENVELOPE_VERSION: u32 = 2;
+const LEGACY_SECRET_ENVELOPE_VERSION: u32 = 1;
+const DEFAULT_TRANSLATION_PROVIDER_ID: &str = "gemini-default";
+const LEGACY_GEMINI_ACCOUNT: &str = "gemini_api_key";
+const RECOGNITION_ACCOUNT: &str = "dashscope_api_key";
+const REALTIME_ACCOUNT: &str = "dashscope_realtime_api_key";
+const GEMINI_ENV_BINDING_ACCOUNT: &str = "environment_binding:gemini";
+const RECOGNITION_ENV_BINDING_ACCOUNT: &str = "environment_binding:dashscope";
+const REALTIME_ENV_BINDING_ACCOUNT: &str = "environment_binding:dashscope-realtime";
+const DEFAULT_RECOGNITION_BASE_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+const DEFAULT_TRANSLATION_MODEL: &str = "gemini-3.7-flash";
+// The realtime model streams audio in, and translated audio plus text out, over
+// one WebSocket: `?model=` selects it, so the base URL stays query-free.
+const DEFAULT_LIVETRANSLATE_BASE_URL: &str = "wss://maas.qianwenaiapi.com/api-ws/v1/realtime";
+const DEFAULT_LIVETRANSLATE_MODEL: &str = "qwen3.8-livetranslate-flash-realtime";
+const LIVETRANSLATE_PROTOCOL: &str = "livetranslate";
+const ENGINE_PIPELINE: &str = "pipeline";
+const ENGINE_REALTIME: &str = "realtime";
+const DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY: &str = "once";
+const VOICE_CLONE_FREQUENCIES: [&str; 3] = ["never", "once", "always"];
+const AUDIO_INPUT_KINDS: [&str; 3] = ["system", "loopback", "microphone"];
+const MAX_AUDIO_DEVICE_BYTES: usize = 512;
+const MAX_REALTIME_VOICE_BYTES: usize = 80;
+const MAX_MODELS_PER_PROVIDER: usize = 100;
+const MAX_ENDPOINT_BYTES: usize = 2_048;
+const MAX_MODEL_ID_BYTES: usize = 256;
+const MAX_LANGUAGE_BYTES: usize = 80;
+const MAX_API_KEY_BYTES: usize = 4_096;
+// The Secret Service (GNOME Keyring / KWallet) stores an item as a D-Bus byte
+// array and has no Windows-style 2,560-byte hard limit. The bound is kept as a
+// defensive sanity check; values above it fall back to the legacy two-entry
+// layout (raw secret plus a separate scope binding) so nothing is ever silently
+// truncated. UTF-16 units are counted because the Windows port did the same and
+// the shape of the stored value is unchanged.
+const MAX_CREDENTIAL_UTF16_BYTES: usize = 64 * 1024;
+// A bare kill abandons the DashScope recognition task, which the service then
+// holds open until it times out on its own. The realtime engine additionally
+// sends `session.finish` and waits for `session.finished`, and cutting that
+// short would drop the last translated utterance.
+const ENGINE_SHUTDOWN_GRACE: Duration = Duration::from_millis(3_000);
+// A one-file Python sidecar must be unpacked on its first launch. Slow disks (and
+// antivirus or integrity scanning on some systems) can legitimately exceed the
+// old eight-second budget before Python has imported the audio stack.
+const ENGINE_START_TIMEOUT: Duration = Duration::from_secs(60);
+const STDERR_HISTORY_LINES: usize = 20;
+const MAX_STDERR_DETAIL_CHARS: usize = 400;
+static SETTINGS_CREDENTIAL_LOCK: Mutex<()> = Mutex::new(());
+
+fn settings_schema_version() -> u32 {
+    SETTINGS_SCHEMA_VERSION
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecognitionSettings {
+    protocol: String,
+    base_url: String,
+    model: String,
+}
+
+impl Default for RecognitionSettings {
+    fn default() -> Self {
+        Self {
+            protocol: "dashscope".into(),
+            base_url: DEFAULT_RECOGNITION_BASE_URL.into(),
+            model: "qwen-audio-3.0-asr-flash-streaming".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationProvider {
+    id: String,
+    name: String,
+    protocol: String,
+    base_url: String,
+    models: Vec<String>,
+    selected_model: String,
+}
+
+impl Default for TranslationProvider {
+    fn default() -> Self {
+        Self {
+            id: DEFAULT_TRANSLATION_PROVIDER_ID.into(),
+            name: "Gemini".into(),
+            protocol: "gemini".into(),
+            base_url: DEFAULT_GEMINI_BASE_URL.into(),
+            models: vec![DEFAULT_TRANSLATION_MODEL.into()],
+            selected_model: DEFAULT_TRANSLATION_MODEL.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeSettings {
+    protocol: String,
+    base_url: String,
+    model: String,
+    voice: String,
+    enable_voice_clone: bool,
+    voice_clone_frequency: String,
+}
+
+impl Default for RealtimeSettings {
+    fn default() -> Self {
+        Self {
+            protocol: LIVETRANSLATE_PROTOCOL.into(),
+            base_url: DEFAULT_LIVETRANSLATE_BASE_URL.into(),
+            model: DEFAULT_LIVETRANSLATE_MODEL.into(),
+            voice: "default".into(),
+            enable_voice_clone: true,
+            voice_clone_frequency: DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioChannelSettings {
+    #[serde(default)]
+    voice_mode: String,
+    enabled: bool,
+    input: String,
+    input_device: String,
+    target_language: String,
+    output_device: String,
+    play_audio: bool,
+}
+
+impl AudioChannelSettings {
+    fn listen() -> Self {
+        Self {
+            enabled: true,
+            // The shipped behaviour listens to system playback, which is what a
+            // meeting or a video call actually emits.
+            input: "system".into(),
+            voice_mode: "system".into(),
+            input_device: String::new(),
+            target_language: "简体中文".into(),
+            output_device: String::new(),
+            play_audio: false,
+        }
+    }
+
+    fn speak() -> Self {
+        Self {
+            enabled: false,
+            input: "microphone".into(),
+            voice_mode: "clone".into(),
+            input_device: String::new(),
+            target_language: "English".into(),
+            output_device: String::new(),
+            play_audio: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioSettings {
+    listen: AudioChannelSettings,
+    speak: AudioChannelSettings,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            listen: AudioChannelSettings::listen(),
+            speak: AudioChannelSettings::speak(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+struct ShortcutSettings {
+    start_or_stop_session: String,
+    toggle_speak_mute: String,
+    toggle_subtitle_window: String,
+    toggle_listen_channel: String,
+    toggle_speak_channel: String,
+}
+
+impl Default for ShortcutSettings {
+    fn default() -> Self {
+        Self {
+            start_or_stop_session: "Ctrl+Shift+Space".into(),
+            toggle_speak_mute: "Ctrl+Shift+M".into(),
+            toggle_subtitle_window: "Ctrl+Shift+O".into(),
+            toggle_listen_channel: "Ctrl+Shift+L".into(),
+            toggle_speak_channel: "Ctrl+Shift+S".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicSettings {
+    #[serde(default = "settings_schema_version")]
+    schema_version: u32,
+    source_language: String,
+    target_language: String,
+    recognition: RecognitionSettings,
+    translation_providers: Vec<TranslationProvider>,
+    active_translation_provider_id: String,
+    keep_on_top: bool,
+    caption_scale: String,
+    // Legacy provider fields are retained for migration; schema 6 runs realtime only.
+    #[serde(default = "default_engine")]
+    engine: String,
+    #[serde(default)]
+    realtime: RealtimeSettings,
+    #[serde(default)]
+    audio: AudioSettings,
+    #[serde(default)]
+    shortcuts: ShortcutSettings,
+}
+
+fn default_engine() -> String {
+    ENGINE_REALTIME.into()
+}
+
+impl Default for PublicSettings {
+    fn default() -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            source_language: "自动检测".into(),
+            target_language: "简体中文".into(),
+            recognition: RecognitionSettings::default(),
+            translation_providers: vec![TranslationProvider::default()],
+            active_translation_provider_id: DEFAULT_TRANSLATION_PROVIDER_ID.into(),
+            keep_on_top: false,
+            caption_scale: "medium".into(),
+            engine: default_engine(),
+            realtime: RealtimeSettings::default(),
+            audio: AudioSettings::default(),
+            shortcuts: ShortcutSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPublicSettings {
+    dashscope_ws_url: String,
+    gemini_base_url: String,
+    gemini_model: String,
+    source_language: String,
+    target_language: String,
+    keep_on_top: bool,
+    caption_scale: String,
+}
+
+impl From<LegacyPublicSettings> for PublicSettings {
+    fn from(legacy: LegacyPublicSettings) -> Self {
+        let model = legacy.gemini_model;
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            source_language: legacy.source_language,
+            target_language: legacy.target_language,
+            recognition: RecognitionSettings {
+                base_url: legacy.dashscope_ws_url,
+                ..RecognitionSettings::default()
+            },
+            translation_providers: vec![TranslationProvider {
+                base_url: legacy.gemini_base_url,
+                models: vec![model.clone()],
+                selected_model: model,
+                ..TranslationProvider::default()
+            }],
+            active_translation_provider_id: DEFAULT_TRANSLATION_PROVIDER_ID.into(),
+            keep_on_top: legacy.keep_on_top,
+            caption_scale: legacy.caption_scale,
+            engine: default_engine(),
+            realtime: RealtimeSettings::default(),
+            audio: AudioSettings::default(),
+            shortcuts: ShortcutSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecognitionInput {
+    protocol: String,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    clear_api_key: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationProviderInput {
+    id: String,
+    name: String,
+    protocol: String,
+    base_url: String,
+    models: Vec<String>,
+    selected_model: String,
+    api_key: Option<String>,
+    clear_api_key: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeInput {
+    protocol: String,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    voice: String,
+    #[serde(default)]
+    enable_voice_clone: bool,
+    #[serde(default)]
+    voice_clone_frequency: String,
+    api_key: Option<String>,
+    clear_api_key: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioChannelInput {
+    #[serde(default)]
+    voice_mode: String,
+    enabled: bool,
+    input: String,
+    #[serde(default)]
+    input_device: String,
+    #[serde(default)]
+    target_language: String,
+    #[serde(default)]
+    output_device: String,
+    #[serde(default = "default_play_audio")]
+    play_audio: bool,
+}
+
+fn default_play_audio() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioSettingsInput {
+    listen: AudioChannelInput,
+    speak: AudioChannelInput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsInput {
+    source_language: String,
+    target_language: String,
+    recognition: RecognitionInput,
+    translation_providers: Vec<TranslationProviderInput>,
+    active_translation_provider_id: String,
+    keep_on_top: bool,
+    caption_scale: String,
+    // Optional so a pre-realtime frontend or an older test payload still saves.
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    realtime: Option<RealtimeInput>,
+    #[serde(default)]
+    audio: Option<AudioSettingsInput>,
+    #[serde(default)]
+    shortcuts: Option<ShortcutSettings>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeProviderSpec {
+    protocol: String,
+    base_url: String,
+    model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProbeInput {
+    provider_id: String,
+    provider: ProbeProviderSpec,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioTestInput {
+    kind: String,
+    #[serde(default)]
+    device_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SecretSource {
+    Environment,
+    SecureStore,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretScope {
+    protocol: String,
+    endpoint_hash: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct LegacySecretScope {
+    protocol: String,
+    origin: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSecretEnvelope {
+    version: u32,
+    secret: String,
+    scope: SecretScope,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyStoredSecretEnvelope {
+    version: u32,
+    secret: String,
+    scope: LegacySecretScope,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentBinding {
+    version: u32,
+    scope: SecretScope,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyEnvironmentBinding {
+    version: u32,
+    scope: LegacySecretScope,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScopedSecret {
+    Available(String),
+    Missing,
+    ScopeMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SecretUpgrade {
+    Usable,
+    Upgrade(String),
+    Unusable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountMigrationState {
+    Missing,
+    UsableOrPlanned,
+    Unusable,
+}
+
+fn legacy_alias_can_fill(state: AccountMigrationState) -> bool {
+    matches!(state, AccountMigrationState::Missing)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecognitionSnapshot {
+    #[serde(flatten)]
+    settings: RecognitionSettings,
+    api_key_status: SecretSource,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationProviderSnapshot {
+    #[serde(flatten)]
+    provider: TranslationProvider,
+    api_key_status: SecretSource,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeSnapshot {
+    #[serde(flatten)]
+    settings: RealtimeSettings,
+    api_key_status: SecretSource,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsSnapshot {
+    schema_version: u32,
+    source_language: String,
+    target_language: String,
+    engine: String,
+    recognition: RecognitionSnapshot,
+    realtime: RealtimeSnapshot,
+    audio: AudioSettings,
+    translation_providers: Vec<TranslationProviderSnapshot>,
+    active_translation_provider_id: String,
+    keep_on_top: bool,
+    caption_scale: String,
+    shortcuts: ShortcutSettings,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartResult {
+    session_id: String,
+}
+
+struct EngineProcess {
+    child: Child,
+    stdin: ChildStdin,
+    session_id: String,
+}
+
+#[derive(Clone)]
+struct EngineManager {
+    process: Arc<Mutex<Option<EngineProcess>>>,
+    // Sidecar responses for runtime channel commands are correlated by request id.
+    // `start_stdout_forwarder` claims them here instead of forwarding them, so the
+    // caller sees the effective value the sidecar actually applied.
+    pending: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>,
+}
+
+impl EngineManager {
+    /// Hands a `type == "response"` payload to its waiter, if any.
+    ///
+    /// Returns `true` when the payload belonged to a pending request; the caller
+    /// must then skip the `translator-event` forwarding path.
+    fn claim_response(&self, payload: &Value) -> bool {
+        if payload.get("type").and_then(Value::as_str) != Some("response") {
+            return false;
+        }
+        let Some(id) = payload.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        let waiter = match self.pending.lock() {
+            Ok(mut pending) => pending.remove(id),
+            Err(poisoned) => poisoned.into_inner().remove(id),
+        };
+        match waiter {
+            Some(waiter) => {
+                // Dropping the receiver first is fine: the send simply fails.
+                let _ = waiter.send(payload.clone());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drops every waiter so a blocked `request_engine_blocking` returns immediately
+    /// instead of waiting for its full timeout after the session is gone.
+    fn clear_pending(&self) {
+        match self.pending.lock() {
+            Ok(mut pending) => pending.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ProbeManager {
+    gate: Arc<Mutex<()>>,
+    audio_gate: Arc<Mutex<()>>,
+}
+
+impl Default for EngineManager {
+    fn default() -> Self {
+        Self {
+            process: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用配置目录：{error}"))?;
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建配置目录：{error}"))?;
+    Ok(directory.join(SETTINGS_FILE))
+}
+
+fn load_public_settings(app: &AppHandle) -> Result<PublicSettings, String> {
+    let _guard = lock_settings_credentials()?;
+    load_public_settings_internal(app, false)
+}
+
+fn lock_settings_credentials() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    SETTINGS_CREDENTIAL_LOCK
+        .lock()
+        .map_err(|_| "设置与凭据状态暂不可用，请重启应用后重试".to_string())
+}
+
+fn load_public_settings_internal(
+    app: &AppHandle,
+    tolerate_credential_migration_failure: bool,
+) -> Result<PublicSettings, String> {
+    let path = settings_path(app)?;
+    if !path.exists() {
+        return Ok(PublicSettings::default());
+    }
+
+    let content = fs::read_to_string(&path).map_err(|error| format!("无法读取设置：{error}"))?;
+    match decode_public_settings_versioned(&content) {
+        Ok((settings, source_version)) if source_version < SETTINGS_SCHEMA_VERSION as u64 => {
+            match migrate_previous_settings(app, &settings, source_version) {
+                Ok(()) => Ok(settings),
+                Err(error) if tolerate_credential_migration_failure => {
+                    eprintln!("credential migration deferred: {error}");
+                    Ok(settings)
+                }
+                Err(error) => Err(format!("旧版 API Key 尚未完成安全迁移：{error}")),
+            }
+        }
+        Ok((settings, _)) => Ok(settings),
+        Err(SettingsDecodeError::UnsupportedVersion(version)) => Err(format!(
+            "设置文件来自更高版本（版本 {version}），当前版本不会修改它。请升级应用后重试。"
+        )),
+        Err(SettingsDecodeError::Invalid(error)) => {
+            let backup = path.with_file_name(format!("settings.invalid-{}.json", Uuid::new_v4()));
+            fs::rename(&path, &backup)
+                .map_err(|rename_error| format!("设置文件格式无效且无法备份：{rename_error}"))?;
+            eprintln!(
+                "invalid settings file moved to {}: {error}",
+                backup.display()
+            );
+            Ok(PublicSettings::default())
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SettingsDecodeError {
+    Invalid(String),
+    UnsupportedVersion(u64),
+}
+
+#[cfg(test)]
+fn decode_public_settings(content: &str) -> Result<PublicSettings, SettingsDecodeError> {
+    decode_public_settings_versioned(content).map(|(settings, _)| settings)
+}
+
+fn decode_public_settings_versioned(
+    content: &str,
+) -> Result<(PublicSettings, u64), SettingsDecodeError> {
+    let value: Value = serde_json::from_str(content)
+        .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?;
+    let version = match value.get("schemaVersion") {
+        None => 1,
+        Some(Value::Number(version)) => version
+            .as_u64()
+            .ok_or_else(|| SettingsDecodeError::Invalid("schemaVersion 必须是正整数".into()))?,
+        Some(_) => {
+            return Err(SettingsDecodeError::Invalid(
+                "schemaVersion 必须是正整数".into(),
+            ))
+        }
+    };
+    let mut settings = match version {
+        1 => {
+            let legacy = serde_json::from_value::<LegacyPublicSettings>(value)
+                .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?;
+            PublicSettings::from(legacy)
+        }
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 => serde_json::from_value::<PublicSettings>(value)
+            .map_err(|error| SettingsDecodeError::Invalid(error.to_string()))?,
+        version => return Err(SettingsDecodeError::UnsupportedVersion(version)),
+    };
+    if version < 6 {
+        let was_pipeline = version < 5 || settings.engine != ENGINE_REALTIME;
+        settings.engine = ENGINE_REALTIME.into();
+        settings.source_language = "自动检测".into();
+        settings.realtime.model = DEFAULT_LIVETRANSLATE_MODEL.into();
+        if settings.realtime.base_url == "wss://dashscope.aliyuncs.com/api-ws/v1/realtime" {
+            settings.realtime.base_url = DEFAULT_LIVETRANSLATE_BASE_URL.into();
+        }
+        settings.realtime.voice.clear();
+        settings.realtime.enable_voice_clone = false;
+        if was_pipeline {
+            settings.audio = AudioSettings::default();
+            settings.audio.listen.target_language = settings.target_language.clone();
+        }
+    }
+    if version < 7 {
+        settings.realtime.voice = "default".into();
+        settings.realtime.enable_voice_clone = true;
+        settings.realtime.voice_clone_frequency = "once".into();
+    }
+    if version < 8 {
+        settings.audio.listen.voice_mode = "system".into();
+        settings.audio.speak.voice_mode = if settings.realtime.enable_voice_clone {
+            "clone"
+        } else {
+            "system"
+        }
+        .into();
+        if settings.audio.listen.input == "loopback"
+            && settings.audio.listen.input_device.is_empty()
+        {
+            settings.audio.listen.input = "system".into();
+        }
+    }
+    normalize_public_settings(settings)
+        .map(|settings| (settings, version))
+        .map_err(SettingsDecodeError::Invalid)
+}
+
+fn save_public_settings(app: &AppHandle, settings: &PublicSettings) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("无法序列化设置：{error}"))?;
+    let path = settings_path(app)?;
+    let temporary = path.with_file_name(format!("settings.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, content).map_err(|error| format!("无法写入临时设置：{error}"))?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("无法替换设置文件：{error}"));
+    }
+    Ok(())
+}
+
+fn normalize_endpoint(
+    value: &str,
+    scheme: &str,
+    label: &str,
+    version_suffix: Option<&str>,
+) -> Result<String, String> {
+    let value = value.trim();
+    if value.len() > MAX_ENDPOINT_BYTES {
+        return Err(format!("{label} 地址过长"));
+    }
+    let mut url = Url::parse(value).map_err(|_| format!("{label} 地址无效"))?;
+    if url.scheme() != scheme || url.host_str().is_none() {
+        return Err(format!("{label} 必须使用 {scheme}:// 安全地址"));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!("{label} 地址不能包含凭据、查询参数或片段"));
+    }
+
+    if let Some(version_suffix) = version_suffix {
+        let path = url.path().trim_end_matches('/').to_string();
+        let lower_path = path.to_ascii_lowercase();
+        if lower_path.ends_with(version_suffix) {
+            let prefix = &path[..path.len() - version_suffix.len()];
+            url.set_path(if prefix.is_empty() { "/" } else { prefix });
+        }
+    }
+
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn validate_provider_id(id: &str) -> Result<String, String> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("服务商标识无效，请删除后重新添加".into());
+    }
+    Ok(id.to_string())
+}
+
+fn normalize_translation_provider(
+    provider: TranslationProvider,
+) -> Result<TranslationProvider, String> {
+    let id = validate_provider_id(&provider.id)?;
+    let name = provider.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 60 {
+        return Err("服务商名称不能为空且不能超过 60 个字符".into());
+    }
+    let protocol = provider.protocol.trim().to_lowercase();
+    let version_suffix = match protocol.as_str() {
+        "gemini" => "/v1beta",
+        "openai" => "/v1",
+        _ => return Err(format!("服务商“{name}”使用了不支持的接口协议")),
+    };
+    let base_url = normalize_endpoint(
+        &provider.base_url,
+        "https",
+        &format!("服务商“{name}”"),
+        Some(version_suffix),
+    )?;
+    let selected_model = provider.selected_model.trim().to_string();
+    if selected_model.is_empty() || selected_model.len() > MAX_MODEL_ID_BYTES {
+        return Err(format!("请为服务商“{name}”选择有效且不过长的模型名称"));
+    }
+
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    for model in provider.models {
+        let model = model.trim().to_string();
+        if model.len() > MAX_MODEL_ID_BYTES {
+            return Err(format!("服务商“{name}”的模型名称过长"));
+        }
+        if !model.is_empty() && seen.insert(model.clone()) {
+            models.push(model);
+        }
+    }
+    if seen.insert(selected_model.clone()) {
+        models.push(selected_model.clone());
+    }
+    if models.len() > MAX_MODELS_PER_PROVIDER {
+        return Err(format!(
+            "服务商“{name}”最多可保存 {MAX_MODELS_PER_PROVIDER} 个模型"
+        ));
+    }
+
+    Ok(TranslationProvider {
+        id,
+        name,
+        protocol,
+        base_url,
+        models,
+        selected_model,
+    })
+}
+
+fn normalize_engine(value: &str) -> Result<String, String> {
+    let engine = value.trim().to_lowercase();
+    match engine.as_str() {
+        ENGINE_PIPELINE | ENGINE_REALTIME => Ok(ENGINE_REALTIME.into()),
+        _ => Err("翻译引擎无效，只能是管线翻译或实时同传".into()),
+    }
+}
+
+fn normalize_realtime(settings: RealtimeSettings) -> Result<RealtimeSettings, String> {
+    let protocol = settings.protocol.trim().to_lowercase();
+    if protocol != LIVETRANSLATE_PROTOCOL {
+        return Err("实时同传仅支持 LiveTranslate 协议".into());
+    }
+    let model = settings.model.trim().to_string();
+    if model != DEFAULT_LIVETRANSLATE_MODEL {
+        return Err("当前仅支持 qwen3.8-livetranslate-flash-realtime 同传模型".into());
+    }
+    let voice = settings.voice.trim().to_string();
+    if voice.len() > MAX_REALTIME_VOICE_BYTES {
+        return Err("同传音色名称过长".into());
+    }
+    let frequency = settings.voice_clone_frequency.trim().to_lowercase();
+    let voice_clone_frequency = if VOICE_CLONE_FREQUENCIES.contains(&frequency.as_str()) {
+        frequency
+    } else {
+        DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY.into()
+    };
+    Ok(RealtimeSettings {
+        protocol,
+        base_url: normalize_endpoint(&settings.base_url, "wss", "实时同传 WebSocket", None)?,
+        model,
+        voice,
+        enable_voice_clone: settings.enable_voice_clone,
+        voice_clone_frequency,
+    })
+}
+
+fn normalize_audio_channel(
+    settings: AudioChannelSettings,
+    label: &str,
+    default_target_language: &str,
+) -> Result<AudioChannelSettings, String> {
+    let input = settings.input.trim().to_lowercase();
+    if !AUDIO_INPUT_KINDS.contains(&input.as_str()) {
+        return Err(format!("{label}通道的音频来源无效"));
+    }
+    // Each direction supplies its own fallback; outgoing speech must never
+    // inherit the incoming translation target.
+    let target_language = match settings.target_language.trim() {
+        "" => default_target_language.to_string(),
+        value if value.len() <= MAX_LANGUAGE_BYTES => value.to_string(),
+        _ => return Err(format!("{label}通道的目标语言过长")),
+    };
+    let input_device = settings.input_device.trim();
+    let output_device = settings.output_device.trim();
+    if input_device.len() > MAX_AUDIO_DEVICE_BYTES || output_device.len() > MAX_AUDIO_DEVICE_BYTES {
+        return Err(format!("{label}通道的音频设备标识过长"));
+    }
+    Ok(AudioChannelSettings {
+        voice_mode: match settings.voice_mode.as_str() {
+            "system" | "clone" => settings.voice_mode,
+            "" => if label == "发言" { "clone" } else { "system" }.into(),
+            _ => return Err(format!("{label}通道的音色设置无效")),
+        },
+        enabled: settings.enabled,
+        input,
+        input_device: input_device.into(),
+        target_language,
+        output_device: output_device.into(),
+        play_audio: settings.play_audio,
+    })
+}
+
+fn normalize_audio_settings(
+    settings: AudioSettings,
+    target_language: &str,
+) -> Result<AudioSettings, String> {
+    Ok(AudioSettings {
+        listen: normalize_audio_channel(settings.listen, "收听", target_language)?,
+        speak: normalize_audio_channel(settings.speak, "发言", "English")?,
+    })
+}
+
+fn normalize_public_settings(settings: PublicSettings) -> Result<PublicSettings, String> {
+    let source_language = settings.source_language.trim().to_string();
+    let target_language = settings.target_language.trim().to_string();
+    if source_language.is_empty()
+        || target_language.is_empty()
+        || source_language.len() > MAX_LANGUAGE_BYTES
+        || target_language.len() > MAX_LANGUAGE_BYTES
+    {
+        return Err("源语言和目标语言不能为空且不能过长".into());
+    }
+    if !matches!(
+        settings.caption_scale.as_str(),
+        "small" | "medium" | "large"
+    ) {
+        return Err("字幕大小无效".into());
+    }
+
+    let recognition = settings.recognition;
+    let translation_providers = settings.translation_providers;
+    let active_translation_provider_id = settings.active_translation_provider_id;
+
+    let engine = normalize_engine(&settings.engine)?;
+    let realtime = normalize_realtime(settings.realtime)?;
+    let audio = normalize_audio_settings(settings.audio, &target_language)?;
+    let shortcuts = normalize_shortcut_settings(settings.shortcuts)?;
+    if engine == ENGINE_REALTIME && !audio.listen.enabled && !audio.speak.enabled {
+        return Err("实时同传至少需要启用一个翻译通道".into());
+    }
+
+    Ok(PublicSettings {
+        schema_version: SETTINGS_SCHEMA_VERSION,
+        source_language,
+        target_language,
+        recognition,
+        translation_providers,
+        active_translation_provider_id,
+        keep_on_top: settings.keep_on_top,
+        caption_scale: settings.caption_scale,
+        engine,
+        realtime,
+        audio,
+        shortcuts,
+    })
+}
+
+fn normalize_shortcut_settings(mut settings: ShortcutSettings) -> Result<ShortcutSettings, String> {
+    let mut ids = HashSet::new();
+    let bindings = [
+        ("开始 / 停止同传", &mut settings.start_or_stop_session),
+        ("静音发言", &mut settings.toggle_speak_mute),
+        ("字幕悬浮窗", &mut settings.toggle_subtitle_window),
+        ("收听通道", &mut settings.toggle_listen_channel),
+        ("发言通道", &mut settings.toggle_speak_channel),
+    ];
+    for (label, accelerator) in bindings {
+        let value = accelerator.trim();
+        if value.is_empty() || value.len() > 128 {
+            return Err(format!("{label}快捷键不能为空且不能过长"));
+        }
+        let shortcut: Shortcut = value
+            .parse()
+            .map_err(|error| format!("{label}快捷键无效：{error}"))?;
+        if !shortcut
+            .mods
+            .intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER)
+        {
+            return Err(format!("{label}快捷键请至少包含 Ctrl、Alt 或 Win"));
+        }
+        if !ids.insert(shortcut.id()) {
+            return Err(format!("快捷键“{value}”已分配给其他操作"));
+        }
+        *accelerator = value.to_string();
+    }
+    Ok(settings)
+}
+
+fn normalize_settings(input: &SettingsInput) -> Result<PublicSettings, String> {
+    normalize_public_settings(PublicSettings {
+        schema_version: SETTINGS_SCHEMA_VERSION,
+        source_language: input.source_language.clone(),
+        target_language: input.target_language.clone(),
+        recognition: RecognitionSettings {
+            protocol: input.recognition.protocol.clone(),
+            base_url: input.recognition.base_url.clone(),
+            model: input.recognition.model.clone(),
+        },
+        translation_providers: input
+            .translation_providers
+            .iter()
+            .map(|provider| TranslationProvider {
+                id: provider.id.clone(),
+                name: provider.name.clone(),
+                protocol: provider.protocol.clone(),
+                base_url: provider.base_url.clone(),
+                models: provider.models.clone(),
+                selected_model: provider.selected_model.clone(),
+            })
+            .collect(),
+        active_translation_provider_id: input.active_translation_provider_id.clone(),
+        keep_on_top: input.keep_on_top,
+        caption_scale: input.caption_scale.clone(),
+        engine: input.engine.clone().unwrap_or_else(default_engine),
+        realtime: input
+            .realtime
+            .as_ref()
+            .map(|realtime| RealtimeSettings {
+                protocol: realtime.protocol.clone(),
+                base_url: realtime.base_url.clone(),
+                model: realtime.model.clone(),
+                voice: realtime.voice.clone(),
+                enable_voice_clone: realtime.enable_voice_clone,
+                voice_clone_frequency: if realtime.voice_clone_frequency.trim().is_empty() {
+                    DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY.into()
+                } else {
+                    realtime.voice_clone_frequency.clone()
+                },
+            })
+            .unwrap_or_default(),
+        audio: input
+            .audio
+            .as_ref()
+            .map(|audio| AudioSettings {
+                listen: channel_from_input(audio.listen.clone()),
+                speak: channel_from_input(audio.speak.clone()),
+            })
+            .unwrap_or_default(),
+        shortcuts: input.shortcuts.clone().unwrap_or_default(),
+    })
+}
+
+fn channel_from_input(input: AudioChannelInput) -> AudioChannelSettings {
+    AudioChannelSettings {
+        voice_mode: input.voice_mode,
+        enabled: input.enabled,
+        input: input.input,
+        input_device: input.input_device,
+        target_language: input.target_language,
+        output_device: input.output_device,
+        play_audio: input.play_audio,
+    }
+}
+
+fn credential_entry(account: &str) -> Result<Entry, String> {
+    Entry::new(KEYRING_SERVICE, account)
+        .map_err(|error| format!("无法访问系统密钥环（Secret Service）：{error}"))
+}
+
+fn read_secret(account: &str) -> Result<Option<String>, String> {
+    match credential_entry(account)?.get_password() {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) | Err(KeyringError::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "无法读取系统密钥环中的 {account}：{error}"
+        )),
+    }
+}
+
+fn provider_account(provider_id: &str) -> String {
+    format!("translation_provider:{provider_id}")
+}
+
+fn is_legacy_gemini_provider(provider: &TranslationProvider) -> bool {
+    provider.id == DEFAULT_TRANSLATION_PROVIDER_ID && provider.protocol == "gemini"
+}
+
+fn secret_binding_account(account: &str) -> String {
+    format!("{account}:scope")
+}
+
+fn provider_environment(provider: &TranslationProvider) -> Result<Option<&'static str>, String> {
+    if provider.id != DEFAULT_TRANSLATION_PROVIDER_ID
+        || provider.protocol != "gemini"
+        || environment_secret(Some("GEMINI_API_KEY")).is_none()
+    {
+        return Ok(None);
+    }
+    if provider.base_url == DEFAULT_GEMINI_BASE_URL
+        || environment_binding_matches(
+            GEMINI_ENV_BINDING_ACCOUNT,
+            &secret_scope(&provider.protocol, &provider.base_url)?,
+        )?
+    {
+        Ok(Some("GEMINI_API_KEY"))
+    } else {
+        Ok(None)
+    }
+}
+
+fn recognition_environment(
+    recognition: &RecognitionSettings,
+) -> Result<Option<&'static str>, String> {
+    if recognition.protocol != "dashscope" {
+        return Ok(None);
+    }
+    if environment_secret(Some("DASHSCOPE_API_KEY")).is_none() {
+        return Ok(None);
+    }
+    if recognition.base_url == DEFAULT_RECOGNITION_BASE_URL
+        || environment_binding_matches(
+            RECOGNITION_ENV_BINDING_ACCOUNT,
+            &secret_scope(&recognition.protocol, &recognition.base_url)?,
+        )?
+    {
+        Ok(Some("DASHSCOPE_API_KEY"))
+    } else {
+        Ok(None)
+    }
+}
+
+fn realtime_environment(realtime: &RealtimeSettings) -> Result<Option<&'static str>, String> {
+    if realtime.protocol != LIVETRANSLATE_PROTOCOL {
+        return Ok(None);
+    }
+    if environment_secret(Some("DASHSCOPE_API_KEY")).is_none() {
+        return Ok(None);
+    }
+    if realtime.base_url == DEFAULT_LIVETRANSLATE_BASE_URL
+        || environment_binding_matches(
+            REALTIME_ENV_BINDING_ACCOUNT,
+            &secret_scope(&realtime.protocol, &realtime.base_url)?,
+        )?
+    {
+        Ok(Some("DASHSCOPE_API_KEY"))
+    } else {
+        Ok(None)
+    }
+}
+
+fn environment_secret(name: Option<&str>) -> Option<String> {
+    name.and_then(|name| env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn secret_scope(protocol: &str, base_url: &str) -> Result<SecretScope, String> {
+    Url::parse(base_url).map_err(|_| "无法为 API Key 绑定服务地址".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(protocol.as_bytes());
+    hasher.update([0]);
+    hasher.update(base_url.as_bytes());
+    let endpoint_hash = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(SecretScope {
+        protocol: protocol.to_string(),
+        endpoint_hash,
+    })
+}
+
+fn legacy_secret_scope(protocol: &str, base_url: &str) -> Result<LegacySecretScope, String> {
+    let url = Url::parse(base_url).map_err(|_| "无法为旧版 API Key 校验服务地址".to_string())?;
+    Ok(LegacySecretScope {
+        protocol: protocol.to_string(),
+        origin: url.origin().ascii_serialization(),
+    })
+}
+
+fn inspect_secret_for_upgrade(
+    stored: &str,
+    stored_binding: Option<&str>,
+    current_scope: &SecretScope,
+    legacy_scope: &LegacySecretScope,
+    source_settings_version: u64,
+) -> SecretUpgrade {
+    if let Ok(envelope) = serde_json::from_str::<StoredSecretEnvelope>(stored) {
+        return if envelope.version == SECRET_ENVELOPE_VERSION
+            && envelope.scope == *current_scope
+            && !envelope.secret.trim().is_empty()
+        {
+            SecretUpgrade::Usable
+        } else {
+            SecretUpgrade::Unusable
+        };
+    }
+    if let Ok(envelope) = serde_json::from_str::<LegacyStoredSecretEnvelope>(stored) {
+        return if envelope.version == LEGACY_SECRET_ENVELOPE_VERSION
+            && envelope.scope == *legacy_scope
+        {
+            let secret = envelope.secret.trim().to_string();
+            if secret.is_empty() {
+                SecretUpgrade::Unusable
+            } else {
+                SecretUpgrade::Upgrade(secret)
+            }
+        } else {
+            SecretUpgrade::Unusable
+        };
+    }
+
+    if let Some(binding) = stored_binding {
+        if serde_json::from_str::<EnvironmentBinding>(binding).is_ok_and(|binding| {
+            binding.version == SECRET_ENVELOPE_VERSION && binding.scope == *current_scope
+        }) {
+            return if stored.trim().is_empty() {
+                SecretUpgrade::Unusable
+            } else {
+                SecretUpgrade::Usable
+            };
+        }
+        let secret = serde_json::from_str::<LegacyEnvironmentBinding>(binding)
+            .ok()
+            .filter(|binding| {
+                binding.version == LEGACY_SECRET_ENVELOPE_VERSION && binding.scope == *legacy_scope
+            })
+            .map(|_| stored.trim().to_string())
+            .filter(|secret| !secret.is_empty());
+        return secret
+            .map(SecretUpgrade::Upgrade)
+            .unwrap_or(SecretUpgrade::Unusable);
+    }
+
+    let secret = stored.trim().to_string();
+    if source_settings_version <= 2 && !secret.is_empty() {
+        SecretUpgrade::Upgrade(secret)
+    } else {
+        SecretUpgrade::Unusable
+    }
+}
+
+fn environment_binding_needs_upgrade(
+    stored_binding: Option<&str>,
+    current_scope: &SecretScope,
+    legacy_scope: &LegacySecretScope,
+) -> bool {
+    match stored_binding {
+        Some(binding)
+            if serde_json::from_str::<EnvironmentBinding>(binding).is_ok_and(|binding| {
+                binding.version == SECRET_ENVELOPE_VERSION && binding.scope == *current_scope
+            }) =>
+        {
+            false
+        }
+        Some(binding) => {
+            serde_json::from_str::<LegacyEnvironmentBinding>(binding).is_ok_and(|binding| {
+                binding.version == LEGACY_SECRET_ENVELOPE_VERSION && binding.scope == *legacy_scope
+            })
+        }
+        None => false,
+    }
+}
+
+fn environment_binding_matches(account: &str, scope: &SecretScope) -> Result<bool, String> {
+    let Some(stored) = read_secret(account)? else {
+        return Ok(false);
+    };
+    Ok(serde_json::from_str::<EnvironmentBinding>(&stored)
+        .is_ok_and(|binding| binding.version == SECRET_ENVELOPE_VERSION && binding.scope == *scope))
+}
+
+fn encode_environment_binding(scope: SecretScope) -> Result<String, String> {
+    let encoded = serde_json::to_string(&EnvironmentBinding {
+        version: SECRET_ENVELOPE_VERSION,
+        scope,
+    })
+    .map_err(|error| format!("无法准备环境变量地址绑定：{error}"))?;
+    validate_credential_value_size(&encoded, "环境变量地址绑定")?;
+    Ok(encoded)
+}
+
+fn read_scoped_secret(account: &str, scope: &SecretScope) -> Result<ScopedSecret, String> {
+    let Some(stored) = read_secret(account)? else {
+        return Ok(ScopedSecret::Missing);
+    };
+    let decoded = decode_scoped_secret(stored.clone(), scope);
+    if matches!(&decoded, ScopedSecret::ScopeMismatch)
+        && serde_json::from_str::<StoredSecretEnvelope>(&stored).is_err()
+        && environment_binding_matches(&secret_binding_account(account), scope)?
+    {
+        return Ok(ScopedSecret::Available(stored));
+    }
+    Ok(decoded)
+}
+
+fn decode_scoped_secret(stored: String, scope: &SecretScope) -> ScopedSecret {
+    if let Ok(envelope) = serde_json::from_str::<StoredSecretEnvelope>(&stored) {
+        if envelope.version == SECRET_ENVELOPE_VERSION && envelope.scope == *scope {
+            let secret = envelope.secret.trim().to_string();
+            return if secret.is_empty() {
+                ScopedSecret::Missing
+            } else {
+                ScopedSecret::Available(secret)
+            };
+        }
+        return ScopedSecret::ScopeMismatch;
+    }
+    ScopedSecret::ScopeMismatch
+}
+
+fn scoped_secret_source(secret: ScopedSecret) -> SecretSource {
+    match secret {
+        ScopedSecret::Available(_) => SecretSource::SecureStore,
+        ScopedSecret::Missing | ScopedSecret::ScopeMismatch => SecretSource::Missing,
+    }
+}
+
+fn recognition_secret_source(recognition: &RecognitionSettings) -> Result<SecretSource, String> {
+    if environment_secret(recognition_environment(recognition)?).is_some() {
+        return Ok(SecretSource::Environment);
+    }
+    let scope = secret_scope(&recognition.protocol, &recognition.base_url)?;
+    Ok(scoped_secret_source(read_scoped_secret(
+        RECOGNITION_ACCOUNT,
+        &scope,
+    )?))
+}
+
+fn realtime_secret_source(realtime: &RealtimeSettings) -> Result<SecretSource, String> {
+    if environment_secret(realtime_environment(realtime)?).is_some() {
+        return Ok(SecretSource::Environment);
+    }
+    let scope = secret_scope(&realtime.protocol, &realtime.base_url)?;
+    Ok(scoped_secret_source(read_scoped_secret(
+        REALTIME_ACCOUNT,
+        &scope,
+    )?))
+}
+
+fn resolve_realtime_secret(realtime: &RealtimeSettings) -> Result<String, String> {
+    if let Some(value) = environment_secret(realtime_environment(realtime)?) {
+        return Ok(value);
+    }
+    let scope = secret_scope(&realtime.protocol, &realtime.base_url)?;
+    match read_scoped_secret(REALTIME_ACCOUNT, &scope)? {
+        ScopedSecret::Available(value) => Ok(value),
+        ScopedSecret::ScopeMismatch => {
+            Err("实时同传服务地址已更改，请重新输入并保存 API Key".into())
+        }
+        ScopedSecret::Missing => {
+            Err("缺少实时同传 API Key，请在设置中配置 DashScope API Key".into())
+        }
+    }
+}
+
+fn provider_secret_source(provider: &TranslationProvider) -> Result<SecretSource, String> {
+    if environment_secret(provider_environment(provider)?).is_some() {
+        return Ok(SecretSource::Environment);
+    }
+    let account = provider_account(&provider.id);
+    let scope = secret_scope(&provider.protocol, &provider.base_url)?;
+    match read_scoped_secret(&account, &scope)? {
+        ScopedSecret::Available(_) => Ok(SecretSource::SecureStore),
+        secret => Ok(scoped_secret_source(secret)),
+    }
+}
+
+fn resolve_provider_secret(provider: &TranslationProvider) -> Result<String, String> {
+    if let Some(value) = environment_secret(provider_environment(provider)?) {
+        return Ok(value);
+    }
+    let account = provider_account(&provider.id);
+    let scope = secret_scope(&provider.protocol, &provider.base_url)?;
+    match read_scoped_secret(&account, &scope)? {
+        ScopedSecret::Available(value) => Ok(value),
+        ScopedSecret::ScopeMismatch => Err(format!(
+            "服务商“{}”的协议或地址已更改，请重新输入并保存 API Key",
+            provider.name
+        )),
+        ScopedSecret::Missing => Err(format!(
+            "缺少服务商“{}”的 API Key，请在设置中配置",
+            provider.name
+        )),
+    }
+}
+
+fn encode_scoped_secret(secret: &str, scope: SecretScope) -> Result<String, String> {
+    let encoded = serde_json::to_string(&StoredSecretEnvelope {
+        version: SECRET_ENVELOPE_VERSION,
+        secret: secret.to_string(),
+        scope,
+    })
+    .map_err(|error| format!("无法准备 API Key：{error}"))?;
+    validate_credential_value_size(&encoded, "API Key")?;
+    Ok(encoded)
+}
+
+fn validate_credential_value_size(value: &str, label: &str) -> Result<(), String> {
+    let utf16_bytes = value.encode_utf16().count().saturating_mul(2);
+    if utf16_bytes > MAX_CREDENTIAL_UTF16_BYTES {
+        return Err(format!(
+            "{label} 与服务地址合计过长，超出密钥环条目大小限制"
+        ));
+    }
+    Ok(())
+}
+
+fn plan_scoped_secret_storage(
+    planned_secrets: &mut Vec<(String, Option<String>)>,
+    account: String,
+    secret: &str,
+    scope: SecretScope,
+) -> Result<(), String> {
+    match encode_scoped_secret(secret, scope.clone()) {
+        Ok(encoded) => {
+            planned_secrets.push((account.clone(), Some(encoded)));
+            planned_secrets.push((secret_binding_account(&account), None));
+        }
+        Err(envelope_error) => {
+            validate_credential_value_size(secret, "旧版 API Key").map_err(|_| envelope_error)?;
+            planned_secrets.push((
+                secret_binding_account(&account),
+                Some(encode_environment_binding(scope)?),
+            ));
+            planned_secrets.push((account, Some(secret.to_string())));
+        }
+    }
+    Ok(())
+}
+
+fn requested_secret_change(
+    value: Option<&str>,
+    clear: bool,
+    label: &str,
+) -> Result<Option<Option<String>>, String> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    if clear && value.is_some() {
+        return Err(format!("{label} 不能同时替换和删除"));
+    }
+    if let Some(value) = value {
+        if value.len() > MAX_API_KEY_BYTES {
+            return Err(format!("{label} 过长"));
+        }
+        return Ok(Some(Some(value.to_string())));
+    }
+    Ok(clear.then_some(None))
+}
+
+fn write_secret_value(account: &str, value: Option<&str>) -> Result<(), String> {
+    let entry = credential_entry(account)?;
+    match value {
+        Some(value) => entry
+            .set_password(value)
+            .map_err(|error| format!("无法保存 {account}：{error}"))?,
+        None => match entry.delete_credential() {
+            Ok(()) | Err(KeyringError::NoEntry) => {}
+            Err(error) => return Err(format!("无法删除 {account}：{error}")),
+        },
+    }
+    let verified = read_secret(account)?;
+    if verified.as_deref() != value {
+        return Err(format!("{account} 的保存校验失败，请重试"));
+    }
+    Ok(())
+}
+
+fn commit_settings_and_secrets(
+    app: &AppHandle,
+    settings: &PublicSettings,
+    planned_secrets: &[(String, Option<String>)],
+) -> Result<(), String> {
+    let previous_secrets = planned_secrets
+        .iter()
+        .map(|(account, _)| Ok((account.clone(), read_secret(account)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut attempted_secrets = 0;
+    let commit_result = (|| {
+        for (account, value) in planned_secrets {
+            attempted_secrets += 1;
+            write_secret_value(account, value.as_deref())?;
+        }
+        save_public_settings(app, settings)
+    })();
+    if let Err(error) = commit_result {
+        let rollback_errors = previous_secrets[..attempted_secrets]
+            .iter()
+            .rev()
+            .filter_map(|(account, value)| {
+                write_secret_value(account, value.as_deref())
+                    .err()
+                    .map(|rollback_error| format!("{account}: {rollback_error}"))
+            })
+            .collect::<Vec<_>>();
+        return if rollback_errors.is_empty() {
+            Err(error)
+        } else {
+            Err(format!(
+                "{error}；恢复原有密钥时仍有错误：{}",
+                rollback_errors.join("；")
+            ))
+        };
+    }
+    Ok(())
+}
+
+fn plan_account_scope_upgrade(
+    planned_secrets: &mut Vec<(String, Option<String>)>,
+    account: &str,
+    current_scope: &SecretScope,
+    legacy_scope: &LegacySecretScope,
+    source_settings_version: u64,
+) -> Result<AccountMigrationState, String> {
+    let Some(stored) = read_secret(account)? else {
+        return Ok(AccountMigrationState::Missing);
+    };
+    let binding_account = secret_binding_account(account);
+    let stored_binding = read_secret(&binding_account)?;
+    match inspect_secret_for_upgrade(
+        &stored,
+        stored_binding.as_deref(),
+        current_scope,
+        legacy_scope,
+        source_settings_version,
+    ) {
+        SecretUpgrade::Usable => Ok(AccountMigrationState::UsableOrPlanned),
+        SecretUpgrade::Upgrade(secret) => {
+            plan_scoped_secret_storage(
+                planned_secrets,
+                account.to_string(),
+                &secret,
+                current_scope.clone(),
+            )?;
+            Ok(AccountMigrationState::UsableOrPlanned)
+        }
+        SecretUpgrade::Unusable => Ok(AccountMigrationState::Unusable),
+    }
+}
+
+fn migrate_previous_settings(
+    app: &AppHandle,
+    settings: &PublicSettings,
+    source_settings_version: u64,
+) -> Result<(), String> {
+    let mut planned_secrets = Vec::new();
+    let recognition_scope = secret_scope(
+        &settings.recognition.protocol,
+        &settings.recognition.base_url,
+    )?;
+    let legacy_recognition_scope = legacy_secret_scope(
+        &settings.recognition.protocol,
+        &settings.recognition.base_url,
+    )?;
+    plan_account_scope_upgrade(
+        &mut planned_secrets,
+        RECOGNITION_ACCOUNT,
+        &recognition_scope,
+        &legacy_recognition_scope,
+        source_settings_version,
+    )?;
+    if settings.recognition.base_url != DEFAULT_RECOGNITION_BASE_URL
+        && environment_binding_needs_upgrade(
+            read_secret(RECOGNITION_ENV_BINDING_ACCOUNT)?.as_deref(),
+            &recognition_scope,
+            &legacy_recognition_scope,
+        )
+    {
+        planned_secrets.push((
+            RECOGNITION_ENV_BINDING_ACCOUNT.into(),
+            Some(encode_environment_binding(recognition_scope)?),
+        ));
+    }
+
+    let realtime_scope = secret_scope(&settings.realtime.protocol, &settings.realtime.base_url)?;
+    let legacy_realtime_scope =
+        legacy_secret_scope(&settings.realtime.protocol, &settings.realtime.base_url)?;
+    plan_account_scope_upgrade(
+        &mut planned_secrets,
+        REALTIME_ACCOUNT,
+        &realtime_scope,
+        &legacy_realtime_scope,
+        source_settings_version,
+    )?;
+    if settings.realtime.base_url != DEFAULT_LIVETRANSLATE_BASE_URL
+        && environment_binding_needs_upgrade(
+            read_secret(REALTIME_ENV_BINDING_ACCOUNT)?.as_deref(),
+            &realtime_scope,
+            &legacy_realtime_scope,
+        )
+    {
+        planned_secrets.push((
+            REALTIME_ENV_BINDING_ACCOUNT.into(),
+            Some(encode_environment_binding(realtime_scope)?),
+        ));
+    }
+
+    let legacy_secret = read_secret(LEGACY_GEMINI_ACCOUNT)?;
+    let mut legacy_alias_consumed = false;
+    for provider in &settings.translation_providers {
+        let provider_scope = secret_scope(&provider.protocol, &provider.base_url)?;
+        let legacy_provider_scope = legacy_secret_scope(&provider.protocol, &provider.base_url)?;
+        let provider_account = provider_account(&provider.id);
+        let provider_secret_state = plan_account_scope_upgrade(
+            &mut planned_secrets,
+            &provider_account,
+            &provider_scope,
+            &legacy_provider_scope,
+            source_settings_version,
+        )?;
+        let is_legacy_gemini = is_legacy_gemini_provider(provider);
+        if is_legacy_gemini {
+            match (provider_secret_state, legacy_secret.as_deref()) {
+                (state, Some(legacy_secret)) if legacy_alias_can_fill(state) => {
+                    plan_scoped_secret_storage(
+                        &mut planned_secrets,
+                        provider_account.clone(),
+                        legacy_secret,
+                        provider_scope.clone(),
+                    )?;
+                    legacy_alias_consumed = true;
+                }
+                (AccountMigrationState::UsableOrPlanned, Some(_)) => {
+                    legacy_alias_consumed = true;
+                }
+                _ => {}
+            }
+        }
+        if is_legacy_gemini
+            && provider.base_url != DEFAULT_GEMINI_BASE_URL
+            && environment_binding_needs_upgrade(
+                read_secret(GEMINI_ENV_BINDING_ACCOUNT)?.as_deref(),
+                &provider_scope,
+                &legacy_provider_scope,
+            )
+        {
+            planned_secrets.push((
+                GEMINI_ENV_BINDING_ACCOUNT.into(),
+                Some(encode_environment_binding(provider_scope)?),
+            ));
+        }
+    }
+    if legacy_alias_consumed {
+        planned_secrets.push((LEGACY_GEMINI_ACCOUNT.into(), None));
+        planned_secrets.push((secret_binding_account(LEGACY_GEMINI_ACCOUNT), None));
+    }
+    commit_settings_and_secrets(app, settings, &planned_secrets)
+}
+
+fn snapshot(app: &AppHandle) -> Result<SettingsSnapshot, String> {
+    let _guard = lock_settings_credentials()?;
+    let settings = load_public_settings_internal(app, true)?;
+    Ok(snapshot_from_settings(settings))
+}
+
+fn snapshot_from_settings(settings: PublicSettings) -> SettingsSnapshot {
+    let recognition_status =
+        recognition_secret_source(&settings.recognition).unwrap_or(SecretSource::Unavailable);
+    let realtime_status =
+        realtime_secret_source(&settings.realtime).unwrap_or(SecretSource::Unavailable);
+    let translation_providers = settings
+        .translation_providers
+        .iter()
+        .cloned()
+        .map(|provider| {
+            let api_key_status =
+                provider_secret_source(&provider).unwrap_or(SecretSource::Unavailable);
+            TranslationProviderSnapshot {
+                provider,
+                api_key_status,
+            }
+        })
+        .collect::<Vec<_>>();
+    SettingsSnapshot {
+        schema_version: settings.schema_version,
+        source_language: settings.source_language,
+        target_language: settings.target_language,
+        engine: settings.engine,
+        recognition: RecognitionSnapshot {
+            settings: settings.recognition,
+            api_key_status: recognition_status,
+        },
+        realtime: RealtimeSnapshot {
+            settings: settings.realtime,
+            api_key_status: realtime_status,
+        },
+        audio: settings.audio,
+        translation_providers,
+        active_translation_provider_id: settings.active_translation_provider_id,
+        keep_on_top: settings.keep_on_top,
+        caption_scale: settings.caption_scale,
+        shortcuts: settings.shortcuts,
+    }
+}
+
+fn write_json_line(stdin: &mut ChildStdin, payload: Value) -> Result<(), String> {
+    let line =
+        serde_json::to_string(&payload).map_err(|error| format!("无法编码引擎指令：{error}"))?;
+    stdin
+        .write_all(line.as_bytes())
+        .and_then(|_| stdin.write_all(b"\n"))
+        .and_then(|_| stdin.flush())
+        .map_err(|error| format!("无法向翻译引擎发送指令：{error}"))
+}
+
+fn start_stdout_reader(stdout: ChildStdout) -> mpsc::Receiver<Value> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = match line {
+                Ok(line) => line,
+                // A single mis-encoded line used to end the reader silently, so
+                // the session died with no diagnostic at all.
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    eprintln!("translator sidecar emitted a non-UTF-8 line");
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let Ok(payload) = serde_json::from_str::<Value>(&line) else {
+                eprintln!("translator sidecar emitted invalid JSON");
+                continue;
+            };
+            if sender.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn forward_engine_payload(app: &AppHandle, payload: Value) {
+    // Sidecar payloads keep flowing to `translator-event` unchanged; the native
+    // runtime state is updated on the side (contract runtime-channel-control §5).
+    tray::observe_engine_payload(app, &payload);
+    if payload.get("type").and_then(Value::as_str) == Some("event") {
+        let _ = app.emit("translator-event", payload);
+    }
+}
+
+/// Writes one sidecar request and waits (bounded) for the matching `response`.
+///
+/// The waiter is registered *before* the write so a fast response cannot be
+/// missed. Returns `Ok(None)` when the sidecar did not answer in time: the
+/// request itself was accepted, and any real state change still arrives as a
+/// `runtime.channel` / `runtime.mute` event.
+fn request_engine_blocking(
+    manager: &EngineManager,
+    session_id: &str,
+    command: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Option<Value>, String> {
+    let request_id = Uuid::new_v4().to_string();
+    let (sender, receiver) = mpsc::channel();
+    match manager.pending.lock() {
+        Ok(mut pending) => {
+            pending.insert(request_id.clone(), sender);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(request_id.clone(), sender);
+        }
+    }
+
+    let request = json!({
+        "type": "request",
+        "id": request_id,
+        "command": command,
+        "params": params,
+    });
+    let write_result = {
+        let mut process = manager
+            .process
+            .lock()
+            .map_err(|_| "翻译引擎状态不可用".to_string())?;
+        match process.as_mut() {
+            Some(engine) if engine.session_id == session_id => {
+                write_json_line(&mut engine.stdin, request)
+            }
+            Some(_) => Err("会话已结束或已被替换。".to_string()),
+            None => Err("翻译引擎未在运行。".to_string()),
+        }
+    };
+    if let Err(error) = write_result {
+        if let Ok(mut pending) = manager.pending.lock() {
+            pending.remove(&request_id);
+        }
+        return Err(error);
+    }
+
+    match receiver.recv_timeout(timeout) {
+        Ok(payload) => Ok(Some(payload)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Ok(mut pending) = manager.pending.lock() {
+                pending.remove(&request_id);
+            }
+            Ok(None)
+        }
+        // The sidecar exited (or the engine was cleaned up) before answering.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+    }
+}
+
+fn is_stopped_state(payload: &Value, session_id: &str) -> bool {
+    payload.get("type").and_then(Value::as_str) == Some("event")
+        && payload.get("event").and_then(Value::as_str) == Some("state")
+        && payload.get("session_id").and_then(Value::as_str) == Some(session_id)
+        && payload.pointer("/data/state").and_then(Value::as_str) == Some("stopped")
+}
+
+fn clear_matching_engine(manager: &EngineManager, session_id: &str) -> bool {
+    let cleared = match manager.process.lock() {
+        Ok(mut process) => {
+            let belongs_to_session = process
+                .as_ref()
+                .is_some_and(|engine| engine.session_id == session_id);
+            if belongs_to_session {
+                if let Some(mut engine) = process.take() {
+                    let _ = engine.child.kill();
+                    let _ = engine.child.wait();
+                }
+            }
+            belongs_to_session
+        }
+        Err(_) => false,
+    };
+    if cleared {
+        manager.clear_pending();
+    }
+    cleared
+}
+
+fn start_stdout_forwarder(
+    app: AppHandle,
+    receiver: mpsc::Receiver<Value>,
+    manager: EngineManager,
+    session_id: String,
+) {
+    thread::spawn(move || {
+        for payload in receiver {
+            let stopped = is_stopped_state(&payload, &session_id);
+            if manager.claim_response(&payload) {
+                // A runtime channel / mute response for `request_engine_blocking`:
+                // it is not an event, so it never reaches `translator-event`.
+                continue;
+            }
+            forward_engine_payload(&app, payload);
+            if stopped {
+                clear_matching_engine(&manager, &session_id);
+                return;
+            }
+        }
+
+        let should_report_exit = clear_matching_engine(&manager, &session_id);
+        // Nothing can answer pending requests any more.
+        manager.clear_pending();
+
+        if should_report_exit {
+            let _ = app.emit(
+                "translator-event",
+                json!({
+                    "type": "event",
+                    "event": "error",
+                    "session_id": session_id.clone(),
+                    "data": {
+                        "scope": "system",
+                        "code": "sidecar_exited",
+                        "message": "翻译引擎已意外停止，请重新开始会话。",
+                        "recoverable": true
+                    }
+                }),
+            );
+            let _ = app.emit(
+                "translator-event",
+                json!({
+                    "type": "event",
+                    "event": "state",
+                    "session_id": session_id,
+                    "data": {"state": "stopped"}
+                }),
+            );
+        }
+    });
+}
+
+fn wait_for_start_response(
+    app: &AppHandle,
+    receiver: &mpsc::Receiver<Value>,
+    request_id: &str,
+    expected_session_id: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + ENGINE_START_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("翻译引擎启动超时".into());
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(payload) => {
+                if payload.get("type").and_then(Value::as_str) == Some("response")
+                    && payload.get("id").and_then(Value::as_str) == Some(request_id)
+                {
+                    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+                        let acknowledged_session_id = payload
+                            .pointer("/result/session_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if acknowledged_session_id != expected_session_id {
+                            return Err("翻译引擎返回了不匹配的会话 ID".into());
+                        }
+                        return Ok(());
+                    }
+                    let message = payload
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("翻译引擎拒绝启动请求");
+                    return Err(format!("翻译引擎无法启动：{message}"));
+                }
+                forward_engine_payload(app, payload);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err("翻译引擎启动超时".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("翻译引擎在启动确认前退出".into())
+            }
+        }
+    }
+}
+
+/// A rolling tail of the sidecar's stderr.
+///
+/// A GUI-subsystem build has nowhere to print it, so without keeping the last
+/// lines around a Python traceback is invisible and every failure looks like the
+/// bare "翻译引擎在启动确认前退出".
+#[derive(Clone, Default)]
+struct StderrLog {
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl StderrLog {
+    fn push(&self, line: String) {
+        if let Ok(mut lines) = self.lines.lock() {
+            if lines.len() >= STDERR_HISTORY_LINES {
+                lines.remove(0);
+            }
+            lines.push(line);
+        }
+    }
+
+    fn tail(&self) -> String {
+        let Ok(lines) = self.lines.lock() else {
+            return String::new();
+        };
+        let joined = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if joined.chars().count() <= MAX_STDERR_DETAIL_CHARS {
+            joined
+        } else {
+            joined
+                .chars()
+                .skip(joined.chars().count() - MAX_STDERR_DETAIL_CHARS)
+                .collect()
+        }
+    }
+}
+
+fn with_engine_detail(error: String, stderr_log: &StderrLog) -> String {
+    let detail = stderr_log.tail();
+    if detail.is_empty() {
+        error
+    } else {
+        format!("{error}（引擎输出：{detail}）")
+    }
+}
+
+fn start_stderr_forwarder(stderr: ChildStderr) -> StderrLog {
+    let log = StderrLog::default();
+    let sink = log.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("translator sidecar: {line}");
+            sink.push(line);
+        }
+    });
+    log
+}
+
+// --------------------------------------------------------------------------- //
+// 平台辅助（Linux）
+// --------------------------------------------------------------------------- //
+
+/// 用桌面默认程序打开 URL 或目录（Linux 的 `xdg-open`）。
+///
+/// `xdg-open` 在部分文件管理器上会驻留，因此不等它退出，只在后台线程回收子进程。
+pub(crate) fn open_with_default_app(target: &str) -> Result<(), String> {
+    let mut child = Command::new("xdg-open")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => "未找到 xdg-open，请先安装 xdg-utils".to_string(),
+            _ => format!("无法启动 xdg-open：{error}"),
+        })?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Linux 版仓库根目录：`<linux 根>`，即 `desktop/src-tauri` 的上两级。
+///
+/// 开发模式下 Python 引擎放在仓库级的 `scripts/` 与 `.venv/`（PORTING_CONTRACT
+/// §4.4），而不是每个桌面包各自一份。
+fn project_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("src-tauri must be nested under desktop")
+        .to_path_buf()
+}
+
+/// 开发模式 Python 解释器路径的覆盖变量（`scripts/dev.sh` 会导出它）。
+pub(crate) const ENGINE_PYTHON_ENV: &str = "TRANSLATOR_PYTHON";
+
+/// 开发模式下的桥接脚本路径：`<linux 根>/scripts/tauri_bridge.py`。
+fn dev_engine_bridge(root: &Path) -> PathBuf {
+    root.join("scripts").join("tauri_bridge.py")
+}
+
+/// 开发模式下按优先级解析 Python 解释器：
+/// `TRANSLATOR_PYTHON` 环境变量 → `<linux 根>/.venv/bin/python` → PATH 中的 `python3`。
+///
+/// 环境变量是用户显式指定的路径，缺失时直接报错而不是静默换一个解释器；仓库内的
+/// `.venv` 由 `scripts/install.sh` 创建，尚未创建时退回系统 `python3`（启动失败会
+/// 给出带安装提示的错误）。
+fn dev_engine_python(root: &Path, interpreter_override: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    if let Some(value) = interpreter_override.filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if !path.exists() {
+            return Err(format!(
+                "{ENGINE_PYTHON_ENV} 指向的 Python 解释器不存在：{}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    let venv = root.join(".venv").join("bin").join("python");
+    if venv.exists() {
+        return Ok(venv);
+    }
+    Ok(PathBuf::from("python3"))
+}
+
+fn launch_engine() -> Result<Child, String> {
+    let development = cfg!(debug_assertions);
+    let mut command = if development {
+        let root = project_root();
+        let bridge = dev_engine_bridge(&root);
+        if !bridge.exists() {
+            return Err(format!(
+                "未找到开发用 Python 引擎（{}）。请先运行 scripts/install.sh。",
+                bridge.display()
+            ));
+        }
+        let interpreter = env::var_os(ENGINE_PYTHON_ENV).filter(|value| !value.is_empty());
+        let python = dev_engine_python(&root, interpreter.as_deref())?;
+        let mut command = Command::new(&python);
+        command.arg("-u").arg(&bridge);
+        command
+    } else {
+        // Tauri's `externalBin` build step copies the target-suffixed file next to
+        // the application executable and strips the target suffix.
+        let executable_dir = env::current_exe()
+            .map_err(|error| format!("无法定位应用程序目录：{error}"))?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or("无法定位已打包的翻译引擎目录")?;
+        let executable = executable_dir.join("translator-bridge");
+        if !executable.exists() {
+            return Err("已打包的翻译引擎缺失（translator-bridge）。请重新安装应用。".into());
+        }
+        Command::new(executable)
+    };
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if development && error.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "未找到开发用 Python 解释器。请先运行 scripts/install.sh，\
+                     或设置环境变量 {ENGINE_PYTHON_ENV} 指向可用的 Python 解释器。"
+                )
+            } else {
+                format!("无法启动翻译引擎：{error}")
+            }
+        })
+}
+
+fn run_probe_request(command: &str, params: Value) -> Result<Value, String> {
+    let mut child = launch_engine()?;
+    let mut stderr_log = StderrLog::default();
+    let result = (|| {
+        let mut stdin = child.stdin.take().ok_or("翻译引擎未提供标准输入")?;
+        let stdout = child.stdout.take().ok_or("翻译引擎未提供标准输出")?;
+        let stderr = child.stderr.take().ok_or("翻译引擎未提供错误输出")?;
+        let receiver = start_stdout_reader(stdout);
+        stderr_log = start_stderr_forwarder(stderr);
+        let request_id = Uuid::new_v4().to_string();
+        write_json_line(
+            &mut stdin,
+            json!({
+                "type": "request",
+                "id": request_id,
+                "command": command,
+                "params": params
+            }),
+        )?;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("服务检测超时".into());
+            }
+            match receiver.recv_timeout(remaining) {
+                Ok(payload)
+                    if payload.get("type").and_then(Value::as_str) == Some("response")
+                        && payload.get("id").and_then(Value::as_str)
+                            == Some(request_id.as_str()) =>
+                {
+                    if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+                        return Ok(payload.get("result").cloned().unwrap_or_else(|| json!({})));
+                    }
+                    let message = payload
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("服务检测失败");
+                    return Err(message.to_string());
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err("服务检测超时".into()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("翻译引擎在服务检测完成前退出".into())
+                }
+            }
+        }
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result.map_err(|error| with_engine_detail(error, &stderr_log))
+}
+
+fn normalize_probe_provider(input: &ProviderProbeInput) -> Result<TranslationProvider, String> {
+    let selected_model = if input.provider.model.trim().is_empty() {
+        "model-list-probe".to_string()
+    } else {
+        input.provider.model.trim().to_string()
+    };
+    normalize_translation_provider(TranslationProvider {
+        id: input.provider_id.clone(),
+        name: "待检测服务商".into(),
+        protocol: input.provider.protocol.clone(),
+        base_url: input.provider.base_url.clone(),
+        models: vec![selected_model.clone()],
+        selected_model,
+    })
+}
+
+fn resolve_probe_key(
+    app: &AppHandle,
+    input: &ProviderProbeInput,
+    normalized: &TranslationProvider,
+) -> Result<String, String> {
+    if let Some(api_key) = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if api_key.len() > MAX_API_KEY_BYTES {
+            return Err("API Key 过长".into());
+        }
+        return Ok(api_key.to_string());
+    }
+    let _guard = lock_settings_credentials()?;
+    let settings = load_public_settings_internal(app, false)?;
+    let stored = settings
+        .translation_providers
+        .iter()
+        .find(|provider| provider.id == normalized.id)
+        .ok_or_else(|| "请先填写 API Key，或保存服务商后再检测".to_string())?;
+    if stored.protocol != normalized.protocol || stored.base_url != normalized.base_url {
+        return Err("服务商协议或地址已更改；为保护已保存密钥，请重新输入 API Key 后再检测".into());
+    }
+    resolve_provider_secret(stored)
+}
+
+fn probe_params(provider: &TranslationProvider, api_key: &str) -> Value {
+    json!({
+        "kind": "translation",
+        "provider": {
+            "protocol": provider.protocol,
+            "base_url": provider.base_url,
+            "model": provider.selected_model
+        },
+        "secrets": {"api_key": api_key}
+    })
+}
+
+fn wait_for_engine_exit(child: &mut Child, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn stop_locked(process: &mut Option<EngineProcess>) {
+    if let Some(mut engine) = process.take() {
+        // Ask the sidecar to close its recognition stream first, and only fall
+        // back to killing the process when it does not exit within the grace
+        // period. Killing straight away leaves the ASR task dangling.
+        let requested_shutdown = write_json_line(
+            &mut engine.stdin,
+            json!({"type": "request", "id": Uuid::new_v4().to_string(), "command": "shutdown", "params": {}}),
+        )
+        .is_ok();
+        if !requested_shutdown || !wait_for_engine_exit(&mut engine.child, ENGINE_SHUTDOWN_GRACE) {
+            let _ = engine.child.kill();
+        }
+        let _ = engine.child.wait();
+    }
+}
+
+/// Every command in this file touches the credential store, the settings file
+/// or the sidecar process. A synchronous Tauri command runs on the main thread,
+/// which stops the window from repainting for as long as it blocks, so each one
+/// hands its work to the runtime's blocking pool instead.
+async fn spawn_command<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("后台任务异常结束：{error}"))?
+}
+
+#[tauri::command]
+async fn get_settings(app: AppHandle) -> Result<SettingsSnapshot, String> {
+    spawn_command(move || snapshot(&app)).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveSessionSnapshot {
+    session_id: Option<String>,
+}
+
+fn active_session_blocking(manager: &EngineManager) -> Result<ActiveSessionSnapshot, String> {
+    let mut process = manager
+        .process
+        .lock()
+        .map_err(|_| "翻译引擎状态不可用".to_string())?;
+    let has_exited = if let Some(engine) = process.as_mut() {
+        engine
+            .child
+            .try_wait()
+            .map_err(|error| format!("无法检查翻译引擎状态：{error}"))?
+            .is_some()
+    } else {
+        false
+    };
+    if has_exited {
+        process.take();
+    }
+    Ok(ActiveSessionSnapshot {
+        session_id: process.as_ref().map(|engine| engine.session_id.clone()),
+    })
+}
+
+#[tauri::command]
+async fn get_active_session(
+    manager: State<'_, EngineManager>,
+) -> Result<ActiveSessionSnapshot, String> {
+    let manager = manager.inner().clone();
+    spawn_command(move || active_session_blocking(&manager)).await
+}
+
+fn fetch_provider_models_blocking(
+    app: AppHandle,
+    input: ProviderProbeInput,
+) -> Result<Value, String> {
+    let provider = normalize_probe_provider(&input)?;
+    let api_key = resolve_probe_key(&app, &input, &provider)?;
+    let result = run_probe_request("probe.models", probe_params(&provider, &api_key))?;
+    // Deduplicate before truncating, otherwise a list padded with repeats hides
+    // models the service actually offers.
+    let mut models = result
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "服务返回了无效的模型列表".to_string())?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && model.len() <= MAX_MODEL_ID_BYTES)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    models.sort_unstable();
+    models.truncate(MAX_MODELS_PER_PROVIDER);
+    Ok(json!({
+        "models": models,
+        "supported": result.get("supported").and_then(Value::as_bool).unwrap_or(true)
+    }))
+}
+
+fn test_provider_connection_blocking(
+    app: AppHandle,
+    input: ProviderProbeInput,
+) -> Result<Value, String> {
+    if input.provider.model.trim().is_empty() {
+        return Err("请先添加并选择一个模型".into());
+    }
+    let provider = normalize_probe_provider(&input)?;
+    let api_key = resolve_probe_key(&app, &input, &provider)?;
+    let result = run_probe_request("probe.connect", probe_params(&provider, &api_key))?;
+    Ok(json!({
+        "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(true),
+        "latencyMs": result.get("latency_ms").and_then(Value::as_u64).unwrap_or(0),
+        "detail": result.get("detail").and_then(Value::as_str).unwrap_or("模型响应正常")
+    }))
+}
+
+async fn run_probe_blocking<T, F>(gate: Arc<Mutex<()>>, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    spawn_command(move || {
+        let _guard = gate
+            .try_lock()
+            .map_err(|_| "已有服务检测正在进行，请等待完成".to_string())?;
+        operation()
+    })
+    .await
+}
+
+#[tauri::command]
+async fn fetch_provider_models(
+    app: AppHandle,
+    manager: State<'_, ProbeManager>,
+    input: ProviderProbeInput,
+) -> Result<Value, String> {
+    let gate = manager.gate.clone();
+    run_probe_blocking(gate, move || fetch_provider_models_blocking(app, input)).await
+}
+
+#[tauri::command]
+async fn test_provider_connection(
+    app: AppHandle,
+    manager: State<'_, ProbeManager>,
+    input: ProviderProbeInput,
+) -> Result<Value, String> {
+    let gate = manager.gate.clone();
+    run_probe_blocking(gate, move || test_provider_connection_blocking(app, input)).await
+}
+
+#[tauri::command]
+async fn list_audio_devices(manager: State<'_, ProbeManager>) -> Result<Value, String> {
+    let gate = manager.audio_gate.clone();
+    // Device enumeration reuses the probe path: one throwaway sidecar, one
+    // request, then the sidecar dies, so it never disturbs a live session.
+    spawn_command(move || {
+        let _guard = gate
+            .lock()
+            .map_err(|_| "音频设备查询状态异常，请重启应用".to_string())?;
+        run_probe_request("devices", json!({}))
+    })
+    .await
+}
+
+fn normalize_audio_test_input(input: AudioTestInput) -> Result<(String, String), String> {
+    let kind = input.kind.trim().to_string();
+    if !matches!(kind.as_str(), "playback" | "microphone" | "loopback") {
+        return Err("不支持的音频测试类型".into());
+    }
+    let device_id = input.device_id.trim().to_string();
+    if device_id.len() > MAX_AUDIO_DEVICE_BYTES {
+        return Err("音频设备标识过长".into());
+    }
+    Ok((kind, device_id))
+}
+
+#[tauri::command]
+async fn run_audio_test(
+    manager: State<'_, ProbeManager>,
+    input: AudioTestInput,
+) -> Result<Value, String> {
+    let (kind, device_id) = normalize_audio_test_input(input)?;
+    let gate = manager.audio_gate.clone();
+    spawn_command(move || {
+        let _guard = gate
+            .lock()
+            .map_err(|_| "音频设备测试状态异常，请重启应用".to_string())?;
+        run_probe_request(
+            "audio_test",
+            json!({"kind": kind, "device_id": device_id}),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_settings(app: AppHandle, input: SettingsInput) -> Result<SettingsSnapshot, String> {
+    spawn_command(move || save_settings_blocking(&app, input)).await
+}
+
+fn save_settings_blocking(
+    app: &AppHandle,
+    input: SettingsInput,
+) -> Result<SettingsSnapshot, String> {
+    let _guard = lock_settings_credentials()?;
+    let previous = load_public_settings_internal(app, false)?;
+    let normalized = normalize_settings(&input)?;
+    translation_languages::validate_audio_languages(&normalized.audio)?;
+    let recognition_change = requested_secret_change(
+        input.recognition.api_key.as_deref(),
+        input.recognition.clear_api_key.unwrap_or(false),
+        "语音识别 API Key",
+    )?;
+    let recognition_target_changed = previous.recognition.protocol
+        != normalized.recognition.protocol
+        || previous.recognition.base_url != normalized.recognition.base_url;
+    if recognition_target_changed
+        && recognition_change.is_none()
+        && !matches!(
+            recognition_secret_source(&previous.recognition)?,
+            SecretSource::Missing
+        )
+    {
+        return Err("语音识别服务地址已更改，请重新输入 API Key 或明确删除旧密钥".into());
+    }
+    let reset_recognition_environment_binding =
+        input.recognition.clear_api_key.unwrap_or(false) || recognition_target_changed;
+
+    let realtime_input = input.realtime.as_ref();
+    let realtime_change = match realtime_input {
+        Some(realtime) => requested_secret_change(
+            realtime.api_key.as_deref(),
+            realtime.clear_api_key.unwrap_or(false),
+            "实时同传 API Key",
+        )?,
+        None => None,
+    };
+    let realtime_target_changed = normalized.realtime.protocol != previous.realtime.protocol
+        || normalized.realtime.base_url != previous.realtime.base_url;
+    if realtime_target_changed
+        && realtime_change.is_none()
+        && !matches!(
+            realtime_secret_source(&previous.realtime)?,
+            SecretSource::Missing
+        )
+    {
+        return Err("实时同传服务地址已更改，请重新输入 API Key 或明确删除旧密钥".into());
+    }
+    let reset_realtime_environment_binding = realtime_input
+        .and_then(|realtime| realtime.clear_api_key)
+        .unwrap_or(false)
+        || realtime_target_changed;
+
+    let mut provider_changes = Vec::with_capacity(input.translation_providers.len());
+    for (provider_input, provider) in input
+        .translation_providers
+        .iter()
+        .zip(normalized.translation_providers.iter())
+    {
+        let change = requested_secret_change(
+            provider_input.api_key.as_deref(),
+            provider_input.clear_api_key.unwrap_or(false),
+            &format!("服务商“{}”的 API Key", provider.name),
+        )?;
+        if let Some(stored) = previous
+            .translation_providers
+            .iter()
+            .find(|stored| stored.id == provider.id)
+        {
+            if (stored.protocol != provider.protocol || stored.base_url != provider.base_url)
+                && change.is_none()
+                && !matches!(provider_secret_source(stored)?, SecretSource::Missing)
+            {
+                return Err(format!(
+                    "服务商“{}”的协议或地址已更改，请重新输入 API Key 或明确删除旧密钥",
+                    provider.name
+                ));
+            }
+        }
+        provider_changes.push(change);
+    }
+
+    let mut planned_secrets: Vec<(String, Option<String>)> = Vec::new();
+    let mut plan_secret = |account: String, value: Option<String>| {
+        if let Some(existing) = planned_secrets
+            .iter_mut()
+            .find(|(existing_account, _)| *existing_account == account)
+        {
+            existing.1 = value;
+        } else {
+            planned_secrets.push((account, value));
+        }
+    };
+    if let Some(change) = recognition_change {
+        match change {
+            Some(secret) => {
+                let mut storage = Vec::new();
+                plan_scoped_secret_storage(
+                    &mut storage,
+                    RECOGNITION_ACCOUNT.into(),
+                    &secret,
+                    secret_scope(
+                        &normalized.recognition.protocol,
+                        &normalized.recognition.base_url,
+                    )?,
+                )?;
+                for (account, value) in storage {
+                    plan_secret(account, value);
+                }
+            }
+            None => {
+                plan_secret(RECOGNITION_ACCOUNT.into(), None);
+                plan_secret(secret_binding_account(RECOGNITION_ACCOUNT), None);
+            }
+        }
+    }
+    if reset_recognition_environment_binding {
+        plan_secret(RECOGNITION_ENV_BINDING_ACCOUNT.into(), None);
+    }
+    if let Some(change) = realtime_change {
+        match change {
+            Some(secret) => {
+                let mut storage = Vec::new();
+                plan_scoped_secret_storage(
+                    &mut storage,
+                    REALTIME_ACCOUNT.into(),
+                    &secret,
+                    secret_scope(&normalized.realtime.protocol, &normalized.realtime.base_url)?,
+                )?;
+                for (account, value) in storage {
+                    plan_secret(account, value);
+                }
+            }
+            None => {
+                plan_secret(REALTIME_ACCOUNT.into(), None);
+                plan_secret(secret_binding_account(REALTIME_ACCOUNT), None);
+            }
+        }
+    }
+    if reset_realtime_environment_binding {
+        plan_secret(REALTIME_ENV_BINDING_ACCOUNT.into(), None);
+    }
+    for ((provider_input, provider), change) in input
+        .translation_providers
+        .iter()
+        .zip(normalized.translation_providers.iter())
+        .zip(provider_changes)
+    {
+        if let Some(change) = change {
+            let account = provider_account(&provider.id);
+            match change {
+                Some(secret) => {
+                    let mut storage = Vec::new();
+                    plan_scoped_secret_storage(
+                        &mut storage,
+                        account,
+                        &secret,
+                        secret_scope(&provider.protocol, &provider.base_url)?,
+                    )?;
+                    for (account, value) in storage {
+                        plan_secret(account, value);
+                    }
+                }
+                None => {
+                    plan_secret(account.clone(), None);
+                    plan_secret(secret_binding_account(&account), None);
+                }
+            }
+        }
+        if provider_input.clear_api_key.unwrap_or(false)
+            && provider.id == DEFAULT_TRANSLATION_PROVIDER_ID
+        {
+            plan_secret(LEGACY_GEMINI_ACCOUNT.into(), None);
+            plan_secret(secret_binding_account(LEGACY_GEMINI_ACCOUNT), None);
+        }
+        if provider.id == DEFAULT_TRANSLATION_PROVIDER_ID {
+            let target_changed = previous
+                .translation_providers
+                .iter()
+                .find(|stored| stored.id == provider.id)
+                .is_some_and(|stored| {
+                    stored.protocol != provider.protocol || stored.base_url != provider.base_url
+                });
+            if provider_input.clear_api_key.unwrap_or(false) || target_changed {
+                plan_secret(GEMINI_ENV_BINDING_ACCOUNT.into(), None);
+            }
+        }
+    }
+
+    let retained_ids = normalized
+        .translation_providers
+        .iter()
+        .map(|provider| provider.id.as_str())
+        .collect::<HashSet<_>>();
+    for removed in previous
+        .translation_providers
+        .iter()
+        .filter(|provider| !retained_ids.contains(provider.id.as_str()))
+    {
+        let account = provider_account(&removed.id);
+        plan_secret(account.clone(), None);
+        plan_secret(secret_binding_account(&account), None);
+        if removed.id == DEFAULT_TRANSLATION_PROVIDER_ID {
+            plan_secret(LEGACY_GEMINI_ACCOUNT.into(), None);
+            plan_secret(GEMINI_ENV_BINDING_ACCOUNT.into(), None);
+        }
+    }
+
+    commit_settings_and_secrets(app, &normalized, &planned_secrets)?;
+    tray::register_global_shortcuts(app, &normalized.shortcuts);
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_always_on_top(normalized.keep_on_top);
+    }
+    Ok(snapshot_from_settings(normalized))
+}
+
+fn build_start_request(
+    request_id: &str,
+    session_id: &str,
+    settings: &PublicSettings,
+    _recognition_key: &str,
+    _translation_key: &str,
+    realtime_key: &str,
+) -> Result<Value, String> {
+    let realtime = &settings.realtime;
+    let audio = &settings.audio;
+    translation_languages::validate_audio_languages(audio)?;
+    Ok(json!({
+        "type": "request",
+        "id": request_id,
+        "command": "start",
+        "params": {
+            "session_id": session_id,
+            "config": {
+                "engine": settings.engine,
+                "sourceLanguage": settings.source_language,
+                "targetLanguage": settings.target_language,
+                "realtime": {
+                    "protocol": realtime.protocol,
+                    "baseUrl": realtime.base_url,
+                    "model": realtime.model,
+                    "voice": realtime.voice,
+                    "enableVoiceClone": realtime.enable_voice_clone,
+                    "voiceCloneFrequency": realtime.voice_clone_frequency
+                },
+                "audio": {
+                    "listen": {
+                        "enabled": audio.listen.enabled,
+                        "input": audio.listen.input,
+                        "inputDevice": audio.listen.input_device,
+                        "targetLanguage": audio.listen.target_language,
+                        "outputDevice": audio.listen.output_device,
+                        "playAudio": audio.listen.play_audio,
+                        "voiceMode": audio.listen.voice_mode
+                    },
+                    "speak": {
+                        "enabled": audio.speak.enabled,
+                        "input": audio.speak.input,
+                        "inputDevice": audio.speak.input_device,
+                        "targetLanguage": audio.speak.target_language,
+                        "outputDevice": audio.speak.output_device,
+                        "playAudio": audio.speak.play_audio,
+                        "voiceMode": audio.speak.voice_mode
+                    }
+                }
+            },
+            "secrets": {
+                "realtime_api_key": realtime_key
+            }
+        }
+    }))
+}
+
+#[tauri::command]
+async fn start_translation(
+    app: AppHandle,
+    manager: State<'_, EngineManager>,
+) -> Result<StartResult, String> {
+    let manager = manager.inner().clone();
+    spawn_command(move || start_translation_blocking(app, &manager)).await
+}
+
+fn start_translation_blocking(
+    app: AppHandle,
+    manager: &EngineManager,
+) -> Result<StartResult, String> {
+    match start_translation_inner(app.clone(), manager) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            // A failed launch must not leave a session id behind: the native
+            // dispatcher decides start-vs-stop by the presence of a session.
+            tray::publish_start_failure(&app, &error);
+            Err(error)
+        }
+    }
+}
+
+fn start_translation_inner(app: AppHandle, manager: &EngineManager) -> Result<StartResult, String> {
+    let settings_guard = lock_settings_credentials()?;
+    let settings = load_public_settings_internal(&app, false)?;
+    let recognition_key = String::new();
+    let translation_key = String::new();
+    let realtime_key = resolve_realtime_secret(&settings.realtime)?;
+    drop(settings_guard);
+    let session_id = Uuid::new_v4().to_string();
+    let request_id = Uuid::new_v4().to_string();
+    let request = build_start_request(
+        &request_id,
+        &session_id,
+        &settings,
+        &recognition_key,
+        &translation_key,
+        &realtime_key,
+    )?;
+
+    // Publish the new session id *before* the request reaches the sidecar, so the
+    // `state{starting}` event that follows is not dropped as a stale session.
+    // Runtime channel switches start from the configured values (runtime-channel
+    // contract §1, rule 2).
+    tray::publish_session_starting(
+        &app,
+        &session_id,
+        settings.audio.listen.enabled,
+        settings.audio.speak.enabled,
+    );
+
+    // Any waiter belongs to the previous session and can never be answered.
+    manager.clear_pending();
+    let mut process = manager
+        .process
+        .lock()
+        .map_err(|_| "翻译引擎状态不可用".to_string())?;
+    stop_locked(&mut process);
+
+    let mut child = launch_engine()?;
+    let mut stdin = child.stdin.take().ok_or("翻译引擎未提供标准输入")?;
+    let stdout = child.stdout.take().ok_or("翻译引擎未提供标准输出")?;
+    let stderr = child.stderr.take().ok_or("翻译引擎未提供错误输出")?;
+    let stdout_receiver = start_stdout_reader(stdout);
+    let stderr_log = start_stderr_forwarder(stderr);
+
+    if let Err(error) = write_json_line(&mut stdin, request) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(with_engine_detail(error, &stderr_log));
+    }
+    if let Err(error) = wait_for_start_response(&app, &stdout_receiver, &request_id, &session_id) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(with_engine_detail(error, &stderr_log));
+    }
+    *process = Some(EngineProcess {
+        child,
+        stdin,
+        session_id: session_id.clone(),
+    });
+    start_stdout_forwarder(
+        app.clone(),
+        stdout_receiver,
+        manager.clone(),
+        session_id.clone(),
+    );
+    Ok(StartResult { session_id })
+}
+
+#[tauri::command]
+async fn stop_translation(
+    app: AppHandle,
+    manager: State<'_, EngineManager>,
+    session_id: String,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    spawn_command(move || stop_translation_blocking(&app, &manager, &session_id)).await
+}
+
+fn stop_translation_blocking(
+    app: &AppHandle,
+    manager: &EngineManager,
+    session_id: &str,
+) -> Result<(), String> {
+    let stopped = {
+        let mut process = manager
+            .process
+            .lock()
+            .map_err(|_| "翻译引擎状态不可用".to_string())?;
+        if process
+            .as_ref()
+            .is_some_and(|engine| engine.session_id == session_id)
+        {
+            stop_locked(&mut process);
+            true
+        } else {
+            false
+        }
+    };
+    if stopped {
+        // The session is gone: reset the runtime channels and health, and drop
+        // every pending sidecar request.
+        manager.clear_pending();
+        tray::publish_session_stopped(app);
+    }
+    Ok(())
+}
+
+fn cleanup_engine(manager: &EngineManager) {
+    if let Ok(mut process) = manager.process.lock() {
+        stop_locked(&mut process);
+    }
+    manager.clear_pending();
+}
+
+// Session-history export. The filename arrives over the IPC boundary and is only
+// a suggestion for the save dialog, but it still has to be one plain file name.
+// The text is written byte for byte because the frontend already adds the UTF-8
+// BOM that text editors use to detect the encoding.
+#[derive(Deserialize)]
+struct CaptionHistoryExportInput {
+    filename: String,
+    text: String,
+}
+
+const MAX_CAPTION_HISTORY_FILENAME_CHARS: usize = 120;
+const CAPTION_HISTORY_FILENAME_STEM: &str = "会话历史";
+const CAPTION_HISTORY_FILENAME_SUFFIX: &str = ".txt";
+
+/// Reduce a suggested export name to one safe `.txt` file name.
+///
+/// Linux only forbids `/` and NUL (and the names `.` / `..`), but the sanitizer is
+/// deliberately stricter: it keeps the last path component so a suggestion can
+/// never escape the directory the dialog opens in, removes control characters,
+/// collapses `..` runs, and always forces the `.txt` suffix. Characters that are
+/// legal on Linux (such as `:` or `?`) are kept instead of being Windows-stripped.
+fn sanitize_caption_history_filename(raw: &str) -> String {
+    // Keep the last path component only: directory prefixes, `..` traversal and
+    // absolute paths can never point outside the directory the dialog opens in.
+    let suggested = raw.rsplit(['/', '\\']).next().unwrap_or_default();
+    let mut cleaned = String::with_capacity(suggested.len());
+    let mut previous_was_dot = false;
+    for character in suggested.chars() {
+        if character.is_control() {
+            continue;
+        }
+        if character == '.' {
+            // `..` stays a traversal segment even without a path separator.
+            if previous_was_dot {
+                continue;
+            }
+            previous_was_dot = true;
+        } else {
+            previous_was_dot = false;
+        }
+        cleaned.push(character);
+    }
+    // A leading dot would hide the export in the file manager, so leading dots and
+    // spaces are trimmed; a suggested extension never decides the format either.
+    let mut stem = cleaned.trim_matches(['.', ' ']).to_string();
+    if stem
+        .to_ascii_lowercase()
+        .ends_with(CAPTION_HISTORY_FILENAME_SUFFIX)
+    {
+        stem.truncate(stem.len() - CAPTION_HISTORY_FILENAME_SUFFIX.len());
+    }
+    // Any other extension is replaced rather than kept (`report.md` -> `report.txt`).
+    if let Some(position) = stem.rfind('.') {
+        if position > 0 {
+            stem.truncate(position);
+        }
+    }
+    let stem_limit = MAX_CAPTION_HISTORY_FILENAME_CHARS - CAPTION_HISTORY_FILENAME_SUFFIX.len();
+    let mut stem = stem
+        .chars()
+        .take(stem_limit)
+        .collect::<String>()
+        .trim_end_matches(['.', ' '])
+        .to_string();
+    if stem.is_empty() {
+        stem = CAPTION_HISTORY_FILENAME_STEM.to_string();
+    }
+    format!("{stem}{CAPTION_HISTORY_FILENAME_SUFFIX}")
+}
+
+/// Write the exported bytes to `dir/filename` and return the resulting path.
+fn write_caption_history_file(dir: &Path, filename: &str, text: &str) -> Result<PathBuf, String> {
+    let path = dir.join(filename);
+    // `text` already starts with the UTF-8 BOM the export adds, so writing the
+    // raw bytes keeps that hint without re-encoding the content.
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|error| format!("无法保存会话历史文件 {}：{error}", path.display()))?;
+    Ok(path)
+}
+
+/// Default directory for the save dialog: documents, then downloads, then the
+/// current directory. A missing directory is skipped so the dialog never opens
+/// on a path that cannot be browsed.
+fn caption_history_directory(app: &AppHandle) -> PathBuf {
+    [app.path().document_dir(), app.path().download_dir()]
+        .into_iter()
+        .find_map(|candidate| candidate.ok().filter(|directory| directory.is_dir()))
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn export_caption_history_blocking(
+    app: &AppHandle,
+    input: CaptionHistoryExportInput,
+) -> Result<Option<String>, String> {
+    let filename = sanitize_caption_history_filename(&input.filename);
+    let directory = caption_history_directory(app);
+    // `rfd` runs its own modal message loop; the command below keeps it on the
+    // blocking pool so a Tauri runtime worker is never stalled by the dialog.
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("文本文件", &["txt"])
+        .set_file_name(&filename)
+        .set_directory(&directory)
+        .save_file()
+    else {
+        // The user cancelled: nothing was written and the history is untouched.
+        return Ok(None);
+    };
+    // The dialog lets the user rename the file or pick another directory, so the
+    // returned path wins over the suggested name.
+    let target_directory = path.parent().unwrap_or(directory.as_path());
+    let target_filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "保存位置的文件名无效".to_string())?;
+    let saved = write_caption_history_file(target_directory, target_filename, &input.text)?;
+    Ok(Some(saved.display().to_string()))
+}
+
+#[tauri::command]
+async fn export_caption_history(
+    app: AppHandle,
+    file: CaptionHistoryExportInput,
+) -> Result<Option<String>, String> {
+    spawn_command(move || export_caption_history_blocking(&app, file)).await
+}
+
+pub fn run() {
+    tauri::Builder::default()
+        // Global shortcuts stay native-only: no WebView ever gets the
+        // `global-shortcut:*` capability (tray-shortcuts contract §11).
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| tray::on_global_shortcut(app, shortcut, event))
+                .build(),
+        )
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .manage(EngineManager::default())
+        .manage(ProbeManager::default())
+        .manage(virtual_microphone::InstallerState::default())
+        .manage(updater::UpdateState::default())
+        .manage(tray::RuntimeHub::default())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            // A missing tray must not stop the app from starting: the main window
+            // keeps working, only the native entry points are unavailable (D7).
+            if let Err(error) = tray::init(&handle) {
+                eprintln!("system tray unavailable: {error}");
+            }
+            // 启动时清理 translator_* 残留模块（audio routing §3.3 / §4.3）。pactl
+            // 放到后台线程，不拖慢首屏；已完整存在的虚拟麦克风不会被卸载。
+            thread::spawn(|| {
+                if let Err(error) = virtual_microphone::cleanup_stale_modules() {
+                    eprintln!("virtual microphone cleanup skipped: {error}");
+                }
+            });
+            match load_public_settings(&handle) {
+                Ok(settings) => {
+                    tray::register_global_shortcuts(&handle, &settings.shortcuts);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.set_always_on_top(settings.keep_on_top);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("settings unavailable during startup: {error}");
+                    tray::register_global_shortcuts(&handle, &ShortcutSettings::default());
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            get_active_session,
+            fetch_provider_models,
+            test_provider_connection,
+            list_audio_devices,
+            run_audio_test,
+            virtual_microphone::install_virtual_microphone,
+            virtual_microphone::open_virtual_microphone_link,
+            api_key_help::open_api_key_help,
+            updater::check_app_update,
+            updater::download_app_update,
+            updater::install_app_update,
+            updater::open_app_releases,
+            save_settings,
+            export_caption_history,
+            start_translation,
+            stop_translation,
+            tray::get_runtime_state,
+            tray::dispatch_native_action
+        ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                // Quitting (tray "退出应用") lets every window close normally.
+                if tray::is_quitting(app) {
+                    return;
+                }
+                // No tray: hiding the only window would leave the app running with
+                // no way to reach it again, so closing the window quits (D7).
+                if !tray::tray_available() {
+                    return;
+                }
+                // Otherwise the window hides to the tray and the translation
+                // session keeps running (contract §10).
+                api.prevent_close();
+                let _ = window.hide();
+                if window.label() == tray::SUBTITLE_WINDOW_LABEL {
+                    tray::set_subtitle_visible(app, false);
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building the simultaneous translator desktop app")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Last-resort guard so the Python sidecar never outlives the app.
+                tray::on_app_exit(app);
+                // 退出应用时卸载虚拟麦克风；停止同传不卸载（audio routing §4.3）。
+                virtual_microphone::unload_microphone();
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_test_input_reads_camel_case_device_id() {
+        let input: AudioTestInput = serde_json::from_value(json!({
+            "kind": "loopback",
+            "deviceId": "speaker-1"
+        }))
+        .expect("audio test input should deserialize");
+
+        assert_eq!(input.kind, "loopback");
+        assert_eq!(input.device_id, "speaker-1");
+    }
+
+    #[test]
+    fn audio_test_kind_validation_rejects_unknown_values() {
+        let error = normalize_audio_test_input(AudioTestInput {
+            kind: "invalid".into(),
+            device_id: String::new(),
+        })
+        .expect_err("unknown audio test kinds must be rejected");
+
+        assert!(error.contains("不支持的音频测试类型"));
+    }
+
+    #[test]
+    fn unsupported_legacy_speech_target_is_readable_but_cannot_start() {
+        for target in ["粤语", "Cantonese", "YUE", "Ελληνικά", "el"] {
+            let mut saved = PublicSettings::default();
+            saved.audio.listen.target_language = target.into();
+            saved.audio.listen.play_audio = true;
+            let loaded = decode_public_settings(&serde_json::to_string(&saved).unwrap()).unwrap();
+            assert_eq!(loaded.audio.listen.target_language, target);
+            assert!(loaded.audio.listen.play_audio);
+            let error =
+                build_start_request("request", "session", &loaded, "", "", "test").unwrap_err();
+            assert!(error.contains("仅支持文字"));
+        }
+    }
+
+    #[test]
+    fn language_modes_validate_each_direction_without_changing_targets() {
+        let mut settings = PublicSettings::default();
+        settings.audio.listen.target_language = "粤语".into();
+        settings.audio.speak.enabled = true;
+        settings.audio.speak.play_audio = true;
+        let request = build_start_request("request", "session", &settings, "", "", "test").unwrap();
+        assert_eq!(
+            request["params"]["config"]["audio"]["listen"]["targetLanguage"],
+            "粤语"
+        );
+        assert_eq!(
+            request["params"]["config"]["audio"]["speak"]["targetLanguage"],
+            "English"
+        );
+        settings.audio.speak.target_language = "希腊语".into();
+        assert!(
+            build_start_request("request", "session", &settings, "", "", "test")
+                .unwrap_err()
+                .contains("发言")
+        );
+        settings.audio.speak.enabled = false;
+        assert!(build_start_request("request", "session", &settings, "", "", "test").is_ok());
+        settings.audio.listen.target_language = "unknown-language".into();
+        assert!(build_start_request("request", "session", &settings, "", "", "test").is_err());
+    }
+
+    #[test]
+    fn clean_install_has_only_the_stock_services() {
+        let settings = PublicSettings::default();
+
+        assert_eq!(settings.translation_providers.len(), 1);
+        let provider = &settings.translation_providers[0];
+        assert_eq!(provider.id, DEFAULT_TRANSLATION_PROVIDER_ID);
+        assert_eq!(provider.name, "Gemini");
+        assert_eq!(provider.protocol, "gemini");
+        assert_eq!(provider.base_url, DEFAULT_GEMINI_BASE_URL);
+        assert_eq!(provider.models, vec![DEFAULT_TRANSLATION_MODEL]);
+        assert_eq!(provider.selected_model, DEFAULT_TRANSLATION_MODEL);
+        assert_eq!(settings.recognition.protocol, "dashscope");
+        assert_eq!(settings.recognition.base_url, DEFAULT_RECOGNITION_BASE_URL);
+        assert_eq!(
+            settings.recognition.model,
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+        assert!(ENGINE_START_TIMEOUT >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn migrates_legacy_settings_without_losing_provider_values() {
+        let migrated = decode_public_settings(
+            r#"{
+                "dashscopeWsUrl":"wss://dashscope.example/ws",
+                "geminiBaseUrl":"https://relay.example/gemini/v1beta",
+                "geminiModel":"custom-gemini-model",
+                "sourceLanguage":"English",
+                "targetLanguage":"简体中文",
+                "keepOnTop":true,
+                "captionScale":"large"
+            }"#,
+        )
+        .expect("legacy settings should migrate");
+
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(migrated.recognition.base_url, "wss://dashscope.example/ws");
+        assert_eq!(migrated.translation_providers.len(), 1);
+        let provider = &migrated.translation_providers[0];
+        assert_eq!(provider.id, DEFAULT_TRANSLATION_PROVIDER_ID);
+        assert_eq!(provider.base_url, "https://relay.example/gemini/v1beta");
+        assert_eq!(provider.selected_model, "custom-gemini-model");
+        assert_eq!(provider.models, vec!["custom-gemini-model"]);
+        assert!(migrated.keep_on_top);
+        assert_eq!(migrated.caption_scale, "large");
+    }
+
+    #[test]
+    fn schema_eight_settings_receive_default_shortcuts() {
+        let mut value = serde_json::to_value(PublicSettings::default())
+            .expect("default settings should serialize");
+        value["schemaVersion"] = json!(8);
+        value
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .remove("shortcuts");
+
+        let (settings, source_version) = decode_public_settings_versioned(
+            &serde_json::to_string(&value).expect("schema 8 fixture should serialize"),
+        )
+        .expect("schema 8 settings should remain readable");
+
+        assert_eq!(source_version, 8);
+        assert_eq!(settings.shortcuts, ShortcutSettings::default());
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn custom_shortcuts_are_normalized_and_duplicates_are_rejected() {
+        let mut settings = ShortcutSettings::default();
+        settings.toggle_subtitle_window = "  Alt+F8  ".into();
+        let normalized = normalize_shortcut_settings(settings)
+            .expect("a valid custom shortcut should be accepted");
+        assert_eq!(normalized.toggle_subtitle_window, "Alt+F8");
+
+        let mut duplicate = ShortcutSettings::default();
+        duplicate.toggle_speak_mute = duplicate.start_or_stop_session.clone();
+        assert!(normalize_shortcut_settings(duplicate)
+            .expect_err("duplicate shortcuts should be rejected")
+            .contains("已分配给其他操作"));
+
+        assert!(normalize_shortcut_settings(ShortcutSettings {
+            start_or_stop_session: "Space".into(),
+            ..ShortcutSettings::default()
+        })
+        .expect_err("a shortcut without a control modifier should be rejected")
+        .contains("Ctrl、Alt 或 Win"));
+    }
+
+    #[test]
+    fn unused_legacy_models_do_not_block_realtime() {
+        let mut settings = PublicSettings::default();
+        settings.translation_providers.clear();
+        settings.recognition.model.clear();
+        let normalized = normalize_public_settings(settings).expect("only realtime is required");
+        assert_eq!(normalized.engine, ENGINE_REALTIME);
+    }
+
+    #[test]
+    fn rejects_unsupported_future_settings_version() {
+        let future = u64::from(SETTINGS_SCHEMA_VERSION) + 1;
+        let error = decode_public_settings(
+            &json!({"schemaVersion": future, "translationProviders": []}).to_string(),
+        )
+        .expect_err("future settings must not be interpreted as v2");
+        assert_eq!(error, SettingsDecodeError::UnsupportedVersion(future));
+    }
+
+    #[test]
+    fn version_two_settings_are_marked_for_credential_migration() {
+        let mut value = serde_json::to_value(PublicSettings::default())
+            .expect("default settings should serialize");
+        value["schemaVersion"] = json!(2);
+        let (settings, source_version) = decode_public_settings_versioned(
+            &serde_json::to_string(&value).expect("v2 fixture should serialize"),
+        )
+        .expect("v2 settings should remain readable");
+        assert_eq!(source_version, 2);
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_gemini_alias_never_targets_an_openai_provider() {
+        let mut provider = TranslationProvider::default();
+        provider.protocol = "openai".into();
+        provider.base_url = "https://api.openai.com".into();
+        assert!(!is_legacy_gemini_provider(&provider));
+
+        provider.protocol = "gemini".into();
+        provider.id = "custom-gemini".into();
+        assert!(!is_legacy_gemini_provider(&provider));
+    }
+
+    #[test]
+    fn legacy_alias_never_overwrites_an_unusable_scoped_account() {
+        assert!(legacy_alias_can_fill(AccountMigrationState::Missing));
+        assert!(!legacy_alias_can_fill(
+            AccountMigrationState::UsableOrPlanned
+        ));
+        assert!(!legacy_alias_can_fill(AccountMigrationState::Unusable));
+    }
+
+    #[test]
+    fn stored_secret_is_bound_to_its_protocol_and_full_endpoint() {
+        let scope = SecretScope {
+            protocol: "openai".into(),
+            endpoint_hash: "relay-hash".into(),
+        };
+        let encoded = encode_scoped_secret("secret-value", scope.clone())
+            .expect("secret envelope should serialize");
+        assert_eq!(
+            decode_scoped_secret(encoded.clone(), &scope),
+            ScopedSecret::Available("secret-value".into())
+        );
+        assert_eq!(
+            decode_scoped_secret(
+                encoded,
+                &SecretScope {
+                    protocol: "openai".into(),
+                    endpoint_hash: "other-hash".into(),
+                },
+            ),
+            ScopedSecret::ScopeMismatch
+        );
+    }
+
+    #[test]
+    fn endpoint_scope_distinguishes_paths_on_the_same_origin() {
+        let first = secret_scope("openai", "https://relay.example/tenant-a")
+            .expect("first endpoint scope should be created");
+        let second = secret_scope("openai", "https://relay.example/tenant-b")
+            .expect("second endpoint scope should be created");
+        assert_ne!(first.endpoint_hash, second.endpoint_hash);
+    }
+
+    #[test]
+    fn schema_three_origin_envelope_upgrades_only_for_its_matching_origin() {
+        let mut settings_value = serde_json::to_value(PublicSettings::default())
+            .expect("default settings should serialize");
+        settings_value["schemaVersion"] = json!(3);
+        let (_, source_version) = decode_public_settings_versioned(
+            &serde_json::to_string(&settings_value).expect("v3 fixture should serialize"),
+        )
+        .expect("v3 settings should remain readable");
+        assert_eq!(source_version, 3);
+
+        let base_url = "https://relay.example/tenant-a";
+        let current_scope =
+            secret_scope("openai", base_url).expect("current endpoint scope should be created");
+        let legacy_scope = legacy_secret_scope("openai", base_url)
+            .expect("legacy endpoint scope should be created");
+        let stored = json!({
+            "version": 1,
+            "secret": "existing-key",
+            "scope": {
+                "protocol": "openai",
+                "origin": "https://relay.example"
+            }
+        })
+        .to_string();
+        assert_eq!(
+            inspect_secret_for_upgrade(
+                &stored,
+                None,
+                &current_scope,
+                &legacy_scope,
+                source_version,
+            ),
+            SecretUpgrade::Upgrade("existing-key".into())
+        );
+
+        let other_origin = legacy_secret_scope("openai", "https://other.example/tenant-a")
+            .expect("comparison endpoint scope should be created");
+        assert_eq!(
+            inspect_secret_for_upgrade(
+                &stored,
+                None,
+                &current_scope,
+                &other_origin,
+                source_version,
+            ),
+            SecretUpgrade::Unusable
+        );
+    }
+
+    #[test]
+    fn only_an_existing_legacy_environment_binding_can_be_upgraded() {
+        let base_url = "https://relay.example/tenant-a";
+        let current_scope =
+            secret_scope("gemini", base_url).expect("current endpoint scope should be created");
+        let legacy_scope = legacy_secret_scope("gemini", base_url)
+            .expect("legacy endpoint scope should be created");
+        let stored_binding = json!({
+            "version": 1,
+            "scope": {
+                "protocol": "gemini",
+                "origin": "https://relay.example"
+            }
+        })
+        .to_string();
+
+        assert!(environment_binding_needs_upgrade(
+            Some(&stored_binding),
+            &current_scope,
+            &legacy_scope,
+        ));
+        assert!(!environment_binding_needs_upgrade(
+            None,
+            &current_scope,
+            &legacy_scope,
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_secret_mutation() {
+        let error = requested_secret_change(Some("replacement"), true, "API Key")
+            .expect_err("set and clear must be mutually exclusive");
+        assert!(error.contains("同时替换和删除"));
+    }
+
+    #[test]
+    fn rejects_secret_envelopes_larger_than_the_keyring_accepts() {
+        let error = encode_scoped_secret(
+            &"a".repeat(40_000),
+            SecretScope {
+                protocol: "openai".into(),
+                endpoint_hash: "relay-hash".into(),
+            },
+        )
+        .expect_err("oversized keyring blobs must fail before mutation");
+        assert!(error.contains("密钥环条目大小限制"));
+    }
+
+    #[test]
+    fn stores_near_limit_secret_with_a_separate_scope_binding() {
+        let account = "translation_provider:legacy".to_string();
+        // 32,700 个 ASCII 字符：明文（65,400 UTF-16 字节）仍在上限内，但加上
+        // JSON 信封（版本号 / scope / 字段名）后就超过 64 KiB，于是退回旧版
+        // 「明文 + 独立 scope 绑定」的两条目布局。
+        let secret = "a".repeat(32_700);
+        let mut plan = Vec::new();
+        plan_scoped_secret_storage(
+            &mut plan,
+            account.clone(),
+            &secret,
+            SecretScope {
+                protocol: "openai".into(),
+                endpoint_hash: "relay-hash".into(),
+            },
+        )
+        .expect("an existing credential that fits the keyring should remain migratable");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, secret_binding_account(&account));
+        assert!(plan[0].1.is_some());
+        assert_eq!(plan[1], (account, Some(secret)));
+    }
+
+    #[test]
+    fn start_request_contains_only_realtime_configuration_and_key() {
+        let settings = PublicSettings::default();
+        let request = build_start_request(
+            "request-id",
+            "session-id",
+            &settings,
+            "recognition-secret",
+            "translation-secret",
+            "realtime-secret",
+        )
+        .expect("request should serialize");
+        assert_eq!(
+            request.pointer("/params/config/engine"),
+            Some(&json!(ENGINE_REALTIME))
+        );
+        assert!(request.pointer("/params/config/translation").is_none());
+        assert!(request.pointer("/params/config/recognition").is_none());
+        assert!(request
+            .pointer("/params/secrets/translation_api_key")
+            .is_none());
+        assert!(request
+            .pointer("/params/secrets/recognition_api_key")
+            .is_none());
+        assert_eq!(
+            request.pointer("/params/secrets/realtime_api_key"),
+            Some(&json!("realtime-secret"))
+        );
+    }
+
+    #[test]
+    fn linux_keyring_backend_is_persistent() {
+        use keyring::credential::CredentialPersistence;
+
+        // Without a persistent store feature keyring silently falls back to the
+        // in-process mock, so every saved key would disappear on the next launch.
+        assert!(matches!(
+            keyring::default::default_credential_builder().persistence(),
+            CredentialPersistence::UntilDelete
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a running Secret Service (GNOME Keyring / KWallet)"]
+    fn linux_keyring_round_trip_survives_a_new_entry_handle() {
+        struct Cleanup(String);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Ok(entry) = credential_entry(&self.0) {
+                    let _ = entry.delete_credential();
+                }
+            }
+        }
+
+        let account = format!("test-round-trip:{}", Uuid::new_v4());
+        let _cleanup = Cleanup(account.clone());
+        write_secret_value(&account, Some("test-secret"))
+            .expect("the Secret Service should accept the test secret");
+        let reopened = credential_entry(&account)
+            .expect("a new credential handle should open")
+            .get_password()
+            .expect("the test secret should still be present");
+        assert_eq!(reopened, "test-secret");
+    }
+
+    fn realtime_settings_input(
+        engine: &str,
+        realtime: RealtimeSettings,
+        audio: AudioSettings,
+    ) -> SettingsInput {
+        SettingsInput {
+            source_language: "自动检测".into(),
+            target_language: "简体中文".into(),
+            recognition: RecognitionInput {
+                protocol: "dashscope".into(),
+                base_url: DEFAULT_RECOGNITION_BASE_URL.into(),
+                model: "qwen-audio-3.0-asr-flash-streaming".into(),
+                api_key: None,
+                clear_api_key: None,
+            },
+            translation_providers: vec![TranslationProviderInput {
+                id: DEFAULT_TRANSLATION_PROVIDER_ID.into(),
+                name: "Gemini".into(),
+                protocol: "gemini".into(),
+                base_url: DEFAULT_GEMINI_BASE_URL.into(),
+                models: vec![DEFAULT_TRANSLATION_MODEL.into()],
+                selected_model: DEFAULT_TRANSLATION_MODEL.into(),
+                api_key: None,
+                clear_api_key: None,
+            }],
+            active_translation_provider_id: DEFAULT_TRANSLATION_PROVIDER_ID.into(),
+            keep_on_top: false,
+            caption_scale: "medium".into(),
+            engine: Some(engine.into()),
+            realtime: Some(RealtimeInput {
+                protocol: realtime.protocol,
+                base_url: realtime.base_url,
+                model: realtime.model,
+                voice: realtime.voice,
+                enable_voice_clone: realtime.enable_voice_clone,
+                voice_clone_frequency: realtime.voice_clone_frequency,
+                api_key: None,
+                clear_api_key: None,
+            }),
+            audio: Some(AudioSettingsInput {
+                listen: channel_input(audio.listen),
+                speak: channel_input(audio.speak),
+            }),
+            shortcuts: None,
+        }
+    }
+
+    fn channel_input(channel: AudioChannelSettings) -> AudioChannelInput {
+        AudioChannelInput {
+            voice_mode: channel.voice_mode,
+            enabled: channel.enabled,
+            input: channel.input,
+            input_device: channel.input_device,
+            target_language: channel.target_language,
+            output_device: channel.output_device,
+            play_audio: channel.play_audio,
+        }
+    }
+
+    #[test]
+    fn a_clean_install_uses_realtime_text_mode() {
+        let settings = PublicSettings::default();
+
+        assert_eq!(settings.engine, ENGINE_REALTIME);
+        assert_eq!(settings.realtime.protocol, LIVETRANSLATE_PROTOCOL);
+        assert_eq!(settings.realtime.base_url, DEFAULT_LIVETRANSLATE_BASE_URL);
+        assert_eq!(settings.realtime.model, DEFAULT_LIVETRANSLATE_MODEL);
+        assert_eq!(settings.realtime.voice, "default");
+        assert!(settings.realtime.enable_voice_clone);
+        assert!(settings.audio.listen.enabled);
+        assert_eq!(settings.audio.listen.input, "system");
+        assert_eq!(settings.audio.speak.input, "microphone");
+        assert_eq!(settings.audio.speak.target_language, "English");
+        assert!(!settings.audio.speak.enabled);
+        assert!(!settings.audio.listen.play_audio);
+    }
+
+    #[test]
+    fn schema_four_files_upgrade_to_realtime() {
+        let stored = json!({
+            "schemaVersion": 4,
+            "sourceLanguage": "自动检测",
+            "targetLanguage": "简体中文",
+            "recognition": {
+                "protocol": "dashscope",
+                "baseUrl": DEFAULT_RECOGNITION_BASE_URL,
+                "model": "qwen-audio-3.0-asr-flash-streaming"
+            },
+            "translationProviders": [{
+                "id": DEFAULT_TRANSLATION_PROVIDER_ID,
+                "name": "Gemini",
+                "protocol": "gemini",
+                "baseUrl": DEFAULT_GEMINI_BASE_URL,
+                "models": [DEFAULT_TRANSLATION_MODEL],
+                "selectedModel": DEFAULT_TRANSLATION_MODEL
+            }],
+            "activeTranslationProviderId": DEFAULT_TRANSLATION_PROVIDER_ID,
+            "keepOnTop": false,
+            "captionScale": "medium"
+        })
+        .to_string();
+
+        let settings = decode_public_settings(&stored).expect("schema 4 must stay readable");
+
+        assert_eq!(settings.engine, ENGINE_REALTIME);
+        assert_eq!(settings.audio.listen.input, "system");
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn realtime_settings_are_normalized() {
+        let input = realtime_settings_input(
+            "REALTIME",
+            RealtimeSettings {
+                voice: "  Tina  ".into(),
+                voice_clone_frequency: "hourly".into(),
+                ..RealtimeSettings::default()
+            },
+            AudioSettings::default(),
+        );
+
+        let settings = normalize_settings(&input).expect("realtime settings should normalize");
+
+        assert_eq!(settings.engine, ENGINE_REALTIME);
+        assert_eq!(settings.realtime.voice, "Tina");
+        // An unknown clone cadence falls back instead of failing the save.
+        assert_eq!(
+            settings.realtime.voice_clone_frequency,
+            DEFAULT_REALTIME_VOICE_CLONE_FREQUENCY
+        );
+    }
+
+    #[test]
+    fn schema_six_enables_original_voice_and_preserves_audio_routes() {
+        let mut original = PublicSettings::default();
+        original.schema_version = 6;
+        original.realtime.enable_voice_clone = false;
+        original.realtime.voice.clear();
+        original.audio.speak.output_device = "headset".into();
+        let migrated = decode_public_settings(&serde_json::to_string(&original).unwrap()).unwrap();
+        assert!(migrated.realtime.enable_voice_clone);
+        assert_eq!(migrated.realtime.voice, "default");
+        assert_eq!(migrated.realtime.voice_clone_frequency, "once");
+        assert_eq!(migrated.audio.speak.output_device, "headset");
+        let mut saved = migrated;
+        saved.realtime.enable_voice_clone = false;
+        let reloaded = decode_public_settings(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(!reloaded.realtime.enable_voice_clone);
+    }
+
+    #[test]
+    fn realtime_rejects_unknown_engines_and_protocols() {
+        let mut input = realtime_settings_input(
+            "teleport",
+            RealtimeSettings::default(),
+            AudioSettings::default(),
+        );
+        assert!(normalize_settings(&input).is_err());
+
+        input.engine = Some(ENGINE_REALTIME.into());
+        input.realtime.as_mut().unwrap().protocol = "gemini".into();
+        assert!(normalize_settings(&input).is_err());
+
+        input.realtime.as_mut().unwrap().protocol = LIVETRANSLATE_PROTOCOL.into();
+        input.realtime.as_mut().unwrap().model = "   ".into();
+        assert!(normalize_settings(&input).is_err());
+    }
+
+    #[test]
+    fn realtime_requires_at_least_one_enabled_channel() {
+        let mut audio = AudioSettings::default();
+        audio.listen.enabled = false;
+        audio.speak.enabled = false;
+        let input = realtime_settings_input(ENGINE_REALTIME, RealtimeSettings::default(), audio);
+
+        let error = normalize_settings(&input).expect_err("no channel means no audio to translate");
+        assert!(error.contains("至少需要启用一个翻译通道"), "{error}");
+
+        // Legacy engine names migrate to realtime and require an enabled channel.
+        let mut audio = AudioSettings::default();
+        audio.listen.enabled = false;
+        audio.speak.enabled = false;
+        let input = realtime_settings_input(ENGINE_PIPELINE, RealtimeSettings::default(), audio);
+        assert!(normalize_settings(&input).is_err());
+    }
+
+    #[test]
+    fn schema_seven_separates_voices_and_migrates_default_loopback() {
+        let mut previous = PublicSettings::default();
+        previous.schema_version = 7;
+        previous.audio.listen.input = "loopback".into();
+        previous.audio.speak.output_device = "cable".into();
+        previous.realtime.enable_voice_clone = false;
+        let migrated = decode_public_settings(&serde_json::to_string(&previous).unwrap()).unwrap();
+        assert_eq!(migrated.audio.listen.voice_mode, "system");
+        assert_eq!(migrated.audio.speak.voice_mode, "system");
+        assert_eq!(migrated.audio.listen.input, "system");
+        assert_eq!(migrated.audio.speak.output_device, "cable");
+        let mut current = migrated;
+        current.audio.listen.voice_mode = "clone".into();
+        let reloaded = decode_public_settings(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(reloaded.audio.listen.voice_mode, "clone");
+        assert_eq!(reloaded.audio.speak.voice_mode, "system");
+        previous.audio.listen.input_device = "selected-speaker".into();
+        let explicit = decode_public_settings(&serde_json::to_string(&previous).unwrap()).unwrap();
+        assert_eq!(explicit.audio.listen.input, "loopback");
+    }
+
+    #[test]
+    fn missing_outgoing_language_does_not_inherit_listening_language() {
+        let mut audio = AudioSettings::default();
+        audio.listen.target_language.clear();
+        audio.speak.target_language.clear();
+        let normalized = normalize_audio_settings(audio, "简体中文").unwrap();
+        assert_eq!(normalized.listen.target_language, "简体中文");
+        assert_eq!(normalized.speak.target_language, "English");
+    }
+
+    #[test]
+    fn realtime_start_request_carries_channels_and_its_own_key() {
+        let mut settings = PublicSettings::default();
+        settings.engine = ENGINE_REALTIME.into();
+        settings.realtime.voice = "Tina".into();
+        settings.audio.speak.output_device = "cable-input".into();
+        settings.audio.speak.play_audio = true;
+
+        let request = build_start_request(
+            "request-id",
+            "session-id",
+            &settings,
+            "",
+            "",
+            "realtime-secret",
+        )
+        .expect("request should serialize");
+
+        assert_eq!(
+            request.pointer("/params/config/engine"),
+            Some(&json!(ENGINE_REALTIME))
+        );
+        assert_eq!(
+            request.pointer("/params/config/realtime/model"),
+            Some(&json!(DEFAULT_LIVETRANSLATE_MODEL))
+        );
+        assert_eq!(
+            request.pointer("/params/config/realtime/voice"),
+            Some(&json!("Tina"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/listen/input"),
+            Some(&json!("system"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/speak/inputDevice"),
+            Some(&json!(""))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/speak/outputDevice"),
+            Some(&json!("cable-input"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/listen/voiceMode"),
+            Some(&json!("system"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/speak/voiceMode"),
+            Some(&json!("clone"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/listen/targetLanguage"),
+            Some(&json!("简体中文"))
+        );
+        assert_eq!(
+            request.pointer("/params/config/audio/speak/targetLanguage"),
+            Some(&json!("English"))
+        );
+        assert_eq!(
+            request.pointer("/params/secrets/realtime_api_key"),
+            Some(&json!("realtime-secret"))
+        );
+    }
+
+    struct TestExportDirectory(PathBuf);
+
+    impl TestExportDirectory {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "simultaneous-translator-export-test-{}",
+                Uuid::new_v4()
+            ));
+            fs::create_dir_all(&directory).expect("test export directory should be created");
+            Self(directory)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestExportDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn caption_history_export_input_reads_the_frontend_contract() {
+        let input: CaptionHistoryExportInput = serde_json::from_value(json!({
+            "filename": "会话历史-2026-10-18.txt",
+            "text": "\u{FEFF}会话历史 · 2026-10-18\n"
+        }))
+        .expect("history export input should deserialize from the IPC payload");
+
+        assert_eq!(input.filename, "会话历史-2026-10-18.txt");
+        assert!(input.text.starts_with('\u{FEFF}'));
+    }
+
+    #[test]
+    fn caption_history_filename_strips_paths_and_keeps_cjk() {
+        assert_eq!(
+            sanitize_caption_history_filename("../../etc/System32/evil.exe"),
+            "evil.txt"
+        );
+        assert_eq!(
+            sanitize_caption_history_filename("..\\..\\Windows\\System32\\evil.exe"),
+            "evil.txt"
+        );
+        assert_eq!(
+            sanitize_caption_history_filename("sub/dir/report.MD"),
+            "report.txt"
+        );
+        assert_eq!(
+            sanitize_caption_history_filename("会话历史-2026-10-18.txt"),
+            "会话历史-2026-10-18.txt"
+        );
+    }
+
+    #[test]
+    fn caption_history_filename_removes_control_characters() {
+        assert_eq!(
+            sanitize_caption_history_filename("会话\t历史\n.txt"),
+            "会话历史.txt"
+        );
+        assert_eq!(
+            sanitize_caption_history_filename("\u{0}\u{7}"),
+            "会话历史.txt"
+        );
+    }
+
+    #[test]
+    fn caption_history_filename_keeps_linux_legal_characters() {
+        // Linux 允许 `:`、`?`、`*` 等字符，只有 `/` 和 NUL 是路径分隔/终止符，
+        // 因此不再像 Windows 版那样把它们删掉。
+        assert_eq!(
+            sanitize_caption_history_filename("report:final?.txt"),
+            "report:final?.txt"
+        );
+        // 但路径分隔符仍然只保留最后一个路径段。
+        assert_eq!(
+            sanitize_caption_history_filename("/tmp/会话历史.txt"),
+            "会话历史.txt"
+        );
+        // Linux 没有 Windows 的保留设备名，CON 是普通文件名。
+        assert_eq!(sanitize_caption_history_filename("CON"), "CON.txt");
+    }
+
+    #[test]
+    fn caption_history_filename_falls_back_for_unusable_suggestions() {
+        for raw in ["", "   ", ".", "..", "dir/", "..\\", "/", "///"] {
+            assert_eq!(
+                sanitize_caption_history_filename(raw),
+                "会话历史.txt",
+                "suggestion {raw:?} should fall back to the default name"
+            );
+        }
+    }
+
+    #[test]
+    fn caption_history_filename_forces_a_lowercase_txt_extension() {
+        assert_eq!(
+            sanitize_caption_history_filename("report.TXT"),
+            "report.txt"
+        );
+        assert_eq!(sanitize_caption_history_filename("notes.md"), "notes.txt");
+        assert_eq!(sanitize_caption_history_filename("history"), "history.txt");
+    }
+
+    #[test]
+    fn caption_history_filename_is_bounded_and_keeps_cjk_characters() {
+        let suggested = format!("{}.txt", "长".repeat(200));
+        let filename = sanitize_caption_history_filename(&suggested);
+
+        assert_eq!(filename.chars().count(), MAX_CAPTION_HISTORY_FILENAME_CHARS);
+        assert!(filename.ends_with(CAPTION_HISTORY_FILENAME_SUFFIX));
+        assert_eq!(
+            filename
+                .chars()
+                .filter(|character| *character == '长')
+                .count(),
+            MAX_CAPTION_HISTORY_FILENAME_CHARS - CAPTION_HISTORY_FILENAME_SUFFIX.len()
+        );
+    }
+
+    #[test]
+    fn caption_history_export_writes_the_exact_utf8_bytes() {
+        let directory = TestExportDirectory::new();
+        let text = "\u{FEFF}会话历史 · 2026-10-18\n共 1 条字幕\n\n[10:00:00] 对方\n原文：hello\n译文：你好\n";
+        let path = write_caption_history_file(directory.path(), "会话历史-2026-10-18.txt", text)
+            .expect("history export should be written");
+
+        assert_eq!(path, directory.path().join("会话历史-2026-10-18.txt"));
+        assert_eq!(fs::read(&path).unwrap().as_slice(), text.as_bytes());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn caption_history_export_reports_a_write_failure() {
+        let directory = TestExportDirectory::new();
+        let error = write_caption_history_file(
+            &directory.path().join("missing-subdirectory"),
+            "会话历史.txt",
+            "text",
+        )
+        .expect_err("a missing directory must not be reported as a successful save");
+
+        assert!(error.contains("无法保存会话历史文件"));
+    }
+
+    #[test]
+    fn dev_engine_bridge_lives_in_the_repository_scripts_directory() {
+        let root = Path::new("/opt/simultaneous-translator/linux");
+        assert_eq!(
+            dev_engine_bridge(root),
+            PathBuf::from("/opt/simultaneous-translator/linux/scripts/tauri_bridge.py")
+        );
+    }
+
+    #[test]
+    fn dev_engine_python_prefers_the_exported_translator_python() {
+        let root = std::env::temp_dir().join(format!(
+            "simultaneous-translator-python-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join(".venv").join("bin")).unwrap();
+        fs::write(root.join(".venv").join("bin").join("python"), b"").unwrap();
+        let custom = root.join("custom-python");
+        fs::write(&custom, b"").unwrap();
+
+        // 显式覆盖优先于仓库 .venv。
+        assert_eq!(
+            dev_engine_python(&root, Some(custom.as_os_str())).unwrap(),
+            custom
+        );
+        // 没有覆盖时用仓库 .venv。
+        assert_eq!(
+            dev_engine_python(&root, None).unwrap(),
+            root.join(".venv").join("bin").join("python")
+        );
+        // 空值视为未设置。
+        assert_eq!(
+            dev_engine_python(&root, Some(std::ffi::OsStr::new(""))).unwrap(),
+            root.join(".venv").join("bin").join("python")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dev_engine_python_falls_back_to_the_path_python3() {
+        let root = std::env::temp_dir().join(format!(
+            "simultaneous-translator-python-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            dev_engine_python(&root, None).unwrap(),
+            PathBuf::from("python3")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dev_engine_python_rejects_a_missing_explicit_interpreter() {
+        let root = std::env::temp_dir().join(format!(
+            "simultaneous-translator-python-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let missing = root.join("missing-python");
+        let error = dev_engine_python(&root, Some(missing.as_os_str()))
+            .expect_err("an explicitly configured interpreter must exist");
+        assert!(error.contains(ENGINE_PYTHON_ENV));
+        assert!(error.contains("missing-python"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn project_root_is_the_linux_directory_above_desktop() {
+        let root = project_root();
+        assert!(
+            root.join("scripts").join("tauri_bridge.py").exists(),
+            "{}",
+            root.display()
+        );
+        assert!(root.join("desktop").join("src-tauri").exists());
+    }
+}

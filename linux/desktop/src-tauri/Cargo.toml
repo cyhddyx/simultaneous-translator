@@ -1,0 +1,50 @@
+[package]
+name = "simultaneous-translator"
+version = "1.0.2"
+description = "Desktop simultaneous translation workspace"
+authors = ["cyhddyx"]
+edition = "2021"
+default-run = "simultaneous-translator"
+
+[lib]
+name = "simultaneous_translator_lib"
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The platform backend is opt-in: with no store feature keyring silently falls
+# back to an in-process mock, so every saved key disappears on the next launch.
+# On Linux the persistent store is the Secret Service (GNOME Keyring / KWallet)
+# over D-Bus, implemented by `sync-secret-service`; `crypto-rust` keeps the
+# session encryption self-contained so no OpenSSL headers are required.
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls", "system-proxy"] }
+# Native "save file" dialog for exporting the caption history. `default-features`
+# is off on purpose: the defaults pull async-std in for the async API, which this
+# blocking dialog does not need. `xdg-portal` is the portal (D-Bus) backend, which
+# is thread safe, so the dialog may run on the blocking pool; the dialog needs an
+# XDG Desktop Portal implementation at runtime (installed by desktop distributions).
+# `tokio` is the required async runtime feature of that backend; tokio is already
+# in the tree through Tauri.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+semver = "1"
+sha2 = "0.10"
+# `tray-icon` enables the system tray used by the native runtime controls
+# (libayatana-appindicator on Linux); `image-png` is what lets the tray reuse the
+# packaged 32x32 PNG through `Image::from_bytes` instead of shipping a second icon
+# asset. The default `x11` feature stays on: Wayland sessions still go through
+# the same WebKitGTK stack, only global shortcuts and always-on-top are limited.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# Pinned to the 2.3.x line on purpose: 2.4.0 requires `tauri ^2.12`, which drags the
+# `tauri` crate past the `@tauri-apps/api` version in `desktop/package.json` and makes
+# `tauri build` abort with "Found version mismatched Tauri packages". `~` (not `^`) is
+# what keeps `cargo update` from resolving back onto 2.4.0; only widen this together
+# with the npm @tauri-apps packages.
+tauri-plugin-global-shortcut = "~2.3.2"
+tauri-plugin-single-instance = "2"
+url = "2"
+uuid = { version = "1", features = ["v4"] }

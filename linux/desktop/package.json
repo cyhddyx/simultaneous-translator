@@ -1,0 +1,35 @@
+{
+  "name": "simultaneous-translator-desktop",
+  "private": true,
+  "version": "1.0.2",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc -b && vite build",
+    "test:audio": "node --experimental-strip-types --test tests/virtual-microphone.test.mjs",
+    "test:devices": "node --experimental-strip-types --test tests/audio-device-test.test.mjs",
+    "test:languages": "node --experimental-strip-types --test tests/translation-languages.test.mjs",
+    "test:runtime": "node --experimental-strip-types --test tests/runtime-state.test.mjs tests/runtime-mock.test.mjs",
+    "test:subtitle": "node --experimental-strip-types --test tests/subtitle-window.test.mjs",
+    "test:copy": "node --experimental-strip-types --test tests/linux-copy.test.mjs",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "tauri": "tauri",
+    "desktop:dev": "bash ../scripts/dev.sh",
+    "desktop:build": "bash ../scripts/build.sh",
+    "test:history": "node --experimental-strip-types --test tests/history.test.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "lucide-react": "^1.39.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  }
+}

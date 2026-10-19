@@ -2,6 +2,11 @@
 
 面向 Windows x64 的实时同传工具，仅使用 `qwen3.8-livetranslate-flash-realtime`。语音理解、翻译和译文语音由同一个模型完成，不需要另配语音识别或文本翻译模型。
 
+> **Linux 版**：同一仓库内的 [`linux/`](linux/README.md) 目录提供功能对等的 Linux 桌面版（Tauri 2 + React + Rust + Python 引擎，
+> PulseAudio 系统声音隔离采集、PulseAudio 内置虚拟麦克风、deb/rpm 安装包）。Linux 安装包发布在本仓库
+> Releases 的 `v1.0.2`（`simultaneous-translator_1.0.2_amd64.deb`、`simultaneous-translator_1.0.2_amd64.rpm`、
+> `SHA256SUMS.txt`）。本 README 其余内容针对 Windows 版。
+
 ## 两种输出模式
 
 - **语音转文字**：输入语音，实时显示原文和译文字幕。会话发送 `output_modalities: ["text"]`，不创建译文播放器。
