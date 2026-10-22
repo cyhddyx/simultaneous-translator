@@ -4,7 +4,7 @@
 
 > **Linux 版**：同一仓库内的 [`linux/`](linux/README.md) 目录提供功能对等的 Linux 桌面版（Tauri 2 + React + Rust + Python 引擎，
 > PulseAudio 系统声音隔离采集、PulseAudio 内置虚拟麦克风、deb/rpm 安装包）。Linux 安装包发布在本仓库
-> Releases 的 `v1.0.2`（`simultaneous-translator_1.0.2_windows_x64-setup.exe`、`simultaneous-translator_1.0.2_linux_amd64.deb`、`simultaneous-translator_1.0.2_linux_amd64.rpm`、
+> Releases 的 `v1.0.3`（`simultaneous-translator_1.0.3_windows_x64-setup.exe`、`simultaneous-translator_1.0.3_linux_amd64.deb`、`simultaneous-translator_1.0.3_linux_amd64.rpm`、
 > `SHA256SUMS.txt`）。本 README 其余内容针对 Windows 版。
 
 ## 两种输出模式
@@ -160,7 +160,7 @@ npm run desktop:dev
 
 发布新版本时，需要同步 `desktop/package.json`、`desktop/src-tauri/Cargo.toml` 和 `desktop/src-tauri/tauri.conf.json` 的版本号，并向对应 Release 上传 `simultaneous-translator_<版本>_windows_x64-setup.exe`（发布资产名带平台标记；应用内更新同时兼容旧名 `_x64-setup.exe`）与 `SHA256SUMS.txt`。校验文件每行格式为 `<64 位 SHA-256>  <安装包文件名>`。当前实现适用于 Windows x64。
 
-**当前正式版本为 1.0.2（Release 标签 `v1.0.2`），新增按日期的会话历史与导出，并延长静默待机。0.5.2 及更新版本用户可在应用内获取更新；0.5.1 及更早版本请手动下载安装正式版。**
+**当前正式版本为 1.0.3（Release 标签 `v1.0.3`），修复连接建立后过早配置会话导致服务端返回 `session does not exist`、界面误报「网络异常」的问题，发布资产名统一带平台标记。0.5.2 及更新版本用户可在应用内获取更新；0.5.1 及更早版本请手动下载安装正式版。**
 
 只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_windows_x64-setup.exe`，不需要编译源码。
 

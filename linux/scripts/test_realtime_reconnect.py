@@ -31,6 +31,11 @@ class Recorder:
         pass
 
 
+# The real server announces its session before any client event is valid, and
+# the client may not configure the session before that announcement arrives.
+SESSION_CREATED = '{"type":"session.created","session":{"id":"test-session"}}'
+
+
 class ToneRecorder(Recorder):
     """Non-silent capture so keepalive silence stays distinguishable from audio."""
 
@@ -87,6 +92,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             attempts.append(socket)
             number = len(attempts)
             try:
+                await socket.send(SESSION_CREATED)
                 async for raw in socket:
                     event = json.loads(raw)
                     if event["type"] == "session.update":
@@ -149,6 +155,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         async def handler(socket):
             language = ""
             try:
+                await socket.send(SESSION_CREATED)
                 async for raw in socket:
                     event = json.loads(raw)
                     if event["type"] == "session.update":
@@ -215,6 +222,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 
         async def handler(socket):
             try:
+                await socket.send(SESSION_CREATED)
                 async for raw in socket:
                     event = json.loads(raw)
                     if event["type"] == "session.update":
@@ -256,6 +264,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 
         async def handler(socket):
             try:
+                await socket.send(SESSION_CREATED)
                 async for raw in socket:
                     event = json.loads(raw)
                     if event["type"] == "session.update":
@@ -296,6 +305,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 
         async def handler(socket):
             try:
+                await socket.send(SESSION_CREATED)
                 async for raw in socket:
                     event = json.loads(raw)
                     if event["type"] == "session.update":
@@ -416,6 +426,151 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(attempt.await_count, 1)
                 self.assertEqual(self.events("error")[-1]["data"]["code"], code)
 
+    async def test_the_configuration_waits_for_the_server_session(self):
+        session = self.session()
+        channel = session.channels[0]
+        order: list[str] = []
+
+        async def handler(socket):
+            try:
+                # The server announces the session only once it initialized the
+                # connection's resources, which is exactly why an update sent
+                # straight after the handshake can be answered with
+                # "session does not exist".
+                await asyncio.sleep(0.2)
+                order.append("session.created")
+                await socket.send(SESSION_CREATED)
+                async for raw in socket:
+                    event = json.loads(raw)
+                    if event["type"] == "session.update":
+                        order.append("session.update")
+                        await socket.send(json.dumps({"type": "session.updated", "session": event["session"]}))
+                    elif event["type"] == "session.finish":
+                        await socket.send('{"type":"session.finished"}')
+            except ConnectionClosed:
+                pass
+
+        async with serve(handler, "127.0.0.1", 0) as websocket_server:
+            channel._base_url = f"ws://127.0.0.1:{websocket_server.sockets[0].getsockname()[1]}"
+            with patch.object(channel, "_prepare_input", side_effect=lambda: (Recorder(), {})):
+                task = asyncio.create_task(channel._run_with_reconnect())
+                try:
+                    await self.wait_until(lambda: channel._stream_started_at is not None)
+                    self.assertEqual(order, ["session.created", "session.update"])
+                    self.assertFalse(self.events("error"))
+                finally:
+                    await self.stop(session, [task])
+
+    async def test_a_silent_server_still_gets_configured_after_the_grace_window(self):
+        session = self.session()
+        channel = session.channels[0]
+        updates: list[dict] = []
+
+        async def handler(socket):
+            try:
+                async for raw in socket:
+                    event = json.loads(raw)
+                    if event["type"] == "session.update":
+                        updates.append(event)
+                        await socket.send(json.dumps({"type": "session.updated", "session": event["session"]}))
+                    elif event["type"] == "session.finish":
+                        await socket.send('{"type":"session.finished"}')
+            except ConnectionClosed:
+                pass
+
+        async with serve(handler, "127.0.0.1", 0) as websocket_server:
+            channel._base_url = f"ws://127.0.0.1:{websocket_server.sockets[0].getsockname()[1]}"
+            # A server that never announces its session must not hang the
+            # channel: the update follows after the bounded grace window.
+            with patch.object(channel, "_prepare_input", side_effect=lambda: (Recorder(), {})), \
+                    patch.object(live, "SESSION_CREATED_GRACE_S", 0.05):
+                task = asyncio.create_task(channel._run_with_reconnect())
+                try:
+                    await self.wait_until(lambda: channel._stream_started_at is not None)
+                    self.assertEqual(len(updates), 1)
+                    self.assertFalse(self.events("error"))
+                finally:
+                    await self.stop(session, [task])
+
+    async def test_a_rejected_session_recovers_by_reconnecting(self):
+        session = self.session()
+        channel = session.channels[0]
+        attempts: list[object] = []
+
+        async def handler(socket):
+            attempts.append(socket)
+            number = len(attempts)
+            try:
+                await socket.send(SESSION_CREATED)
+                async for raw in socket:
+                    event = json.loads(raw)
+                    if event["type"] == "session.update":
+                        await socket.send(json.dumps({"type": "session.updated", "session": event["session"]}))
+                    elif event["type"] == "input_audio_buffer.append" and number == 1:
+                        # The server rejects an event of a session it no longer
+                        # has; the socket itself stays open.
+                        await socket.send(json.dumps({
+                            "type": "error",
+                            "error": {"code": "invalid_request_error", "message": "session does not exist"},
+                        }))
+                    elif event["type"] == "session.finish":
+                        await socket.send('{"type":"session.finished"}')
+            except ConnectionClosed:
+                pass
+
+        async with serve(handler, "127.0.0.1", 0) as websocket_server:
+            channel._base_url = f"ws://127.0.0.1:{websocket_server.sockets[0].getsockname()[1]}"
+            with patch.object(channel, "_prepare_input", side_effect=lambda: (Recorder(), {})), \
+                    patch.object(live, "RECONNECT_INITIAL_DELAY_S", 0.01):
+                task = asyncio.create_task(channel._run_with_reconnect())
+                try:
+                    await self.wait_until(lambda: len(attempts) == 2
+                                          and self.events("network.status")[-1]["data"]["status"] == "ready")
+                    # A stale session is a connection interruption, not a dead
+                    # channel: it recovers inside the same session.
+                    self.assertFalse(self.events("error"))
+                    self.assertFalse(session.stop_event.is_set())
+                    self.assertFalse(task.done())
+                    self.assertNotIn("stopped", [e["data"].get("state") for e in self.events("state")])
+                finally:
+                    await self.stop(session, [task])
+        self.assertEqual(len(attempts), 2)
+
+    async def test_repeated_session_rejections_stop_after_the_bounded_retries(self):
+        session = self.session()
+        channel = session.channels[0]
+        attempts: list[object] = []
+
+        async def handler(socket):
+            attempts.append(socket)
+            try:
+                await socket.send(SESSION_CREATED)
+                async for raw in socket:
+                    event = json.loads(raw)
+                    if event["type"] == "session.update":
+                        await socket.send(json.dumps({"type": "session.updated", "session": event["session"]}))
+                    elif event["type"] == "input_audio_buffer.append":
+                        await socket.send(json.dumps({
+                            "type": "error",
+                            "error": {"code": "invalid_request_error", "message": "session does not exist"},
+                        }))
+                    elif event["type"] == "session.finish":
+                        await socket.send('{"type":"session.finished"}')
+            except ConnectionClosed:
+                pass
+
+        async with serve(handler, "127.0.0.1", 0) as websocket_server:
+            channel._base_url = f"ws://127.0.0.1:{websocket_server.sockets[0].getsockname()[1]}"
+            with patch.object(channel, "_prepare_input", side_effect=lambda: (Recorder(), {})), \
+                    patch.object(live, "RECONNECT_INITIAL_DELAY_S", 0.01):
+                await asyncio.wait_for(channel._run_with_reconnect(), timeout=10)
+        # One attempt plus the bounded recoveries, then the rejection is reported
+        # as a protocol error instead of reconnecting forever.
+        self.assertEqual(len(attempts), live.SESSION_EXPIRED_RETRY_LIMIT + 1)
+        error = self.events("error")[-1]["data"]
+        self.assertEqual(error["code"], "realtime_protocol_error")
+        self.assertIn("session does not exist", error["message"])
+
     def test_a_fast_exit_cannot_retire_a_sibling_that_has_not_started_yet(self):
         session = self.session(two_channels=True)
         with patch.object(self.server, "on_realtime_all_channels_closed") as closed:
@@ -429,3 +584,4 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

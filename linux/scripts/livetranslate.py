@@ -13,6 +13,9 @@ voice of the speaker.  Two channels therefore implement a two-way interpreter:
 
 Wire protocol (``wss://<host>/api-ws/v1/realtime?model=<model>``):
 
+* the server announces its session with ``session.created`` **after** the
+  socket opens and its resources are initialized; ``session.update`` may only
+  follow it, otherwise the server answers ``session does not exist``.
 * ``session.update`` configures target language, output modality and voice.
 * ``input_audio_buffer.append`` streams base64 PCM.  Inbound audio is
   uncompressed 16-bit little-endian PCM, mono, 16 kHz; outbound audio is the
@@ -162,6 +165,24 @@ _AUTH_FAILURE_HINTS = (
     "密钥",
 )
 
+# The server answers an event with ``session does not exist`` when the session
+# it belongs to is gone: either the update arrived before the session existed
+# (resource initialization runs after the socket opens) or the session was
+# dropped server-side while the socket stayed open.  Both are connection-level
+# conditions that a fresh connection fixes, so they must not be reported as a
+# permanent protocol rejection.  Every hint names the session explicitly so a
+# neighbouring failure ("model does not exist") is not swallowed by accident.
+_MISSING_SESSION_HINTS = (
+    "session does not exist",
+    "session not found",
+    "no such session",
+    "session has expired",
+    "session expired",
+    "会话不存在",
+    "会话已失效",
+    "会话已过期",
+)
+
 
 def error_service(code: str, default: str = SERVICE_SYSTEM) -> str:
     """Classify one engine error code into contract 4.4's ``service`` field."""
@@ -177,6 +198,11 @@ def looks_like_auth_failure(detail: str) -> bool:
     text = detail.lower()
     return any(hint in text for hint in _AUTH_FAILURE_HINTS)
 
+
+def looks_like_missing_session(detail: str) -> bool:
+    text = detail.lower()
+    return any(hint in text for hint in _MISSING_SESSION_HINTS)
+
 # Encodings are fixed by the service: PCM16 mono, 16 kHz up / 24 kHz down.
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
@@ -187,6 +213,21 @@ FRAME_SAMPLES = int(INPUT_SAMPLE_RATE * FRAME_SECONDS)
 # playback never drifts behind live speech.
 PLAYER_QUEUE_CHUNKS = 240
 CONNECT_TIMEOUT_S = 20.0
+# A WebSocket is open before the server's session exists: the service finishes
+# its audio and inference resource initialization after the handshake (the same
+# initialization the docs blame for a 5-10 s close on a connection that was
+# never used), and an event that arrives first is rejected with
+# ``session does not exist``.  The documented handshake therefore waits for
+# ``session.created`` before ``session.update`` -- the official WebSocket sample
+# and the DashScope SDK both do.  The grace window only bounds that wait: a
+# server that never announces a session still receives the update, just later,
+# so a missing announcement can never hang the channel.
+SESSION_CREATED_GRACE_S = 10.0
+# Consecutive ``session does not exist`` rejections that may be recovered by
+# reconnecting, because a fresh connection creates a fresh session.  Bounded so
+# a server that keeps rejecting cannot loop forever: after this many attempts
+# the rejection is reported as the protocol error it looks like.
+SESSION_EXPIRED_RETRY_LIMIT = 3
 FINISH_TIMEOUT_S = 15.0
 CLOSE_TIMEOUT_S = 5.0
 RECONNECT_INITIAL_DELAY_S = 1.0
@@ -848,6 +889,12 @@ class LiveTranslateChannel(threading.Thread):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._updated = False
         self._configuration_ready = asyncio.Event()
+        # Set by the server's ``session.created``: the handshake must not send
+        # ``session.update`` before it (see ``SESSION_CREATED_GRACE_S``).
+        self._session_created = asyncio.Event()
+        # Consecutive ``session does not exist`` rejections already recovered by
+        # reconnecting; reset once a connection has proven stable.
+        self._session_expired_retries = 0
         self._variant = 0
         self._source_deltas: dict[str, str] = {}
         self._translation_deltas: dict[str, str] = {}
@@ -877,6 +924,7 @@ class LiveTranslateChannel(threading.Thread):
             # Wake the receive loop out of a long ``recv`` wait.
             with contextlib.suppress(RuntimeError):
                 self._loop.call_soon_threadsafe(self._configuration_ready.set)
+                self._loop.call_soon_threadsafe(self._session_created.set)
                 self._loop.call_soon_threadsafe(self._retry_wakeup.set)
         if self._player is not None:
             self._player.stop()
@@ -905,6 +953,7 @@ class LiveTranslateChannel(threading.Thread):
             self._stream_started_at = None
             self._finished.clear()
             self._configuration_ready.clear()
+            self._session_created.clear()
             self._source_deltas.clear()
             self._translation_deltas.clear()
             self._completed_responses.clear()
@@ -921,6 +970,7 @@ class LiveTranslateChannel(threading.Thread):
             if (self._stream_started_at is not None
                     and time.monotonic() - self._stream_started_at >= RECONNECT_STABLE_SECONDS):
                 delay = RECONNECT_INITIAL_DELAY_S
+                self._session_expired_retries = 0
             detail = f"{self._spec.label}通道连接中断，{delay:g} 秒后自动重连。"
             self._server.on_realtime_channel(self._session, self._spec.channel, "connecting", detail=detail)
             report_channel_network(self._session, self._spec.channel, STATUS_CONNECTING, detail)
@@ -974,6 +1024,12 @@ class LiveTranslateChannel(threading.Thread):
                 keepalive: asyncio.Task[None] | None = None
                 try:
                     stage = "configure"
+                    # Wait for the server's session before configuring it: an
+                    # update that arrives first is rejected with
+                    # ``session does not exist`` and used to kill the channel.
+                    await self._await_session_created()
+                    if self._failed or self._session.stop_event.is_set():
+                        return
                     await self._send_session_update(websocket)
                     await asyncio.wait_for(self._configuration_ready.wait(), CONNECT_TIMEOUT_S)
                     if self._failed or self._session.stop_event.is_set():
@@ -1259,6 +1315,35 @@ class LiveTranslateChannel(threading.Thread):
             })
         return [configuration]
 
+    async def _await_session_created(self) -> None:
+        """Hold the configuration back until the server has a session.
+
+        The socket is open before the session exists, so ``session.update`` sent
+        immediately after the handshake can be answered with
+        ``session does not exist``.  The documented handshake waits for
+        ``session.created``; this waits for it too, but only up to
+        ``SESSION_CREATED_GRACE_S`` and no longer than the connection itself
+        lives, so an announcement that never comes costs one bounded delay
+        instead of hanging the channel.  A connection that already failed
+        settles ``_configuration_ready`` (``_report_failure``) or ends the
+        receive loop, either of which ends the wait at once.
+        """
+
+        if self._session_created.is_set():
+            return
+        created = asyncio.ensure_future(self._session_created.wait())
+        settled = asyncio.ensure_future(self._configuration_ready.wait())
+        try:
+            await asyncio.wait(
+                {created, settled}, timeout=SESSION_CREATED_GRACE_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (created, settled):
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(created, settled, return_exceptions=True)
+
     async def _send_session_update(self, websocket: Any) -> None:
         variants = self._session_variants()
         self._variant = min(self._variant, len(variants) - 1)
@@ -1286,12 +1371,23 @@ class LiveTranslateChannel(threading.Thread):
         except Exception as exc:  # noqa: BLE001 - connection-level failure
             if not self._session.stop_event.is_set():
                 self._report_failure("realtime_receive_failed", f"{self._spec.label}通道连接中断：{exc}")
+        finally:
+            # A socket that is gone can never deliver the handshake events, so
+            # release a pending ``session.created`` wait instead of letting it
+            # run into its grace window.
+            self._session_created.set()
+            self._configuration_ready.set()
 
     def _handle_event(self, event: dict[str, Any], websocket: Any) -> None:
         event_type = event.get("type")
         if not isinstance(event_type, str):
             return
 
+        if event_type == "session.created":
+            # The server's session exists from here on, which is the earliest
+            # point ``session.update`` may be sent (see ``_await_session_created``).
+            self._session_created.set()
+            return
         if event_type == "session.updated":
             session = event.get("session", {})
             actual = session.get("output_modalities") if isinstance(session, dict) else None
@@ -1372,6 +1468,11 @@ class LiveTranslateChannel(threading.Thread):
             return
 
     def _handle_protocol_error(self, event: dict[str, Any], websocket: Any) -> None:
+        if self._failed:
+            # This connection already failed and was reported.  A server answers
+            # every in-flight append with its own error event, so without this
+            # guard one rejection would be counted several times.
+            return
         detail = _event_error_message(event)
         if looks_like_auth_failure(detail):
             # Contract 4.4 names this scenario separately because it is not
@@ -1380,6 +1481,19 @@ class LiveTranslateChannel(threading.Thread):
                 ERROR_CODE_AUTH_FAILED,
                 f"{self._spec.label}通道服务端鉴权失败：{detail}",
                 recoverable=False,
+            )
+            return
+        if (looks_like_missing_session(detail)
+                and self._session_expired_retries < SESSION_EXPIRED_RETRY_LIMIT):
+            # The session this event belongs to is gone; a new connection creates
+            # a new one, so this is a connection-level interruption that recovers
+            # by itself rather than a rejected request the user has to fix.  It is
+            # reported through the retryable connection code so the channel
+            # reconnects quietly instead of showing a dead "network error".
+            self._session_expired_retries += 1
+            self._report_failure(
+                "realtime_connection_closed",
+                f"{self._spec.label}通道服务端会话已失效：{detail}",
             )
             return
         self._report_failure("realtime_protocol_error", f"{self._spec.label}通道被模型拒绝：{detail}")
@@ -1827,3 +1941,4 @@ class RealtimeSession:
             },
             allow_stopping=True,
         )
+
