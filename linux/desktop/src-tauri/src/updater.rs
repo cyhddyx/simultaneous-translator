@@ -3,8 +3,9 @@
 //! Linux 版不做自动提权安装，流程固定为：检查 → 下载 → SHA-256 校验 → 打开下载
 //! 目录由用户手动安装（AppImage 例外：以 AppImage 方式运行且文件可写时，直接替换
 //! 当前镜像并提示重启）。发布资产约定见 `PORTING_CONTRACT.md` §5 D10：
-//! `simultaneous-translator_<version>_amd64.deb`、`..._amd64.rpm`、
-//! `..._amd64.AppImage`，以及 `SHA256SUMS.txt`（每行 `<sha>  <文件名>`）。
+//! `simultaneous-translator_<version>_linux_amd64.deb`、`..._linux_amd64.rpm`、
+//! `..._linux_amd64.AppImage`，以及 `SHA256SUMS.txt`（每行 `<sha>  <文件名>`）。
+//! 旧命名 `..._amd64.<ext>` 仍被接受，避免历史版本更新链路失效。
 
 use std::{
     env,
@@ -76,8 +77,20 @@ enum PackageKind {
 }
 
 impl PackageKind {
-    /// 发布资产名里的架构 / 扩展名部分。
+    /// 发布资产名里的平台 / 架构 / 扩展名部分。
+    ///
+    /// 统一带 `linux_amd64`：和仓库里 Windows 资产（`_windows_x64-setup.exe`）一样，下载
+    /// 文件名本身就能看出系统与架构，不会出现「deb 叫 amd64、rpm 叫 x86_64」的歧义。
     fn asset_suffix(self) -> &'static str {
+        match self {
+            PackageKind::Deb => "linux_amd64.deb",
+            PackageKind::Rpm => "linux_amd64.rpm",
+            PackageKind::AppImage => "linux_amd64.AppImage",
+        }
+    }
+
+    /// 旧版发布资产使用的后缀（仍接受，兼容历史 Release）。
+    fn legacy_asset_suffix(self) -> &'static str {
         match self {
             PackageKind::Deb => "amd64.deb",
             PackageKind::Rpm => "amd64.rpm",
@@ -149,17 +162,21 @@ fn latest_release(releases: Vec<Release>) -> Option<Release> {
 // Linux 资产匹配（contract §5 D10）
 // --------------------------------------------------------------------------- //
 
-/// 某个打包格式在发布页里的候选文件名。
+/// 某个打包格式在发布页里的候选文件名（新命名优先，旧命名兜底）。
 ///
-/// 主文件名遵循契约约定；rpm 额外接受 `cargo tauri build --bundles rpm` 直接产出
-/// 的 rpm 惯用文件名（`...-<version>-1.x86_64.rpm`），避免发布者忘记改名时更新
-/// 功能不可用。
+/// 主文件名遵循契约约定（`..._linux_amd64.<ext>`）；同时接受旧版 `..._amd64.<ext>`，
+/// rpm 还额外接受 `cargo tauri build --bundles rpm` 直接产出的惯用文件名
+/// （`...-<version>-1.x86_64.rpm`），避免发布者忘记改名或历史 Release 导致更新不可用。
 fn asset_names(release: &Release, kind: PackageKind) -> Vec<String> {
     let version = release_version(&release.tag_name).unwrap();
     let mut names = vec![format!(
         "simultaneous-translator_{version}_{}",
         kind.asset_suffix()
     )];
+    names.push(format!(
+        "simultaneous-translator_{version}_{}",
+        kind.legacy_asset_suffix()
+    ));
     if kind == PackageKind::Rpm {
         names.push(format!("simultaneous-translator-{version}-1.x86_64.rpm"));
     }
@@ -679,16 +696,27 @@ mod tests {
         let release = release("beta1.0.2");
         assert_eq!(
             asset_name(&release, PackageKind::Deb),
-            "simultaneous-translator_1.0.2_amd64.deb"
+            "simultaneous-translator_1.0.2_linux_amd64.deb"
         );
         assert_eq!(
             asset_name(&release, PackageKind::Rpm),
-            "simultaneous-translator_1.0.2_amd64.rpm"
+            "simultaneous-translator_1.0.2_linux_amd64.rpm"
         );
         assert_eq!(
             asset_name(&release, PackageKind::AppImage),
-            "simultaneous-translator_1.0.2_amd64.AppImage"
+            "simultaneous-translator_1.0.2_linux_amd64.AppImage"
         );
+    }
+
+    #[test]
+    fn legacy_amd64_asset_names_are_still_accepted() {
+        let mut release = release("v1.0.2");
+        push_asset(&mut release, "simultaneous-translator_1.0.2_amd64.deb");
+        push_asset(&mut release, "simultaneous-translator_1.0.2_amd64.rpm");
+        push_asset(&mut release, "simultaneous-translator_1.0.2_amd64.AppImage");
+        assert!(release_asset_for_kind(&release, PackageKind::Deb).is_some());
+        assert!(release_asset_for_kind(&release, PackageKind::Rpm).is_some());
+        assert!(release_asset_for_kind(&release, PackageKind::AppImage).is_some());
     }
 
     #[test]
@@ -766,7 +794,7 @@ mod tests {
     #[test]
     fn validates_exact_checksum_filename_and_rejects_ambiguity() {
         let hash = "ab".repeat(32);
-        let name = "simultaneous-translator_1.0.2_amd64.deb";
+        let name = "simultaneous-translator_1.0.2_linux_amd64.deb";
         assert_eq!(
             checksum_for(&format!("{hash}  {name}\r\n"), name).unwrap(),
             hash

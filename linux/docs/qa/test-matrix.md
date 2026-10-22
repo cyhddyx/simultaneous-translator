@@ -209,7 +209,7 @@
 | F-10 | 卸载 | `dpkg -r` 成功；无残留进程；用户配置保留（正确行为） | L8 | 见 `qa/packaging.md` |
 | F-11 | 升级安装 | 旧版本 → 新版本覆盖安装，配置保留 | L8 | 未验证（单版本轮次） |
 | F-12 | rpm 安装 | Fedora/openSUSE 安装（Debian 系不安装，只验证元数据/解包） | L9 | 未验证（需 RPM 发行版） |
-| F-13 | 更新检查资产匹配 | Linux 资产名 `_amd64.deb/.rpm/.AppImage` + `SHA256SUMS.txt`；下载校验失败阻止安装（P D10） | L5 + L9 | 部分 |
+| F-13 | 更新检查资产匹配 | Linux 资产名 `_linux_amd64.deb/.rpm/.AppImage` + `SHA256SUMS.txt`；下载校验失败阻止安装（P D10） | L5 + L9 | 部分 |
 | F-14 | AppImage（可选） | 构建成功、可执行、含主程序+sidecar | L6（可选） | 未验证（默认不构建） |
 | F-15 | 打包版本号 | 三处版本一致，产物文件名版本正确 | L6 | 见 `qa/packaging.md` |
 

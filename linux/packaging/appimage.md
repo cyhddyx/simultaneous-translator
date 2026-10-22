@@ -75,7 +75,7 @@ timeout 15 xvfb-run -a dbus-run-session -- "$APP"
 发布归档与更新检查统一使用契约 D10 的资产名：
 
 ```
-releases/linux/v1.0.2/simultaneous-translator_1.0.2_amd64.AppImage
+releases/linux/v1.0.2/simultaneous-translator_1.0.2_linux_amd64.AppImage
 ```
 
 若 Tauri 产物名已是该形式，直接复制；否则复制时重命名（内容不变），并在 `SHA256SUMS.txt`

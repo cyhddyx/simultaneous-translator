@@ -9,10 +9,10 @@
 
 | 资产（GitHub Release 附件名） | 内容 | 必需 |
 | --- | --- | --- |
-| `simultaneous-translator_<版本>_amd64.deb` | Ubuntu/Debian 安装包 | 是 |
-| `simultaneous-translator_<版本>_amd64.rpm` | Fedora/openSUSE 安装包 | 是 |
+| `simultaneous-translator_<版本>_linux_amd64.deb` | Ubuntu/Debian 安装包 | 是 |
+| `simultaneous-translator_<版本>_linux_amd64.rpm` | Fedora/openSUSE 安装包 | 是 |
 | `SHA256SUMS.txt` | 校验文件，每行 `<64位SHA-256>  <文件名>` | 是 |
-| `simultaneous-translator_<版本>_amd64.AppImage` | 便携版 | 可选（默认不构建） |
+| `simultaneous-translator_<版本>_linux_amd64.AppImage` | 便携版 | 可选（默认不构建） |
 | `RELEASE_NOTES.md` | 发布说明正文 | 是（工作区归档） |
 
 应用内「设置 → 软件更新」按同一 GitHub Release 的 `SHA256SUMS.txt` 校验下载文件
@@ -72,7 +72,7 @@ npx tauri build --bundles deb
 npx tauri build --bundles rpm
 ```
 
-产物路径：
+产物路径（Tauri 打包器原名，发布前按 §6 重命名）：
 
 ```
 linux/desktop/src-tauri/target/release/bundle/deb/simultaneous-translator_<版本>_amd64.deb
@@ -119,12 +119,12 @@ mkdir -p releases/linux/v$VER
 DEB=linux/desktop/src-tauri/target/release/bundle/deb/simultaneous-translator_${VER}_amd64.deb
 RPM=$(ls linux/desktop/src-tauri/target/release/bundle/rpm/*.rpm | head -1)
 
-cp "$DEB" releases/linux/v$VER/simultaneous-translator_${VER}_amd64.deb
-cp "$RPM" releases/linux/v$VER/simultaneous-translator_${VER}_amd64.rpm
+cp "$DEB" releases/linux/v$VER/simultaneous-translator_${VER}_linux_amd64.deb
+cp "$RPM" releases/linux/v$VER/simultaneous-translator_${VER}_linux_amd64.rpm
 
 cd releases/linux/v$VER
-sha256sum simultaneous-translator_${VER}_amd64.deb \
-          simultaneous-translator_${VER}_amd64.rpm > SHA256SUMS.txt
+sha256sum simultaneous-translator_${VER}_linux_amd64.deb \
+          simultaneous-translator_${VER}_linux_amd64.rpm > SHA256SUMS.txt
 sha256sum -c SHA256SUMS.txt
 ```
 
@@ -136,13 +136,13 @@ releases/linux/
 └─ v1.0.2/
    ├─ RELEASE_NOTES.md
    ├─ SHA256SUMS.txt
-   ├─ simultaneous-translator_1.0.2_amd64.deb
-   └─ simultaneous-translator_1.0.2_amd64.rpm
+   ├─ simultaneous-translator_1.0.2_linux_amd64.deb
+   └─ simultaneous-translator_1.0.2_linux_amd64.rpm
 ```
 
 **命名强制统一**：GitHub 资产名、`SHA256SUMS.txt` 中的文件名、应用内更新下载匹配名三者必须一致
 （契约 D10）。Tauri 产出的 rpm 文件名可能带 `-1` release 段，归档/上传时**重命名**为
-`simultaneous-translator_<版本>_amd64.rpm`（内容不变，SHA 按重命名后的文件计算）。
+`simultaneous-translator_<版本>_linux_amd64.rpm`（内容不变，SHA 按重命名后的文件计算）。
 
 ---
 
@@ -152,8 +152,8 @@ releases/linux/
 # 前提：本地工作区不是 git 仓库时，用 gh release upload 指定仓库
 TAG=v1.0.2
 gh release create "$TAG" \
-  releases/linux/v1.0.2/simultaneous-translator_1.0.2_amd64.deb \
-  releases/linux/v1.0.2/simultaneous-translator_1.0.2_amd64.rpm \
+  releases/linux/v1.0.2/simultaneous-translator_1.0.2_linux_amd64.deb \
+  releases/linux/v1.0.2/simultaneous-translator_1.0.2_linux_amd64.rpm \
   releases/linux/v1.0.2/SHA256SUMS.txt \
   --repo cyhddyx/simultaneous-translator \
   --title "同传翻译 1.0.2（Linux）" \
@@ -176,7 +176,7 @@ gh release view "$TAG" --repo cyhddyx/simultaneous-translator --json assets \
 ## 8. 应用内更新（Linux 行为）
 
 - 检查：GitHub Releases API，包含 beta 预发布版本；版本号比较规则与 Windows 一致。
-- 下载：按当前架构匹配 `simultaneous-translator_<版本>_amd64.deb` / `.rpm` / `.AppImage`；
+- 下载：按当前架构匹配 `simultaneous-translator_<版本>_linux_amd64.deb` / `.rpm` / `.AppImage`；
   下载后核对同一 Release 的 `SHA256SUMS.txt`，大小或 SHA-256 不符则阻止安装。
 - 安装：**不自动提权**。deb/rpm 下载后打开所在目录并提示用户用系统包管理器安装；
   AppImage 若可写则替换当前文件并提示重启。

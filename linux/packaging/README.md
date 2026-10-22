@@ -104,13 +104,13 @@ npx tauri build --bundles rpm
 | 产物 | 路径（相对 `desktop/src-tauri/`） | 命名规则 |
 | --- | --- | --- |
 | 主程序（未打包） | `target/release/simultaneous-translator` | Cargo 包名 |
-| deb 安装包 | `target/release/bundle/deb/simultaneous-translator_<版本>_amd64.deb` | `<productName>_<version>_<arch>.deb` |
+| deb 安装包 | `target/release/bundle/deb/simultaneous-translator_<版本>_amd64.deb` | 打包器原名：`<productName>_<version>_<arch>.deb` |
 | rpm 安装包 | `target/release/bundle/rpm/simultaneous-translator-<版本>-1.x86_64.rpm` | `<name>-<version>-<release>.<arch>.rpm` |
 | sidecar（中间产物） | `binaries/translator-bridge-x86_64-unknown-linux-gnu` | 不单独分发 |
 
 > 实际文件名以构建输出为准（不同 Tauri CLI 小版本可能微调 rpm 的 `release` 段）。发布归档时按
-> 契约 D10 的统一资产名复制/重命名：`simultaneous-translator_<版本>_amd64.deb`、`..._amd64.rpm`、
-> `..._amd64.AppImage`，见 [`../docs/release.md`](../docs/release.md)。
+> 契约 D10 的统一资产名复制/重命名：`simultaneous-translator_<版本>_linux_amd64.deb`、`..._linux_amd64.rpm`、
+> `..._linux_amd64.AppImage`，见 [`../docs/release.md`](../docs/release.md)。
 
 ---
 
@@ -191,8 +191,8 @@ cd desktop && npx tauri build --bundles appimage
 releases/linux/v1.0.2/
 ├─ RELEASE_NOTES.md
 ├─ SHA256SUMS.txt                     # <sha256>  <文件名>，每行一个
-├─ simultaneous-translator_1.0.2_amd64.deb
-└─ simultaneous-translator_1.0.2_amd64.rpm
+├─ simultaneous-translator_1.0.2_linux_amd64.deb
+└─ simultaneous-translator_1.0.2_linux_amd64.rpm
 ```
 
 应用内「检查更新」按同一 GitHub Release 的 `SHA256SUMS.txt` 校验下载的 deb/rpm/AppImage。

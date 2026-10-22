@@ -97,11 +97,23 @@ fn latest_release(releases: Vec<Release>) -> Option<Release> {
         .map(|(_, release)| release)
 }
 
-fn installer_name(release: &Release) -> String {
-    format!(
-        "simultaneous-translator_{}_x64-setup.exe",
-        release_version(&release.tag_name).unwrap()
-    )
+/// Windows 安装包在发布页里的候选文件名。
+///
+/// 新命名带平台标记（`_windows_x64-setup.exe`），与 Linux 资产（`_linux_amd64.*`）一致，
+/// 下载页一眼能看出系统；同时接受旧命名 `_x64-setup.exe`，兼容历史 Release 与旧版更新器。
+fn installer_names(release: &Release) -> Vec<String> {
+    let version = release_version(&release.tag_name).unwrap();
+    vec![
+        format!("simultaneous-translator_{version}_windows_x64-setup.exe"),
+        format!("simultaneous-translator_{version}_x64-setup.exe"),
+    ]
+}
+
+/// 实际可下载的 Windows 安装包：新命名优先，旧命名兜底。
+fn installer_asset<'a>(release: &'a Release) -> Option<(&'a Asset, String)> {
+    installer_names(release)
+        .into_iter()
+        .find_map(|name| release_asset(release, &name).map(|asset| (asset, name)))
 }
 
 fn release_asset<'a>(release: &'a Release, name: &str) -> Option<&'a Asset> {
@@ -128,7 +140,7 @@ fn release_asset<'a>(release: &'a Release, name: &str) -> Option<&'a Asset> {
 
 fn update_info(release: &Release, current: &str) -> UpdateInfo {
     let version = release_version(&release.tag_name).unwrap();
-    let installer = release_asset(release, &installer_name(release));
+    let installer = installer_asset(release).map(|(asset, _)| asset);
     UpdateInfo {
         current_version: current.into(),
         available: Version::parse(current).is_ok_and(|current| version > current),
@@ -268,8 +280,7 @@ pub async fn download_app_update(
         if !update_info(release, &app.package_info().version.to_string()).available {
             return Err("当前已是最新版本。".into());
         }
-        let name = installer_name(release);
-        let asset = release_asset(release, &name).ok_or("此版本尚未提供 Windows 安装包。")?;
+        let (asset, name) = installer_asset(release).ok_or("此版本尚未提供 Windows 安装包。")?;
         let sums = release_asset(release, "SHA256SUMS.txt").ok_or("此版本缺少校验文件。")?;
         let client = client()?;
         let bytes = read_limited(
@@ -452,7 +463,7 @@ mod tests {
     #[test]
     fn limits_installers_to_the_release_in_the_configured_repository() {
         let mut selected = release("beta0.5.3");
-        let name = installer_name(&selected);
+        let name = installer_names(&selected).remove(0);
         selected.assets.push(Asset {
             name: name.clone(),
             size: 10,
@@ -464,6 +475,26 @@ mod tests {
         selected.assets[0].browser_download_url =
             format!("{RELEASES_URL}/download/beta0.5.2/{name}");
         assert!(release_asset(&selected, &name).is_none());
+    }
+
+    #[test]
+    fn accepts_legacy_unlabeled_installer_names() {
+        let mut selected = release("v1.0.2");
+        selected.assets.push(Asset {
+            name: "simultaneous-translator_1.0.2_x64-setup.exe".into(),
+            size: 10,
+            browser_download_url:
+                "https://github.com/cyhddyx/simultaneous-translator/releases/download/v1.0.2/simultaneous-translator_1.0.2_x64-setup.exe".into(),
+        });
+        selected.assets.push(Asset {
+            name: "SHA256SUMS.txt".into(),
+            size: 10,
+            browser_download_url:
+                "https://github.com/cyhddyx/simultaneous-translator/releases/download/v1.0.2/SHA256SUMS.txt".into(),
+        });
+        let (_, name) = installer_asset(&selected).expect("legacy installer name should match");
+        assert_eq!(name, "simultaneous-translator_1.0.2_x64-setup.exe");
+        assert!(update_info(&selected, "1.0.1").download_available);
     }
 
     #[test]
@@ -522,9 +553,10 @@ mod tests {
             64 * 1024,
         )
         .unwrap();
+        let (_, installer_name) = installer_asset(&selected).unwrap();
         assert!(checksum_for(
             std::str::from_utf8(&bytes).unwrap(),
-            &installer_name(&selected)
+            &installer_name
         )
         .is_ok());
     }

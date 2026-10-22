@@ -1,16 +1,12 @@
 # 同传翻译（Linux 桌面版）
 
-面向 Linux x64 的实时同传工具，与 [Windows 版](../README.md) 功能对等（v1.0.2）。
+面向 Linux x64 的实时同传工具，与 [Windows 版](../windows/README.md) 功能对等（v1.0.2）。
 技术栈与 Windows 版一致：Tauri 2 + React/TypeScript 前端、Rust 原生后端、Python 翻译引擎；
 音频、虚拟麦克风、托盘、密钥存储等平台相关部分按 Linux（PulseAudio / PipeWire / Secret Service /
 AppIndicator / X11 或 Wayland）重新实现。
 
-> **仓库布局**：在 GitHub 仓库 `cyhddyx/simultaneous-translator` 中，Windows 版源码位于仓库根目录
-> （`desktop/`、`scripts/`、`docs/`），Linux 版源码位于本目录 `linux/`。本地开发工作区中两者分别在
-> `windows/` 与 `linux/` 两个目录，本文若出现 `../windows/...` 指本地工作区路径，仓库内对应 `../...`。
-
 - 状态：**Linux 版 1.0.2（首个 Linux 发布）**
-- 目录：本仓库 `linux/`；Windows 版源码位于仓库根目录（本地工作区中为 `../windows`）
+- 目录：`E:\Project\translation\linux`（本目录），Windows 版在 `../windows`
 - 平台：Linux x64；参考验证环境 Ubuntu 24.04（WSLg 与物理桌面均可）
 - 文档：[构建](docs/build.md) · [打包](packaging/README.md) · [发布](docs/release.md) ·
   [测试](docs/testing.md) · [音频路由设计](docs/linux-audio-routing.md) · [QA](docs/qa/)
@@ -203,9 +199,9 @@ wss://maas.qianwenaiapi.com/api-ws/v1/realtime
 
 | 发行版 | 文件 | 安装 |
 | --- | --- | --- |
-| Debian / Ubuntu / Deepin / UOS | `simultaneous-translator_1.0.2_amd64.deb` | `sudo apt install ./simultaneous-translator_1.0.2_amd64.deb` |
-| Fedora / RHEL / openSUSE | `simultaneous-translator-1.0.2-1.x86_64.rpm` | `sudo dnf install ./simultaneous-translator-1.0.2-1.x86_64.rpm` |
-| 任意发行版（免安装） | `simultaneous-translator_1.0.2_amd64.AppImage`（可选构建） | `chmod +x` 后直接运行 |
+| Debian / Ubuntu / Deepin / UOS | `simultaneous-translator_1.0.2_linux_amd64.deb` | `sudo apt install ./simultaneous-translator_1.0.2_linux_amd64.deb` |
+| Fedora / RHEL / openSUSE | `simultaneous-translator_1.0.2_linux_amd64.rpm` | `sudo dnf install ./simultaneous-translator_1.0.2_linux_amd64.rpm` |
+| 任意发行版（免安装） | `simultaneous-translator_1.0.2_linux_amd64.AppImage`（可选构建） | `chmod +x` 后直接运行 |
 
 运行时依赖：`libwebkit2gtk-4.1`、`libgtk-3-0`、`libayatana-appindicator3`（托盘）、
 `libpulse0` + `pulseaudio-utils`（或 `pipewire-pulse`）、`xdg-utils`、`libsecret`（可选，Secret Service 客户端）。
@@ -229,8 +225,8 @@ cd .. && bash scripts/build.sh # 3) sidecar + 前端 + deb/rpm
 | --- | --- |
 | `target/release/simultaneous-translator` | 主程序（未打包） |
 | `binaries/translator-bridge-x86_64-unknown-linux-gnu` | 引擎中间产物（externalBin 复制为 `translator-bridge`） |
-| `target/release/bundle/deb/simultaneous-translator_1.0.2_amd64.deb` | Debian/Ubuntu 安装包 |
-| `target/release/bundle/rpm/simultaneous-translator-1.0.2-1.x86_64.rpm` | Fedora/openSUSE 安装包 |
+| `target/release/bundle/deb/simultaneous-translator_1.0.2_amd64.deb` | Debian/Ubuntu 安装包（打包器原名；发布资产重命名为 `_linux_amd64.deb`） |
+| `target/release/bundle/rpm/simultaneous-translator-1.0.2-1.x86_64.rpm` | Fedora/openSUSE 安装包（打包器原名；发布资产重命名为 `_linux_amd64.rpm`） |
 
 AppImage 需要构建机联网下载 linuxdeploy 工具链，默认不启用：见 [packaging/README.md](packaging/README.md)。
 构建细节、依赖与故障排查见 [docs/build.md](docs/build.md)；发布流程见 [docs/release.md](docs/release.md)。
@@ -238,7 +234,7 @@ AppImage 需要构建机联网下载 linuxdeploy 工具链，默认不启用：�
 ### 更新检查
 
 程序启动后自动查询 GitHub Releases，并在运行期间每 6 小时检查一次；发现新版本时主界面提示。
-Linux 版匹配的资产名为 `simultaneous-translator_<版本>_amd64.deb` / `.rpm` / `.AppImage`，
+Linux 版匹配的资产名为 `simultaneous-translator_<版本>_linux_amd64.deb` / `.rpm` / `.AppImage`，
 并核对同一 Release 的 `SHA256SUMS.txt`。下载并校验后打开文件所在目录（AppImage 且文件可写时直接替换并
 提示重启）；安装由用户完成，应用不会自动提权执行安装命令。也可在更新页直接打开发布页手动下载。
 
@@ -315,9 +311,7 @@ linux/
 ## 版本
 
 - Linux 版：**1.0.2**（首个 Linux 发布，功能对齐 Windows v1.0.2）
-- 参考基线：仓库根目录的 Windows v1.0.2 源码（本地工作区中为 `../windows`，Git HEAD `0da6dbe`）
-- 安装包：GitHub Releases 的 `v1.0.2`（Linux 资产：`simultaneous-translator_1.0.2_amd64.deb`、
-  `simultaneous-translator_1.0.2_amd64.rpm`、`SHA256SUMS.txt`）
+- 参考基线：`windows/`（Git 仓库，HEAD `0da6dbe`，Windows v1.0.2）
 - 本地构建产物归档：`../releases/linux/v1.0.2/`（deb / rpm / SHA256SUMS.txt）
 
 第三方组件与许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；像素字体授权见

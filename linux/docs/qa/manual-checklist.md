@@ -317,7 +317,7 @@
 ## 8. 安装 / 卸载 / 更新
 
 ### M-P01 deb 安装与启动
-- **步骤**：`sudo apt install ./simultaneous-translator_1.0.2_amd64.deb` → 从应用菜单启动。
+- **步骤**：`sudo apt install ./simultaneous-translator_1.0.2_linux_amd64.deb` → 从应用菜单启动。
 - **通过标准**：安装成功；菜单项显示「同传翻译」；能启动并读设置；`ls /usr/bin/{simultaneous-translator,translator-bridge}` 均存在。
 - **实测结果**：`未验证`
 

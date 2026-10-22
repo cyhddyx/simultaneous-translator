@@ -24,15 +24,15 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `simultaneous-translator_<版本>_amd64.deb` | Ubuntu 24.04 / Debian 12+ 安装包 |
-| `simultaneous-translator_<版本>_amd64.rpm` | Fedora / openSUSE 安装包 |
-| `simultaneous-translator_<版本>_amd64.AppImage` | 便携版（可选，需 FUSE） |
+| `simultaneous-translator_<版本>_linux_amd64.deb` | Ubuntu 24.04 / Debian 12+ 安装包 |
+| `simultaneous-translator_<版本>_linux_amd64.rpm` | Fedora / openSUSE 安装包 |
+| `simultaneous-translator_<版本>_linux_amd64.AppImage` | 便携版（可选，需 FUSE） |
 | `SHA256SUMS.txt` | 校验文件，每行 `<64 位 SHA-256>  <文件名>` |
 
 安装：
 
 ```bash
-sudo apt install ./simultaneous-translator_<版本>_amd64.deb     # Debian/Ubuntu
+sudo apt install ./simultaneous-translator_<版本>_linux_amd64.deb     # Debian/Ubuntu
 sudo dnf install ./simultaneous-translator-<版本>-1.x86_64.rpm  # Fedora
 ```
 

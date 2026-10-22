@@ -3,14 +3,13 @@
 > 本文是 Linux 版开发期间的**唯一权威约定**：目录归属、接口不变量、平台映射决策、验证环境与协作规则。
 > 与本文冲突的实现视为缺陷；需要改动本文的决策时，先由 Lead 更新本文再改代码。
 >
-> 参考基线：Windows v1.0.2（Git HEAD `0da6dbe`）。仓库内 Windows 源码位于仓库根目录，Linux 源码位于 `linux/`；
-> 本地开发工作区中两者分别在 `windows/` 与 `linux/`。**`windows/` 源码只读，任何人不得修改**。
+> 参考基线：`E:\Project\translation\windows`（Windows v1.0.2，Git HEAD `0da6dbe`），**只读，任何人不得修改 `windows/` 下的任何文件**。
 
 ## 1. 目标与非目标
 
 ### 目标
 
-在 `linux/` 目录产出一个**可独立构建、可安装运行**的 Linux 桌面版「同传翻译」，功能与 Windows v1.0.2 对等：
+在 `E:\Project\translation\linux` 产出一个**可独立构建、可安装运行**的 Linux 桌面版「同传翻译」，功能与 Windows v1.0.2 对等：
 
 - Tauri 2 桌面应用：React + TypeScript 前端、Rust 原生后端、Python 翻译引擎（JSONL 桥接）。
 - 收听通道：系统声音采集（排除本软件输出）与指定播放设备回环；麦克风输入。
@@ -31,7 +30,7 @@
 
 ## 2. 规格来源（必须先读）
 
-| 主题 | 文件（仓库内 Windows 源码在根目录；下表按本地工作区路径书写，即 `windows/` 前缀在仓库内对应 `../`） |
+| 主题 | 文件（路径相对工作区） |
 | --- | --- |
 | Windows 版功能与行为说明 | `windows/README.md` |
 | 前端↔Rust 契约 | `windows/desktop/src/tauri.ts`、`windows/desktop/src-tauri/src/lib.rs` |
@@ -144,7 +143,7 @@ linux/
 | D7 | 托盘 | Tauri `tray-icon`（libayatana-appindicator3 运行时依赖）。无托盘环境（无 appindicator host）时记录告警并降级为「关闭窗口即退出」并在设置页提示。 |
 | D8 | 全局快捷键 | `tauri-plugin-global-shortcut`：X11 全功能；Wayland 下通常不可用 → 逐项报告注册失败（沿用现有逻辑），设置页明确提示需要 X11/合成器支持。Ctrl+Shift+* 默认组合保持不变。 |
 | D9 | 字幕悬浮窗 | 无边框置顶窗口沿用现状；X11 下 `set_always_on_top` 生效，Wayland 由合成器决定，失败不阻塞主流程并记录。 |
-| D10 | 检查更新 | 同一 GitHub 仓库 Releases；Linux 资产约定：`simultaneous-translator_<version>_amd64.deb`、`simultaneous-translator_<version>_amd64.rpm`、`simultaneous-translator_<version>_amd64.AppImage`，以及 `SHA256SUMS.txt`（`<sha>  <文件名>` 每行）。下载 → SHA256 校验 → 打开所在目录；若以 AppImage 运行且可写，替换当前 AppImage 并提示重启。 |
+| D10 | 检查更新 | 同一 GitHub 仓库 Releases；Linux 资产命名统一带平台与架构：`simultaneous-translator_<version>_linux_amd64.deb`、`..._linux_amd64.rpm`、`..._linux_amd64.AppImage`（与 Windows 资产 `_x64-setup.exe` 一样一眼能看出系统/架构；旧版 `_amd64.<ext>` 命名仍被接受），以及 `SHA256SUMS.txt`（`<sha>  <文件名>` 每行）。下载 → SHA256 校验 → 打开所在目录；若以 AppImage 运行且可写，替换当前 AppImage 并提示重启。 |
 | D11 | 打包 | `bundle.targets = ["deb", "rpm"]`，AppImage 作为可选目标（需构建机联网下载 linuxdeploy；默认不启用，文档给命令）。`productName` 用 ASCII `simultaneous-translator` 以满足 deb 包名规范；中文显示名通过 `bundle.linux.deb.desktopTemplate` / `bundle.linux.rpm.desktopTemplate` 提供（`Name=同传翻译`，`Name[zh_CN]=同传翻译`）。窗口标题仍为「同传翻译」。 |
 | D12 | Python 打包 | PyInstaller onefile（Linux）：`binaries/translator-bridge-x86_64-unknown-linux-gnu`，`externalBin: ["binaries/translator-bridge"]` 保持不变。 |
 | D13 | 文件路径 | 设置/历史/缓存目录交给 Tauri `app_config_dir` / `app_cache_dir`；导出历史走 rfd；不硬编码 `~/.config` 具体子路径。 |
