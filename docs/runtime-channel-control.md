@@ -266,6 +266,27 @@ WebSocket，等待间隔依次为 1、2、4、8、15 秒，之后保持 15 秒�
 鉴权失败、明确的非临时 HTTP 4xx、配置拒绝及音频设备故障不自动重试，仍按
 原有错误协议报告。永久故障的网络健康继续使用 `degraded` / `failed` 聚合。
 
+**D2.1 — 服务端会话失效按临时连接中断处理（2026-10-22 增补）**
+
+服务端对已经不存在的会话返回 `error`（`session does not exist`、`session not found`、
+`会话不存在` 等）时，按**临时连接中断**处理：受影响通道自动重连（沿用 D2 的等待间隔
+与上限语义），不发送终止错误、不进入 `failed`、不显示「网络异常」横幅。理由是新连接会
+创建新会话，属于连接级失效，而不是需要用户改设置的请求拒绝。连续重试以
+`SESSION_EXPIRED_RETRY_LIMIT`（3 次）为上限，超过后仍按 `realtime_protocol_error`
+（`recoverable: true`）上报，避免无限重连。
+
+同时明确**握手顺序**：客户端必须等到服务端的 `session.created` 之后再发送
+`session.update`（与官方 WebSocket 示例、DashScope SDK 一致），因为服务端在建连后才
+完成本次连接的音频与推理资源初始化，提前发送的更新会被拒绝为 `session does not exist`。
+等待窗口有上限（`SESSION_CREATED_GRACE_S` = 10 秒）：服务端始终不宣告会话时仍会发出更新，
+只是延后，通道不会挂死。
+
+回归判据（`scripts/test_realtime_reconnect.py`）：
+`test_the_configuration_waits_for_the_server_session`、
+`test_a_rejected_session_recovers_by_reconnecting`、
+`test_repeated_session_rejections_stop_after_the_bounded_retries`、
+`test_a_silent_server_still_gets_configured_after_the_grace_window`。
+
 **D3 — `recoverable` 取值修正：批准**
 
 `realtime_voice_clone_unsupported`、`realtime_output_mismatch` 由 `true` 改为 `false`。

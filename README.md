@@ -4,7 +4,7 @@
 
 > **Linux 版**：同一仓库内的 [`linux/`](linux/README.md) 目录提供功能对等的 Linux 桌面版（Tauri 2 + React + Rust + Python 引擎，
 > PulseAudio 系统声音隔离采集、PulseAudio 内置虚拟麦克风、deb/rpm 安装包）。Linux 安装包发布在本仓库
-> Releases 的 `v1.0.2`（`simultaneous-translator_1.0.2_amd64.deb`、`simultaneous-translator_1.0.2_amd64.rpm`、
+> Releases 的 `v1.0.2`（`simultaneous-translator_1.0.2_windows_x64-setup.exe`、`simultaneous-translator_1.0.2_linux_amd64.deb`、`simultaneous-translator_1.0.2_linux_amd64.rpm`、
 > `SHA256SUMS.txt`）。本 README 其余内容针对 Windows 版。
 
 ## 两种输出模式
@@ -46,9 +46,9 @@ wss://maas.qianwenaiapi.com/api-ws/v1/realtime
 
 程序自动附加 `?model=qwen3.8-livetranslate-flash-realtime`，并通过 `Authorization: Bearer <API Key>` 鉴权。在“设置 → 同传模型”填写该接口对应的 API Key，或者为默认地址配置 `DASHSCOPE_API_KEY` 环境变量。
 
-客户端等待 `session.updated` 后开始采集，处理 3.8 的增量字幕、完整字幕和语音事件。文本模式与语音模式通过实际会话配置区分，不发送独立 ASR 模型参数。
+客户端先等待服务端的 `session.created`（服务端在建连后才初始化本次连接的音频与推理资源），再发送 `session.update` 配置会话，收到 `session.updated` 后开始采集，处理 3.8 的增量字幕、完整字幕和语音事件。文本模式与语音模式通过实际会话配置区分，不发送独立 ASR 模型参数。
 
-网络临时断开或服务端结束连接后，受影响的通道会自动重连，界面显示“正在连接”，恢复后继续翻译，无需重新点开始。重连保留当前通道开关和发言静音状态，另一通道继续工作；等待间隔从 1 秒逐步增加，最长 15 秒。点击停止会取消重连。鉴权、配置和音频设备故障仍显示具体错误，需要按提示处理。中断时未完成的片段会标为失败，不会与重连后的字幕混在一起。
+网络临时断开、服务端结束连接或服务端拒绝已失效的会话（例如返回 `session does not exist`）后，受影响的通道会自动重连，界面显示“正在连接”，恢复后继续翻译，无需重新点开始。重连保留当前通道开关和发言静音状态，另一通道继续工作；等待间隔从 1 秒逐步增加，最长 15 秒。点击停止会取消重连。鉴权、配置和音频设备故障仍显示具体错误，需要按提示处理。中断时未完成的片段会标为失败，不会与重连后的字幕混在一起。
 
 长时间无人说话（静默待机）时，客户端会定时发送 100 毫秒静音保活帧，避免服务端约 5 分钟收不到客户端数据后按空闲超时终止会话；保活帧不会产生字幕或额外会话轮次，静音或关闭的通道同样适用。
 
@@ -158,11 +158,11 @@ npm run desktop:dev
 
 点击“下载更新”将安装包下载到应用缓存目录，并核对同一 Release 的 `SHA256SUMS.txt`；安装包大小或 SHA-256 不符时阻止安装。下载完成后点击“退出并安装”，程序退出并打开 Windows 安装向导；同传运行时需要先停止。还提供 GitHub 发布页入口。安装由用户发起，下载和更新检查不影响正在进行的翻译。
 
-发布新版本时，需要同步 `desktop/package.json`、`desktop/src-tauri/Cargo.toml` 和 `desktop/src-tauri/tauri.conf.json` 的版本号，并向对应 Release 上传 `simultaneous-translator_<版本>_x64-setup.exe` 与 `SHA256SUMS.txt`。校验文件每行格式为 `<64 位 SHA-256>  <安装包文件名>`。当前实现适用于 Windows x64。
+发布新版本时，需要同步 `desktop/package.json`、`desktop/src-tauri/Cargo.toml` 和 `desktop/src-tauri/tauri.conf.json` 的版本号，并向对应 Release 上传 `simultaneous-translator_<版本>_windows_x64-setup.exe`（发布资产名带平台标记；应用内更新同时兼容旧名 `_x64-setup.exe`）与 `SHA256SUMS.txt`。校验文件每行格式为 `<64 位 SHA-256>  <安装包文件名>`。当前实现适用于 Windows x64。
 
 **当前正式版本为 1.0.2（Release 标签 `v1.0.2`），新增按日期的会话历史与导出，并延长静默待机。0.5.2 及更新版本用户可在应用内获取更新；0.5.1 及更早版本请手动下载安装正式版。**
 
-只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_x64-setup.exe`，不需要编译源码。
+只想使用、不打算改代码，请直接下载 [Releases](https://github.com/cyhddyx/simultaneous-translator/releases) 里的 `simultaneous-translator_x.y.z_windows_x64-setup.exe`，不需要编译源码。
 
 ### 程序由两部分组成，缺一不可
 

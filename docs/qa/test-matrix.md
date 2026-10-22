@@ -131,6 +131,8 @@
 | D-06 | 网络恢复 | `network.status{status:ready}`，`networkHealth` 复位，`trayStatus` 回落 | L1 + L2 | 见 reverification |
 | D-07 | `network.status` 仅变化时发 | 重复同值不发（R §4.3） | L2 | 见 reverification |
 | D-08 | 重连与停止 | 正常关闭、异常断线、服务端 session.finished 后恢复字幕；停止取消等待，开关与静音保留；鉴权和配置错误不循环重试 | test_realtime_reconnect.py | 1.0.1 已覆盖 |
+| D-09 | 握手顺序：先 `session.created` 再 `session.update` | 服务端延迟宣告会话时，更新必须在其之后发出；服务端始终不宣告时按 10 秒窗口兜底发出，通道不挂死 | test_realtime_reconnect.py（`test_the_configuration_waits_for_the_server_session`、`test_a_silent_server_still_gets_configured_after_the_grace_window`） | 本次修复新增（1.0.2 之后） |
+| D-10 | 服务端拒绝失效会话（`session does not exist`） | 按临时连接中断自动重连：不发终止错误、不进入 failed；连续重试上限 3 次后按 `realtime_protocol_error`（`recoverable:true`）上报 | test_realtime_reconnect.py（`test_a_rejected_session_recovers_by_reconnecting`、`test_repeated_session_rejections_stop_after_the_bounded_retries`） | 本次修复新增（1.0.2 之后） |
 
 
 ## 7. 矩阵 E：字幕窗口
