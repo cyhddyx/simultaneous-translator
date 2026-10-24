@@ -19,6 +19,9 @@ use url::Url;
 const RELEASES_URL: &str = "https://github.com/cyhddyx/simultaneous-translator/releases";
 const RELEASES_API: &str =
     "https://api.github.com/repos/cyhddyx/simultaneous-translator/releases?per_page=100";
+const LATEST_API: &str =
+    "https://api.github.com/repos/cyhddyx/simultaneous-translator/releases/latest";
+const MAX_RELEASES_JSON: u64 = 4 * 1024 * 1024;
 const MAX_INSTALLER_SIZE: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Deserialize)]
@@ -200,6 +203,57 @@ fn read_limited(mut response: Response, limit: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn fetch_releases(client: &Client) -> Result<Vec<Release>, String> {
+    let bytes = read_limited(
+        request(client, RELEASES_API, Duration::from_secs(30))?,
+        MAX_RELEASES_JSON,
+    )?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("无法解析 GitHub 版本信息：{error}"))
+}
+
+/// 单版本接口，作为列表接口的兜底。
+///
+/// 未认证请求在共享出口 IP 上容易命中限流和边缘缓存，列表接口会直接返回空数组；
+/// 单版本接口命中同一份异常缓存时仍可能返回数据。404 表示仓库确实没有已发布的
+/// 正式版本，按「没有可安装版本」处理。
+fn fetch_latest(client: &Client) -> Result<Option<Release>, String> {
+    let response = client
+        .get(LATEST_API)
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(30))
+        .send()
+        .map_err(|error| format!("连接 GitHub 失败，请检查网络后重试：{error}"))?;
+    match response.status().as_u16() {
+        200 => {}
+        404 => return Ok(None),
+        403 | 429 => return Err("GitHub 暂时限制了请求次数，请稍后重试。".into()),
+        status => return Err(format!("GitHub 请求失败（HTTP {status}），请稍后重试。")),
+    }
+    let bytes = read_limited(response, MAX_RELEASES_JSON)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("无法解析 GitHub 版本信息：{error}"))
+}
+
+/// 选定最新版本：列表接口为空时重试一次，再退化到单版本接口。
+///
+/// 空列表不能直接当成「尚未发布」：GitHub 的未认证接口会被出口 IP 限流，边缘缓存
+/// 也曾返回与仓库无关的空数组。只有在两个接口都拿不到版本时才报错，并把原因说清楚。
+fn resolve_release(client: &Client) -> Result<Release, String> {
+    for attempt in 0..2 {
+        if let Some(release) = latest_release(fetch_releases(client)?) {
+            return Ok(release);
+        }
+        if attempt == 0 {
+            std::thread::sleep(Duration::from_millis(600));
+        }
+    }
+    if let Some(release) = fetch_latest(client)? {
+        return Ok(release);
+    }
+    Err("GitHub 返回了空的版本列表，暂时无法判断是否有更新，请稍后重试。".into())
+}
+
 fn checksum_for(text: &str, name: &str) -> Result<String, String> {
     let matches: Vec<_> = text
         .lines()
@@ -247,13 +301,7 @@ pub async fn check_app_update(
         let mut data = data
             .try_lock()
             .map_err(|_| "更新任务正在进行，请稍候。".to_string())?;
-        let bytes = read_limited(
-            request(&client()?, RELEASES_API, Duration::from_secs(30))?,
-            4 * 1024 * 1024,
-        )?;
-        let releases = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("无法解析 GitHub 版本信息：{error}"))?;
-        let release = latest_release(releases).ok_or("GitHub 尚未发布可用版本。")?;
+        let release = resolve_release(&client()?)?;
         let info = update_info(&release, &current);
         if data.release.as_ref().map(|release| &release.tag_name) != Some(&release.tag_name) {
             data.prepared = None;

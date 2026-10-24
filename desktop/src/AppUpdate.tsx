@@ -26,6 +26,7 @@ export function AppUpdateSection({ update, sessionActive, onInstall }: { update:
     : phase === "installing" ? "正在退出应用并打开安装程序…"
     : info?.available ? `发现新版本 ${info.tag}`
     : phase === "current" ? "当前已是最新版本。"
+    : error ? "检查更新失败，请稍后重试。"
     : "尚未检查更新。";
 
   return (
