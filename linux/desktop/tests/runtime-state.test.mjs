@@ -7,6 +7,7 @@ import {
   deriveMockTrayStatus,
   describeRuntimeActionResult,
   describeRuntimeChange,
+  friendlyEngineMessage,
   normalizeRuntimeState,
   runtimeChangeSignature,
   runtimeCoversService,
@@ -261,6 +262,38 @@ test("a non-recoverable configuration error is never retryable", () => {
       ["configuration", false],
     ],
   );
+});
+
+test("a PyInstaller unpack failure becomes an actionable disk-space message", () => {
+  const raw =
+    "翻译引擎在启动确认前退出（引擎输出：[PYI-31184:ERROR] Failed to extract " +
+    "cryptography\\hazmat\\bindings\\_rust.pyd: decompression resulted in return code -11 | " +
+    "[PYI-31184:ERROR] Failed to extract entry: cryptography\\hazmat\\bindings\\_rust.pyd）";
+
+  const friendly = friendlyEngineMessage(raw);
+  assert.match(friendly, /\/tmp|系统盘/);
+  assert.match(friendly, /500 MB/);
+  assert.doesNotMatch(friendly, /PYI|decompression/);
+
+  // Ordinary engine failures keep their own wording.
+  assert.equal(friendlyEngineMessage("翻译引擎启动超时"), "翻译引擎启动超时");
+
+  const rows = runtimeErrorRows({
+    ...createInitialRuntimeState(),
+    revision: 10,
+    lastError: {
+      id: "e4",
+      service: "system",
+      code: "start_failed",
+      message: raw,
+      recoverable: true,
+      sessionId: null,
+    },
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].title, "翻译引擎错误");
+  assert.equal(rows[0].message, friendly);
+  assert.equal(rows[0].recoverable, true);
 });
 
 test("local action toasts only fire when that action changed the state", () => {

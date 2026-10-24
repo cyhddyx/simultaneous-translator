@@ -41,6 +41,7 @@ import {
   applyRuntimeState,
   describeRuntimeActionResult,
   describeRuntimeChange,
+  friendlyEngineMessage,
   runtimeChangeSignature,
   runtimeCoversService,
   runtimeErrorRows,
@@ -493,7 +494,11 @@ export default function App() {
         if (message) setToast(message);
       } catch (error) {
         // The native layer returns a ready-to-display Chinese message.
-        setToast(`操作失败：${errorMessage(error, "无法执行该操作。")}`);
+        setToast(
+          `操作失败：${friendlyEngineMessage(
+            errorMessage(error, "无法执行该操作。"),
+          )}`,
+        );
       } finally {
         actionPendingRef.current = false;
         setActionPending(false);
@@ -961,7 +966,7 @@ export default function App() {
                   <CircleAlert size={18} aria-hidden="true" />
                   <div className="error-banner__copy">
                     <strong>{visibleError.title}</strong>
-                    <span>{visibleError.message}</span>
+                    <span>{friendlyEngineMessage(visibleError.message)}</span>
                   </div>
                   <div className="error-banner__actions">
                     {visibleError.recoverable && !active && (

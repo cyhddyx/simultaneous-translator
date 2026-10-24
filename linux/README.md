@@ -1,11 +1,11 @@
 # 同传翻译（Linux 桌面版）
 
-面向 Linux x64 的实时同传工具，与 [Windows 版](../README.md) 功能对等（v1.0.3）。
+面向 Linux x64 的实时同传工具，与 [Windows 版](../README.md) 功能对等（v1.0.4）。
 技术栈与 Windows 版一致：Tauri 2 + React/TypeScript 前端、Rust 原生后端、Python 翻译引擎；
 音频、虚拟麦克风、托盘、密钥存储等平台相关部分按 Linux（PulseAudio / PipeWire / Secret Service /
 AppIndicator / X11 或 Wayland）重新实现。
 
-- 状态：**Linux 版 1.0.3**
+- 状态：**Linux 版 1.0.4**
 - 目录：仓库内 `linux/`；Windows 版源码在仓库根目录
 - 平台：Linux x64；参考验证环境 Ubuntu 24.04（WSLg 与物理桌面均可）
 - 文档：[构建](docs/build.md) · [打包](packaging/README.md) · [发布](docs/release.md) ·
@@ -199,9 +199,9 @@ wss://maas.qianwenaiapi.com/api-ws/v1/realtime
 
 | 发行版 | 文件 | 安装 |
 | --- | --- | --- |
-| Debian / Ubuntu / Deepin / UOS | `simultaneous-translator_1.0.3_linux_amd64.deb` | `sudo apt install ./simultaneous-translator_1.0.3_linux_amd64.deb` |
-| Fedora / RHEL / openSUSE | `simultaneous-translator_1.0.3_linux_amd64.rpm` | `sudo dnf install ./simultaneous-translator_1.0.3_linux_amd64.rpm` |
-| 任意发行版（免安装） | `simultaneous-translator_1.0.3_linux_amd64.AppImage`（可选构建） | `chmod +x` 后直接运行 |
+| Debian / Ubuntu / Deepin / UOS | `simultaneous-translator_1.0.4_linux_amd64.deb` | `sudo apt install ./simultaneous-translator_1.0.4_linux_amd64.deb` |
+| Fedora / RHEL / openSUSE | `simultaneous-translator_1.0.4_linux_amd64.rpm` | `sudo dnf install ./simultaneous-translator_1.0.4_linux_amd64.rpm` |
+| 任意发行版（免安装） | `simultaneous-translator_1.0.4_linux_amd64.AppImage`（可选构建） | `chmod +x` 后直接运行 |
 
 运行时依赖：`libwebkit2gtk-4.1`、`libgtk-3-0`、`libayatana-appindicator3`（托盘）、
 `libpulse0` + `pulseaudio-utils`（或 `pipewire-pulse`）、`xdg-utils`、`libsecret`（可选，Secret Service 客户端）。
@@ -225,8 +225,8 @@ cd .. && bash scripts/build.sh # 3) sidecar + 前端 + deb/rpm
 | --- | --- |
 | `target/release/simultaneous-translator` | 主程序（未打包） |
 | `binaries/translator-bridge-x86_64-unknown-linux-gnu` | 引擎中间产物（externalBin 复制为 `translator-bridge`） |
-| `target/release/bundle/deb/simultaneous-translator_1.0.3_amd64.deb` | Debian/Ubuntu 安装包（打包器原名；发布资产重命名为 `_linux_amd64.deb`） |
-| `target/release/bundle/rpm/simultaneous-translator-1.0.3-1.x86_64.rpm` | Fedora/openSUSE 安装包（打包器原名；发布资产重命名为 `_linux_amd64.rpm`） |
+| `target/release/bundle/deb/simultaneous-translator_1.0.4_amd64.deb` | Debian/Ubuntu 安装包（打包器原名；发布资产重命名为 `_linux_amd64.deb`） |
+| `target/release/bundle/rpm/simultaneous-translator-1.0.4-1.x86_64.rpm` | Fedora/openSUSE 安装包（打包器原名；发布资产重命名为 `_linux_amd64.rpm`） |
 
 AppImage 需要构建机联网下载 linuxdeploy 工具链，默认不启用：见 [packaging/README.md](packaging/README.md)。
 构建细节、依赖与故障排查见 [docs/build.md](docs/build.md)；发布流程见 [docs/release.md](docs/release.md)。
@@ -310,9 +310,9 @@ linux/
 
 ## 版本
 
-- Linux 版：**1.0.3**（功能对齐 Windows v1.0.3）
-- 参考基线：`windows/`（Git 仓库，Windows v1.0.3）
-- 本地构建产物归档：`../releases/linux/v1.0.3/`（deb / rpm / SHA256SUMS.txt）
+- Linux 版：**1.0.4**（功能对齐 Windows v1.0.4）
+- 参考基线：`windows/`（Git 仓库，Windows v1.0.4）
+- 本地构建产物归档：`../releases/linux/v1.0.4/`（deb / rpm / SHA256SUMS.txt）
 
 第三方组件与许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；像素字体授权见
 `desktop/public/fonts/LICENSE-OFL.txt`。
