@@ -82,7 +82,14 @@ if ! rpm -qip "$RPM" >"$TMP/info.txt" 2>"$TMP/info.err"; then
   echo; echo "== 结果: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="; exit 1
 fi
 ok "rpm -qip 成功"
-if ( cd "$ROOT" && rpm2cpio "$RPM" | cpio -idm --quiet 2>"$TMP/cpio.err" ); then
+# rpm 4.18.2 的 rpm2cpio 在本环境会输出完整 cpio 流后仍返回 1；
+# 以 cpio 是否能完整解包为准，不把 rpm2cpio 的退出码单独当失败。
+rpm2cpio "$RPM" >"$TMP/payload.cpio" 2>"$TMP/cpio.err" || true
+if [ ! -s "$TMP/payload.cpio" ]; then
+  bad "解包失败: rpm2cpio 未输出数据: $(tail -2 "$TMP/cpio.err" | tr '\n' ' ')"
+  echo; echo "== 结果: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="; exit 1
+fi
+if ( cd "$ROOT" && cpio -idm --quiet <"$TMP/payload.cpio" 2>>"$TMP/cpio.err" ); then
   ok "rpm2cpio | cpio 解包成功"
 else
   bad "解包失败: $(tail -2 "$TMP/cpio.err" | tr '\n' ' ')"
