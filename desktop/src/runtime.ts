@@ -364,6 +364,25 @@ export function describeRuntimeActionResult(
   return matchesAction ? RUNTIME_CHANGE_TEXT[kind] : null;
 }
 
+/**
+ * PyInstaller onefile bootloader output when the engine cannot unpack itself
+ * into the temporary directory. The desktop build is a single executable, so a
+ * full system disk (or an unwritable `%TEMP%`) surfaces as a lot of `[PYI-…]`
+ * noise and tells the user nothing they can act on.
+ */
+const ENGINE_UNPACK_FAILURE =
+  /\[PYI-\d+:ERROR\][^\n]*(?:Failed to extract|decompression resulted in return code|Failed to create temporary directory)|decompression resulted in return code|Failed to extract entry:|No space left on device/i;
+
+const ENGINE_UNPACK_FAILURE_MESSAGE =
+  "翻译引擎解压失败：临时目录所在磁盘（通常是 C 盘）空间不足或不可写。请至少留出 500 MB 可用空间后点击“重试”。";
+
+/** Replaces a raw engine unpack failure with an actionable message. */
+export function friendlyEngineMessage(message: string): string {
+  return ENGINE_UNPACK_FAILURE.test(message)
+    ? ENGINE_UNPACK_FAILURE_MESSAGE
+    : message;
+}
+
 export interface RuntimeErrorRow {
   /** Stable key so a dismissal survives unrelated re-renders. */
   key: string;
@@ -444,7 +463,9 @@ export function runtimeErrorRows(state: RuntimeState | null): RuntimeErrorRow[] 
       service: lastError.service,
       severity: "error",
       title: lastError.service === "configuration" ? "配置问题" : "翻译引擎错误",
-      message: lastError.message || "翻译引擎返回了未知错误。",
+      message: friendlyEngineMessage(
+        lastError.message || "翻译引擎返回了未知错误。",
+      ),
       // Configuration errors (for example an unsupported voice clone setting)
       // are not retryable: the user has to change the setting first.
       recoverable: lastError.recoverable,
